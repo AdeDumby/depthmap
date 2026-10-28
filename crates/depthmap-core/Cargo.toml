@@ -1,0 +1,9 @@
+[package]
+name = "depthmap-core"
+version.workspace = true
+edition.workspace = true
+description = "Renderer-independent data model for the multi-depth TTRPG map editor"
+
+[dependencies]
+rustc-hash.workspace = true
+zstd = "0.13"

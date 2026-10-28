@@ -1,0 +1,18 @@
+[package]
+name = "depthmap"
+version.workspace = true
+edition.workspace = true
+description = "Multi-depth TTRPG map editor (wgpu + winit)"
+
+[dependencies]
+depthmap-core = { path = "../depthmap-core" }
+wgpu = "30"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+env_logger = "0.11"
+log = "0.4"
+rustc-hash.workspace = true
+
+[dev-dependencies]
+png = "0.18"
