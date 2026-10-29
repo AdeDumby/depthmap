@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use depthmap::editor::Editor;
-use depthmap::renderer::{FrameStats, Renderer};
+use depthmap::gui::{Command, Gui};
+use depthmap::renderer::{FrameStats, RenderOptions, Renderer};
+use depthmap_core::texture::TEXTURE_COUNT;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -16,9 +18,9 @@ const HELP: &str = "\
 depthmap [FILE] [--stress N]
 
   LMB paint            RMB erase            MMB / Space+LMB pan
-  wheel zoom           WASD / arrows pan    1-9, 0 material
+  wheel zoom           WASD / arrows pan    1-9, 0 texture
   [ ] brush size       Ctrl+Z / Ctrl+Y undo / redo
-  Ctrl+S save          Ctrl+O load          Esc quit
+  Ctrl+N/O/S new / open / save   Ctrl+Shift+S save as   F1 help
 ";
 
 struct Gfx {
@@ -28,11 +30,15 @@ struct Gfx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: Renderer,
+    gui: Gui,
+    egui_state: egui_winit::State,
 }
 
 impl Gfx {
     fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
+            Box::new(window.clone()),
+        ));
         let surface = instance.create_surface(window.clone()).expect("create surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -49,7 +55,7 @@ impl Gfx {
         .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
-        // A non-sRGB format keeps the palette's colours exactly as authored.
+        // A non-sRGB format keeps colours exactly as authored.
         let format = caps
             .formats
             .iter()
@@ -69,8 +75,18 @@ impl Gfx {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+
         let renderer = Renderer::new(device.clone(), queue.clone(), format);
-        Self { window, surface, config, device, queue, renderer }
+        let gui = Gui::new(&device, format);
+        let egui_state = egui_winit::State::new(
+            gui.ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(device.limits().max_texture_dimension_2d as usize),
+        );
+        Self { window, surface, config, device, queue, renderer, gui, egui_state }
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -81,20 +97,6 @@ impl Gfx {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
     }
-}
-
-struct App {
-    gfx: Option<Gfx>,
-    editor: Editor,
-    mods: ModifiersState,
-    held: Held,
-    space: bool,
-    last_tick: Instant,
-    fps_frames: u32,
-    fps_since: Instant,
-    fps: f32,
-    stats: FrameStats,
-    dirty: bool,
 }
 
 #[derive(Default)]
@@ -111,6 +113,18 @@ impl Held {
     }
 }
 
+struct App {
+    gfx: Option<Gfx>,
+    editor: Editor,
+    mods: ModifiersState,
+    held: Held,
+    space: bool,
+    last_tick: Instant,
+    last_title: String,
+    repaint_at: Option<Instant>,
+    stats: FrameStats,
+}
+
 impl App {
     fn new(editor: Editor) -> Self {
         Self {
@@ -120,11 +134,59 @@ impl App {
             held: Held::default(),
             space: false,
             last_tick: Instant::now(),
-            fps_frames: 0,
-            fps_since: Instant::now(),
-            fps: 0.0,
+            last_title: String::new(),
+            repaint_at: None,
             stats: FrameStats::default(),
-            dirty: true,
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(g) = &self.gfx {
+            g.window.request_redraw();
+        }
+    }
+
+    fn request(&mut self, cmd: Command) {
+        let modified = self.editor.modified();
+        if let Some(g) = self.gfx.as_mut() {
+            g.gui.state.request(cmd, modified);
+        }
+    }
+
+    fn save(&mut self) {
+        if !self.editor.save() {
+            self.request(Command::SaveAs);
+        }
+    }
+
+    fn run_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
+        match cmd {
+            Command::New => self.editor.new_map(),
+            Command::Open => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Open map")
+                    .add_filter("depthmap", &["dmap"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.editor.load_from(&path);
+                }
+            }
+            Command::SaveAs => {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Save map as")
+                    .add_filter("depthmap", &["dmap"])
+                    .set_file_name(self.editor.file_name_for_dialog());
+                if let Some(dir) = self.editor.path.as_deref().and_then(|p| p.parent()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(mut path) = dialog.save_file() {
+                    if path.extension().is_none() {
+                        path.set_extension("dmap");
+                    }
+                    self.editor.save_to(&path);
+                }
+            }
+            Command::Quit => event_loop.exit(),
         }
     }
 
@@ -143,6 +205,8 @@ impl App {
             self.editor.pan_keys(-dx, -dy);
         }
 
+        // Get the image to draw into first: egui hands out texture uploads
+        // exactly once, so a frame must never be skipped after the UI ran.
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -157,60 +221,72 @@ impl App {
                 return;
             }
         };
+        // The UI runs before the map is drawn: it may change the editor
+        // (zoom buttons, texture choice...).
+        let raw = gfx.egui_state.take_egui_input(&gfx.window);
+        let mut output = gfx.gui.run(raw, &mut self.editor);
+        gfx.egui_state
+            .handle_platform_output(&gfx.window, std::mem::take(&mut output.platform_output));
+        let delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        self.repaint_at = (delay < Duration::from_secs(5)).then(|| Instant::now() + delay);
+
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let size = (gfx.config.width, gfx.config.height);
+        let over_ui = gfx.gui.pointer_over_ui();
         self.stats = gfx.renderer.render(
             &view,
-            (gfx.config.width, gfx.config.height),
+            size,
             &self.editor.world,
             &self.editor.camera,
-            self.editor.cursor_cell(),
-            self.editor.brush_half,
+            &RenderOptions {
+                cursor: if over_ui { None } else { self.editor.cursor_cell() },
+                brush_half: self.editor.brush_half,
+                show_grid: gfx.gui.state.show_grid,
+                ghost_opacity: gfx.gui.state.ghost_opacity,
+            },
         );
+        gfx.gui.paint(&gfx.device, &gfx.queue, &view, [size.0, size.1], output);
         gfx.window.pre_present_notify();
         gfx.queue.present(frame);
 
-        self.fps_frames += 1;
-        let elapsed = self.fps_since.elapsed();
-        if elapsed >= Duration::from_millis(500) {
-            self.fps = self.fps_frames as f32 / elapsed.as_secs_f32();
-            self.fps_frames = 0;
-            self.fps_since = Instant::now();
-            let chunks = self.editor.world.total_chunks();
-            gfx.window.set_title(&format!(
-                "{} | drawn {} up {}",
-                self.editor.title(self.fps, chunks),
-                self.stats.chunks_drawn,
-                self.stats.chunks_uploaded,
-            ));
+        let title = self.editor.title();
+        if title != self.last_title {
+            gfx.window.set_title(&title);
+            self.last_title = title;
         }
 
-        // Only spin while something is animating; otherwise sleep until input.
-        self.dirty = self.held.any();
-        if self.dirty {
+        // Keep animating while keys pan the view or egui asks for it.
+        if self.held.any() || delay.is_zero() {
             gfx.window.request_redraw();
         }
-    }
 
-    fn request_redraw(&mut self) {
-        self.dirty = true;
-        if let Some(g) = &self.gfx {
-            g.window.request_redraw();
+        for cmd in gfx.gui.state.take_commands() {
+            self.run_command(cmd, event_loop);
+            self.request_redraw();
+            if self.gfx.is_none() {
+                break;
+            }
         }
     }
 
-    fn key(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+    fn key(&mut self, event: &winit::event::KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
+        let ctrl = self.mods.control_key() || self.mods.super_key();
         if let PhysicalKey::Code(code) = event.physical_key {
             // Physical positions, so WASD means the same place on AZERTY (ZQSD).
             match code {
                 KeyCode::KeyW | KeyCode::ArrowUp => self.held.up = pressed,
-                KeyCode::KeyS | KeyCode::ArrowDown if !self.mods.control_key() => self.held.down = pressed,
+                KeyCode::KeyS | KeyCode::ArrowDown if !ctrl => self.held.down = pressed,
+                KeyCode::ArrowDown => self.held.down = pressed,
                 KeyCode::KeyA | KeyCode::ArrowLeft => self.held.left = pressed,
                 KeyCode::KeyD | KeyCode::ArrowRight => self.held.right = pressed,
                 KeyCode::Space => self.space = pressed,
                 _ => {}
             }
-            if pressed && !event.repeat {
+            if pressed && !event.repeat && !ctrl {
                 let digit = match code {
                     KeyCode::Digit1 => Some(1),
                     KeyCode::Digit2 => Some(2),
@@ -224,27 +300,31 @@ impl App {
                     KeyCode::Digit0 => Some(10),
                     _ => None,
                 };
-                if let Some(m) = digit {
-                    self.editor.set_material(m);
+                if let Some(id) = digit.filter(|&d| d <= TEXTURE_COUNT) {
+                    self.editor.set_texture(id);
                 }
             }
         }
         if !pressed {
             return;
         }
-        if let Key::Named(NamedKey::Escape) = event.logical_key {
-            event_loop.exit();
+        if let Key::Named(NamedKey::F1) = event.logical_key {
+            if let Some(g) = self.gfx.as_mut() {
+                g.gui.state.toggle_help();
+            }
             return;
         }
-        // Ctrl shortcuts use the key's label, not its position.
-        if self.mods.control_key() {
+        // Shortcuts use the key's label, not its position.
+        if ctrl {
             if let Key::Character(c) = event.key_without_modifiers() {
                 match c.as_str() {
                     "z" if self.mods.shift_key() => self.editor.redo(),
                     "z" => self.editor.undo(),
                     "y" => self.editor.redo(),
-                    "s" => self.editor.save(),
-                    "o" => self.editor.load(),
+                    "s" if self.mods.shift_key() => self.request(Command::SaveAs),
+                    "s" => self.save(),
+                    "o" => self.request(Command::Open),
+                    "n" => self.request(Command::New),
                     _ => {}
                 }
             }
@@ -280,9 +360,34 @@ impl ApplicationHandler for App {
         self.request_redraw();
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.repaint_at {
+            Some(t) if t <= Instant::now() => {
+                self.repaint_at = None;
+                self.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // egui sees every event first; it tells us whether it used it.
+        let consumed = match self.gfx.as_mut() {
+            Some(g) => {
+                let r = g.egui_state.on_window_event(&g.window, &event);
+                if r.repaint {
+                    g.window.request_redraw();
+                }
+                r.consumed
+            }
+            None => false,
+        };
+        let over_ui = self.gfx.as_ref().is_some_and(|g| g.gui.pointer_over_ui());
+
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.request(Command::Quit),
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.resize(size);
@@ -292,7 +397,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                self.key(&event, event_loop);
+                // Typing into a text field must not trigger shortcuts, but
+                // key releases always count so movement never gets stuck.
+                if !consumed || event.state == ElementState::Released {
+                    self.key(&event);
+                }
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -306,10 +415,13 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match (button, down) {
+                    // Clicks that land on a panel or dialog belong to egui.
+                    (_, true) if over_ui || consumed => {}
                     (MouseButton::Left, true) if self.space => self.editor.set_panning(true),
                     (MouseButton::Left, true) => self.editor.begin_paint(),
                     (MouseButton::Right, true) => self.editor.begin_erase(),
                     (MouseButton::Middle, true) => self.editor.set_panning(true),
+                    // Releases always end whatever was in progress.
                     (_, false) => {
                         self.editor.end_stroke();
                         self.editor.set_panning(false);
@@ -319,11 +431,13 @@ impl ApplicationHandler for App {
                 self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
-                };
-                self.editor.zoom(1.2f64.powf(steps));
+                if !over_ui && !consumed {
+                    let steps = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
+                    };
+                    self.editor.zoom(1.2f64.powf(steps));
+                }
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
@@ -334,7 +448,7 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::init();
-    let mut path = PathBuf::from("map.dmap");
+    let mut file: Option<PathBuf> = None;
     let mut stress = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -344,12 +458,18 @@ fn main() {
                 return;
             }
             "--stress" => stress = args.next().and_then(|n| n.parse::<i64>().ok()),
-            _ => path = PathBuf::from(a),
+            _ => file = Some(PathBuf::from(a)),
         }
     }
 
-    let mut editor = Editor::new(path.clone());
-    editor.open_if_exists(&path);
+    let mut editor = Editor::new();
+    if let Some(path) = file {
+        if path.exists() {
+            editor.load_from(&path);
+        } else {
+            editor.path = Some(path);
+        }
+    }
     if let Some(n) = stress {
         depthmap::stress_fill(&mut editor.world, n);
     }

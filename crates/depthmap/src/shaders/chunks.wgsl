@@ -1,16 +1,19 @@
 // One instance per visible chunk, across every depth, in a single draw call.
-// A chunk is a 32x32 block of material ids living in a slot of the R8Uint
-// atlas; the fragment shader looks the id up and maps it through the palette.
+// A chunk is a 32x32 block of cells living in a slot of the Rg8Uint atlas:
+// r = texture id, g = index into the colour table. The fragment shader tints
+// the texture's greyscale shade with that colour.
 
 struct Globals {
     viewport: vec2<f32>,
     atlas_cols: u32,
     _pad: u32,
-    palette: array<vec4<f32>, 32>,
+    colors: array<vec4<f32>, 256>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(0) @binding(1) var atlas: texture_2d<u32>;
+@group(0) @binding(2) var patterns: texture_2d_array<f32>;
+@group(0) @binding(3) var pattern_sampler: sampler;
 
 struct Inst {
     @location(0) origin: vec2<f32>, // top-left, in pixels
@@ -24,6 +27,7 @@ struct VOut {
     @location(0) cell: vec2<f32>,
     @location(1) @interpolate(flat) slot: u32,
     @location(2) @interpolate(flat) opacity: f32,
+    @location(3) @interpolate(flat) ppc: f32, // pixels per cell
 };
 
 @vertex
@@ -41,6 +45,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VOut {
     o.cell = corner * 32.0;
     o.slot = inst.slot;
     o.opacity = inst.opacity;
+    o.ppc = inst.size / 32.0;
     return o;
 }
 
@@ -48,10 +53,16 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Inst) -> VOut {
 fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     let ci = vec2<i32>(clamp(floor(v.cell), vec2<f32>(0.0), vec2<f32>(31.0)));
     let base = vec2<i32>(i32(v.slot % g.atlas_cols), i32(v.slot / g.atlas_cols)) * 32;
-    let id = textureLoad(atlas, base + ci, 0).r;
-    if (id == 0u) {
+    let c = textureLoad(atlas, base + ci, 0).rg;
+    if (c.x == 0u) {
         discard;
     }
-    let c = g.palette[min(id, 31u)];
-    return vec4<f32>(c.rgb, c.a * v.opacity);
+    let rgb = g.colors[min(c.y, 255u)].rgb;
+    // Texture tile (32 px) mapped onto one cell. The mip level is chosen
+    // from the on-screen cell size so distant/small cells average out
+    // instead of shimmering; Repeat addressing makes the tile seamless.
+    let f = fract(v.cell);
+    let lod = clamp(log2(32.0 / max(v.ppc, 0.001)), 0.0, 5.0);
+    let shade = textureSampleLevel(patterns, pattern_sampler, f, min(c.x, 31u), lod).r;
+    return vec4<f32>(rgb * shade, v.opacity);
 }

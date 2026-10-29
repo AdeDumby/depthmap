@@ -2,9 +2,10 @@
 //! machine has no GPU or software Vulkan/GL adapter.
 //! Set `DEPTHMAP_PNG_DIR` to also dump the frames as PNGs.
 
-use depthmap::renderer::Renderer;
-use depthmap_core::palette::MATERIALS;
-use depthmap_core::{Camera, World};
+use depthmap::renderer::{RenderOptions, Renderer};
+use depthmap_core::colors::DEFAULT_COLORS;
+use depthmap_core::texture;
+use depthmap_core::{Camera, World, make_cell};
 
 const W: u32 = 512;
 const H: u32 = 384;
@@ -55,11 +56,11 @@ impl Gpu {
         &mut self,
         world: &World,
         cam: &Camera,
-        cursor: Option<(i64, i64)>,
+        opts: &RenderOptions,
         name: &str,
     ) -> (Vec<u8>, depthmap::renderer::FrameStats) {
         let view = self.target.create_view(&Default::default());
-        let stats = self.renderer.render(&view, (W, H), world, cam, cursor, 0);
+        let stats = self.renderer.render(&view, (W, H), world, cam, opts);
 
         let bpr = W * 4; // 2048 = multiple of 256
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -113,9 +114,15 @@ fn near(a: [u8; 3], b: [u8; 3], tol: i32) -> bool {
     (0..3).all(|i| (a[i] as i32 - b[i] as i32).abs() <= tol)
 }
 
-fn material_rgb(m: usize) -> [u8; 3] {
-    let c = MATERIALS[m].rgba;
-    [c[0], c[1], c[2]]
+const NO_GRID: RenderOptions = RenderOptions {
+    cursor: None,
+    brush_half: 0,
+    show_grid: false,
+    ghost_opacity: 0.35,
+};
+
+fn color(i: usize) -> [u8; 3] {
+    DEFAULT_COLORS[i]
 }
 
 /// Centre of a cell (at the camera's active depth) in screen pixels.
@@ -126,29 +133,29 @@ fn cell_centre(cam: &Camera, cell: (i64, i64)) -> (u32, u32) {
 }
 
 #[test]
-fn renders_cells_with_palette_colours() {
+fn solid_cells_render_in_their_colour() {
     let Some(mut gpu) = gpu() else {
         eprintln!("SKIPPED: no GPU adapter available");
         return;
     };
     let mut world = World::new();
-    // 3 materials in a row, one cell left of the origin to cover negative chunks.
-    world.set(0, -1, 0, 1);
-    world.set(0, 0, 0, 5);
-    world.set(0, 1, 0, 9);
+    // Three colours in a row, one cell left of the origin to cover negative chunks.
+    world.set(0, -1, 0, make_cell(1, 5)); // grass green
+    world.set(0, 0, 0, make_cell(1, 9)); // lava
+    world.set(0, 1, 0, make_cell(1, 8)); // deep water
     let cam = Camera::new(); // depth 0, 32 px/cell, centred on cell (0,0)
 
-    let (img, stats) = gpu.render(&world, &cam, None, "basic");
+    let (img, stats) = gpu.render(&world, &cam, &NO_GRID, "basic");
     assert_eq!(stats.chunks_drawn, 2, "cells span two chunks (x=-1 and x>=0)");
     assert_eq!(stats.chunks_uploaded, 2);
 
-    for (cell, m) in [((-1, 0), 1usize), ((0, 0), 5), ((1, 0), 9)] {
+    for (cell, c) in [((-1, 0), 5usize), ((0, 0), 9), ((1, 0), 8)] {
         let (x, y) = cell_centre(&cam, cell);
         assert!(
-            near(px(&img, x + 3, y + 3), material_rgb(m), 3),
+            near(px(&img, x + 3, y + 3), color(c), 2),
             "cell {cell:?}: got {:?}, want {:?}",
             px(&img, x + 3, y + 3),
-            material_rgb(m)
+            color(c)
         );
     }
     // Empty cell shows the parchment background.
@@ -156,15 +163,78 @@ fn renders_cells_with_palette_colours() {
     assert!(near(px(&img, x + 3, y + 3), [230, 222, 204], 4));
 
     // Second frame: nothing changed, nothing re-uploaded.
-    let (_, stats) = gpu.render(&world, &cam, None, "basic2");
+    let (_, stats) = gpu.render(&world, &cam, &NO_GRID, "basic2");
     assert_eq!(stats.chunks_uploaded, 0);
 
-    // Editing one cell re-uploads exactly its chunk.
-    world.set(0, 0, 0, 2);
-    let (img, stats) = gpu.render(&world, &cam, None, "edited");
+    // Editing one cell re-uploads exactly its chunk and the new colour shows.
+    world.set(0, 0, 0, make_cell(1, 7));
+    let (img, stats) = gpu.render(&world, &cam, &NO_GRID, "edited");
     assert_eq!(stats.chunks_uploaded, 1);
     let (x, y) = cell_centre(&cam, (0, 0));
-    assert!(near(px(&img, x + 3, y + 3), material_rgb(2), 3));
+    assert!(near(px(&img, x + 3, y + 3), color(7), 2));
+}
+
+#[test]
+fn every_texture_matches_its_cpu_tile_when_tinted() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    // At 32 px/cell the 32x32 tile maps 1:1 onto screen pixels, so the GPU
+    // output must equal the CPU tile times the colour, pixel for pixel.
+    let tint = DEFAULT_COLORS[10]; // red
+    let cam = Camera::new();
+    let mut worst = 0i32;
+    for id in 1..=texture::TEXTURE_COUNT {
+        let mut world = World::new();
+        world.set(0, 0, 0, make_cell(id, 10));
+        let (img, _) = gpu.render(&world, &cam, &NO_GRID, &format!("tex{id:02}"));
+        let (ox, oy) = cell_centre(&cam, (0, 0));
+        let (ox, oy) = (ox - 16, oy - 16);
+        let tile = texture::tile(id);
+        for ty in 0..32u32 {
+            for tx in 0..32u32 {
+                let s = tile[(ty * 32 + tx) as usize] as f32 / 255.0;
+                let got = px(&img, ox + tx, oy + ty);
+                for ch in 0..3 {
+                    let want = (tint[ch] as f32 * s).round() as i32;
+                    worst = worst.max((got[ch] as i32 - want).abs());
+                }
+            }
+        }
+    }
+    assert!(worst <= 3, "GPU texture output deviates from the CPU tile by {worst}");
+}
+
+#[test]
+fn texture_cells_at_other_scales_stay_sane() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    // Zoomed far out the mip chain must average a pattern towards its mean
+    // colour instead of shimmering; zoomed in it must still show the pattern.
+    let mut world = World::new();
+    for y in 0..16 {
+        for x in 0..16 {
+            world.set(0, x, y, make_cell(10, 0)); // hatch, white
+        }
+    }
+    let mut cam = Camera::new();
+    cam.ppc = 2.0; // 2 px per cell
+    cam.cell = (8, 8);
+    let (img, _) = gpu.render(&world, &cam, &NO_GRID, "far");
+    let vals: Vec<u8> = (0..8).map(|i| px(&img, W / 2 - 8 + i, H / 2 - 8)[0]).collect();
+    let (lo, hi) = (*vals.iter().min().unwrap(), *vals.iter().max().unwrap());
+    assert!(hi - lo <= 12, "far-away hatch still shimmers: {vals:?}");
+    assert!(lo > 180 && hi < 250, "should settle near the mean shade: {vals:?}");
+
+    let mut cam = Camera::new();
+    cam.ppc = 48.0;
+    cam.cell = (8, 8);
+    let (img, _) = gpu.render(&world, &cam, &NO_GRID, "near");
+    let row: Vec<u8> = (0..48).map(|i| px(&img, W / 2 - 24 + i, H / 2)[0]).collect();
+    assert!(row.iter().max().unwrap() - row.iter().min().unwrap() > 40, "pattern lost: {row:?}");
 }
 
 #[test]
@@ -174,7 +244,7 @@ fn parent_layer_is_ghosted_behind_the_detail_layer() {
         return;
     };
     let mut world = World::new();
-    world.set(0, 0, 0, 8); // lava cell at depth 0
+    world.set(0, 0, 0, make_cell(1, 9)); // lava cell at depth 0
 
     // Zoom in until the camera sits at depth 1 and the lava cell fills the view.
     let mut cam = Camera::new();
@@ -185,14 +255,14 @@ fn parent_layer_is_ghosted_behind_the_detail_layer() {
     cam.frac = (0.5, 0.5);
 
     // One detail cell at depth 1, directly right of the centre.
-    world.set(1, 3, 2, 9);
+    world.set(1, 3, 2, make_cell(1, 1)); // charcoal
 
-    let (img, _) = gpu.render(&world, &cam, None, "ghost");
+    let (img, _) = gpu.render(&world, &cam, &NO_GRID, "ghost");
     let (cx, cy) = (W / 2, H / 2);
 
     // Where the detail layer is empty we see the parent as a faded tint:
     // strictly between pure lava and the background.
-    let lava = material_rgb(8);
+    let lava = color(9);
     let bg = [230u8, 222, 204];
     let ghost = px(&img, cx, cy - 20);
     for i in 0..3 {
@@ -203,26 +273,39 @@ fn parent_layer_is_ghosted_behind_the_detail_layer() {
 
     // The detail cell is drawn at full strength on top.
     let (dx, dy) = cell_centre(&cam, (3, 2));
-    assert!(near(px(&img, dx, dy), material_rgb(9), 3));
+    assert!(near(px(&img, dx, dy), color(1), 2));
+
+    // Ghost opacity 0 hides the parent; 1.0 shows it undiluted.
+    let hidden = RenderOptions { ghost_opacity: 0.0, ..NO_GRID };
+    let (img, _) = gpu.render(&world, &cam, &hidden, "ghost0");
+    assert!(near(px(&img, cx, cy - 20), bg, 4));
+    let full = RenderOptions { ghost_opacity: 1.0, ..NO_GRID };
+    let (img, _) = gpu.render(&world, &cam, &full, "ghost1");
+    assert!(near(px(&img, cx, cy - 20), lava, 3));
 }
 
 #[test]
-fn grid_and_cursor_are_drawn() {
+fn grid_and_cursor_are_drawn_and_the_grid_can_be_hidden() {
     let Some(mut gpu) = gpu() else {
         eprintln!("SKIPPED: no GPU adapter available");
         return;
     };
     let world = World::new();
     let cam = Camera::new();
-    let (plain, _) = gpu.render(&world, &cam, None, "grid");
+    let grid = RenderOptions { show_grid: true, ..NO_GRID };
+    let (plain, _) = gpu.render(&world, &cam, &grid, "grid");
     // A grid line sits on the cell edge at x = W/2 (frac 0 => cell edge in the middle).
     let on_line = px(&plain, W / 2, 50);
     let off_line = px(&plain, W / 2 + 10, 50);
     assert!(on_line[0] < off_line[0] - 10, "grid line missing: {on_line:?} vs {off_line:?}");
 
-    let (with_cursor, _) = gpu.render(&world, &cam, Some((2, 2)), "cursor");
+    let (hidden, _) = gpu.render(&world, &cam, &NO_GRID, "nogrid");
+    assert!(near(px(&hidden, W / 2, 50), px(&hidden, W / 2 + 10, 50), 1), "grid still visible");
+
+    let with_cursor = RenderOptions { cursor: Some((2, 2)), ..grid };
+    let (img, _) = gpu.render(&world, &cam, &with_cursor, "cursor");
     let (x, y) = cell_centre(&cam, (2, 2));
-    assert!(px(&with_cursor, x, y)[0] > px(&plain, x, y)[0], "cursor highlight missing");
+    assert!(px(&img, x, y)[0] > px(&plain, x, y)[0], "cursor highlight missing");
 }
 
 #[test]
@@ -234,11 +317,16 @@ fn stress_map_renders_and_reports_every_chunk() {
     let mut world = World::new();
     depthmap::stress_fill(&mut world, 2048); // 4 million cells at depth 0 + detail at depth 1
     let mut cam = Camera::new();
-    cam.ppc = 4.0; // far zoomed out: the whole 128x96 cell viewport fits ~ 4x3 chunks per 512px
-    let (img, stats) = gpu.render(&world, &cam, None, "stress");
+    cam.ppc = 4.0; // far zoomed out
+    let (img, stats) = gpu.render(&world, &cam, &RenderOptions::default(), "stress");
     assert!(stats.chunks_drawn > 10);
     assert_eq!(stats.chunks_skipped, 0);
     // Not just background.
     let colourful = (0..W).step_by(7).filter(|&x| !near(px(&img, x, 100), [230, 222, 204], 6)).count();
     assert!(colourful > 5);
+
+    // Zoomed in on the same map the textures are visible.
+    cam.ppc = 32.0;
+    let (_, stats) = gpu.render(&world, &cam, &RenderOptions::default(), "stress_near");
+    assert!(stats.chunks_drawn >= 1);
 }

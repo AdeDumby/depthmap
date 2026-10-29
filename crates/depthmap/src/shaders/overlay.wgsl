@@ -11,6 +11,7 @@ struct Overlay {
     cursor_min: vec2<f32>, // brush top-left, in cells relative to the view cell
     cursor_size: f32,
     cursor_on: f32,
+    grid: f32,         // 1.0 = draw grid lines
 };
 
 @group(0) @binding(0) var<uniform> o: Overlay;
@@ -28,12 +29,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
     let dm = abs(fract(p + 0.5) - 0.5) * o.ppc;
     let minor = (1.0 - smoothstep(0.5, 1.5, min(dm.x, dm.y)))
-        * smoothstep(3.0, 10.0, o.ppc) * 0.16;
+        * smoothstep(3.0, 10.0, o.ppc) * 0.16 * o.grid;
 
     let pa = (p + o.cell_mod) / 4.0;
     let dM = abs(fract(pa + 0.5) - 0.5) * 4.0 * o.ppc;
     let major = (1.0 - smoothstep(0.75, 2.0, min(dM.x, dM.y)))
-        * o.major * smoothstep(1.0, 4.0, o.ppc) * 0.38;
+        * o.major * smoothstep(1.0, 4.0, o.ppc) * 0.38 * o.grid;
 
     let grid = max(minor, major);
 

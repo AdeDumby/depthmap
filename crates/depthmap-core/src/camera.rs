@@ -7,6 +7,11 @@ pub const ZOOM_HI: f64 = 64.0;
 pub const ZOOM_LO: f64 = 16.0;
 /// Zoom-out limit at depth 0.
 pub const MIN_PPC: f64 = 0.25;
+/// Pixels per cell of the default view (depth 0, "×1").
+pub const BASE_PPC: f64 = 32.0;
+/// Smallest and largest zoom levels the camera can reach (see [`Camera::zoom_level`]).
+pub const MIN_ZOOM_LEVEL: f64 = -7.0; // log2(MIN_PPC / BASE_PPC)
+pub const MAX_ZOOM_LEVEL: f64 = 2.0 * MAX_DEPTH as f64 + 1.0;
 
 /// One depth's view of the camera: position and scale expressed in that
 /// depth's own integer cell grid.
@@ -72,8 +77,23 @@ impl Camera {
             depth: 0,
             cell: (0, 0),
             frac: (0.0, 0.0),
-            ppc: 32.0,
+            ppc: BASE_PPC,
         }
+    }
+
+    /// Total zoom as a base-2 logarithm: `0` is the default view, `+1`
+    /// doubles the scale, and each depth level adds `2` (cells shrink 4×).
+    /// A single number that is continuous across depth hops, for sliders.
+    pub fn zoom_level(&self) -> f64 {
+        (self.ppc / BASE_PPC).log2() + 2.0 * self.depth as f64
+    }
+
+    /// Zooms to an absolute `zoom_level`, keeping the screen point
+    /// `(sx, sy)` fixed.
+    pub fn set_zoom_level(&mut self, level: f64, sx: f64, sy: f64, vw: f64, vh: f64) {
+        let level = level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        let factor = (level - self.zoom_level()).exp2();
+        self.zoom_at(factor, sx, sy, vw, vh);
     }
 
     /// The view at the active (painting) depth.
@@ -320,6 +340,31 @@ mod tests {
         c.pan_pixels(1.0, 0.0);
         let after = c.view().cell_origin_px(cell.0, cell.1, VW, VH);
         assert!((after.0 - before.0 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_level_is_continuous_across_depth_hops() {
+        let mut c = Camera::new();
+        assert!(c.zoom_level().abs() < 1e-12);
+        let mut last = c.zoom_level();
+        for _ in 0..60 {
+            c.zoom_at(1.3, 10.0, 10.0, VW, VH);
+            let l = c.zoom_level();
+            assert!((l - last - 1.3f64.log2()).abs() < 1e-9, "jump at depth {}", c.depth);
+            last = l;
+        }
+    }
+
+    #[test]
+    fn set_zoom_level_lands_exactly_and_respects_limits() {
+        let mut c = Camera::new();
+        c.set_zoom_level(6.0, VW * 0.5, VH * 0.5, VW, VH);
+        assert!((c.zoom_level() - 6.0).abs() < 1e-9);
+        assert_eq!(c.depth, 3); // 2 levels per depth, ppc back at 32 * 2^0
+        c.set_zoom_level(-100.0, 0.0, 0.0, VW, VH);
+        assert!((c.zoom_level() - MIN_ZOOM_LEVEL).abs() < 1e-9);
+        c.set_zoom_level(1000.0, 0.0, 0.0, VW, VH);
+        assert!(c.depth <= MAX_DEPTH);
     }
 
     #[test]

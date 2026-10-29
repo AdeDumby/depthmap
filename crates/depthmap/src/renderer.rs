@@ -9,13 +9,13 @@
 
 use bytemuck::{Pod, Zeroable};
 use depthmap_core::camera::Camera;
-use depthmap_core::palette::{PALETTE_SIZE, palette_f32};
+use depthmap_core::colors::MAX_COLORS;
+use depthmap_core::texture::{self, MAX_TEXTURES, MIP_LEVELS, TILE};
 use depthmap_core::{CHUNK_SHIFT, CHUNK_SIZE, ChunkPos, MAX_DEPTH, SUBDIV, World};
 use rustc_hash::FxHashMap;
 
-/// Opacity of the layer directly above the active one; each further
-/// ancestor is fainter. This is the "ghost of the original map".
-const GHOST_OPACITY: f32 = 0.35;
+/// Each ancestor layer beyond the first is this much fainter than the one
+/// below it.
 const GHOST_FALLOFF: f32 = 0.55;
 /// Layers whose cells would be thinner than this are not drawn.
 const MIN_CELL_PX: f64 = 0.5;
@@ -37,7 +37,7 @@ struct Globals {
     viewport: [f32; 2],
     atlas_cols: u32,
     _pad: u32,
-    palette: [[f32; 4]; PALETTE_SIZE],
+    colors: [[f32; 4]; MAX_COLORS],
 }
 
 #[repr(C)]
@@ -51,6 +51,32 @@ struct OverlayUniform {
     cursor_min: [f32; 2],
     cursor_size: f32,
     cursor_on: f32,
+    grid: f32,
+    _pad: f32,
+}
+
+/// Per-frame view settings.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOptions {
+    /// Cell under the mouse at the active depth, for the brush highlight.
+    pub cursor: Option<(i64, i64)>,
+    /// Brush radius in cells.
+    pub brush_half: i64,
+    pub show_grid: bool,
+    /// Opacity of the layer just above the active one (`0` hides all
+    /// ancestors): the "ghost of the original map".
+    pub ghost_opacity: f32,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            brush_half: 0,
+            show_grid: true,
+            ghost_opacity: 0.35,
+        }
+    }
 }
 
 struct Slot {
@@ -76,6 +102,8 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     atlas: wgpu::Texture,
     atlas_cols: u32,
+    colors_cpu: Box<[[f32; 4]; MAX_COLORS]>,
+    colors_version: u64,
 
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_bind_group: wgpu::BindGroup,
@@ -106,11 +134,61 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Uint,
+            format: wgpu::TextureFormat::Rg8Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Texture patterns: one 32x32 layer per texture id, full mip chain.
+        let pattern_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("texture patterns"),
+            size: wgpu::Extent3d {
+                width: TILE as u32,
+                height: TILE as u32,
+                depth_or_array_layers: MAX_TEXTURES as u32 + 1,
+            },
+            mip_level_count: MIP_LEVELS as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for layer in 0..=MAX_TEXTURES {
+            for (level, data) in texture::mips(layer).iter().enumerate() {
+                let size = (TILE >> level) as u32;
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &pattern_tex,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size),
+                        rows_per_image: Some(size),
+                    },
+                    wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                );
+            }
+        }
+        let pattern_view = pattern_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let pattern_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pattern sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -149,6 +227,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let chunk_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -162,6 +256,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&pattern_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&pattern_sampler),
                 },
             ],
         });
@@ -280,6 +382,8 @@ impl Renderer {
             globals_buf,
             atlas,
             atlas_cols,
+            colors_cpu: Box::new([[0.0; 4]; MAX_COLORS]),
+            colors_version: 0,
             overlay_pipeline,
             overlay_bind_group,
             overlay_buf,
@@ -345,7 +449,7 @@ impl Renderer {
             cells,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(CHUNK_SIZE as u32),
+                bytes_per_row: Some(CHUNK_SIZE as u32 * 2), // 2 bytes per cell
                 rows_per_image: Some(CHUNK_SIZE as u32),
             },
             wgpu::Extent3d {
@@ -356,24 +460,22 @@ impl Renderer {
         );
     }
 
-    fn opacity_for(active: u8, k: u8) -> f32 {
+    fn opacity_for(active: u8, k: u8, ghost: f32) -> f32 {
         if k >= active {
             1.0
         } else {
-            GHOST_OPACITY * GHOST_FALLOFF.powi((active - k - 1) as i32)
+            ghost * GHOST_FALLOFF.powi((active - k - 1) as i32)
         }
     }
 
-    /// Draws the world into `target`. `cursor` is the cell under the mouse at
-    /// the active depth; `brush_half` is the brush radius in cells.
+    /// Draws the world into `target`.
     pub fn render(
         &mut self,
         target: &wgpu::TextureView,
         size: (u32, u32),
         world: &World,
         camera: &Camera,
-        cursor: Option<(i64, i64)>,
-        brush_half: i64,
+        opts: &RenderOptions,
     ) -> FrameStats {
         self.frame += 1;
         let mut stats = FrameStats::default();
@@ -389,7 +491,7 @@ impl Renderer {
             if ppc_k < MIN_CELL_PX {
                 continue;
             }
-            let opacity = Self::opacity_for(camera.depth, k);
+            let opacity = Self::opacity_for(camera.depth, k, opts.ghost_opacity);
             if opacity < 0.03 {
                 continue;
             }
@@ -442,7 +544,7 @@ impl Renderer {
             });
             for (pos, idx) in pending {
                 if let Some(chunk) = world.chunk(k, pos) {
-                    self.upload(idx, chunk.cells());
+                    self.upload(idx, bytemuck::cast_slice(chunk.cells()));
                 }
             }
         }
@@ -457,17 +559,29 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
         }
+        if self.colors_version != world.colors.version() {
+            self.colors_version = world.colors.version();
+            for (dst, src) in self.colors_cpu.iter_mut().zip(world.colors.as_slice()) {
+                *dst = [
+                    src[0] as f32 / 255.0,
+                    src[1] as f32 / 255.0,
+                    src[2] as f32 / 255.0,
+                    1.0,
+                ];
+            }
+        }
         let globals = Globals {
             viewport: [size.0 as f32, size.1 as f32],
             atlas_cols: self.atlas_cols,
             _pad: 0,
-            palette: palette_f32(),
+            colors: *self.colors_cpu,
         };
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         let view = camera.view();
-        let half = brush_half as f32;
+        let half = opts.brush_half as f32;
+        let cursor = opts.cursor;
         let overlay = OverlayUniform {
             viewport: [size.0 as f32, size.1 as f32],
             ppc: camera.ppc as f32,
@@ -485,6 +599,8 @@ impl Renderer {
             }),
             cursor_size: 2.0 * half + 1.0,
             cursor_on: if cursor.is_some() { 1.0 } else { 0.0 },
+            grid: if opts.show_grid { 1.0 } else { 0.0 },
+            _pad: 0.0,
         };
         self.queue
             .write_buffer(&self.overlay_buf, 0, bytemuck::bytes_of(&overlay));

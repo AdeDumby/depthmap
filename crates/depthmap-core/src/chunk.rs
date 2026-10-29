@@ -1,8 +1,42 @@
+use crate::texture::MAX_TEXTURES;
 use crate::{CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE};
 
-/// A material id. `0` means "nothing here"; the palette maps ids to colours.
-pub type Material = u8;
-pub const EMPTY: Material = 0;
+/// One cell: low byte = texture id (`0` = nothing here), high byte = index
+/// into the world's colour table. Two bytes per cell keeps chunks small and
+/// uploads cheap, while the colour table still allows any RGB value.
+pub type Cell = u16;
+pub const EMPTY: Cell = 0;
+
+#[inline]
+pub const fn make_cell(texture: u8, color: u8) -> Cell {
+    if texture == 0 {
+        EMPTY
+    } else {
+        texture as u16 | ((color as u16) << 8)
+    }
+}
+
+#[inline]
+pub const fn cell_texture(c: Cell) -> u8 {
+    (c & 0xFF) as u8
+}
+
+#[inline]
+pub const fn cell_color(c: Cell) -> u8 {
+    (c >> 8) as u8
+}
+
+/// Canonical form of a cell: empty cells carry no colour, and textures
+/// outside the known range are dropped (used when loading untrusted files).
+#[inline]
+pub fn normalize(c: Cell) -> Cell {
+    let t = cell_texture(c);
+    if t == 0 || t > MAX_TEXTURES {
+        EMPTY
+    } else {
+        c
+    }
+}
 
 /// Chunk coordinates within one depth.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -43,7 +77,7 @@ pub fn local_index(cell_x: i64, cell_y: i64) -> usize {
 /// only when the version it holds differs, even if a chunk was deleted and
 /// later re-created at the same position.
 pub struct Chunk {
-    cells: Box<[Material; CHUNK_AREA]>,
+    cells: Box<[Cell; CHUNK_AREA]>,
     filled: u32,
     version: u64,
 }
@@ -57,7 +91,7 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn from_cells(cells: &[Material; CHUNK_AREA], version: u64) -> Self {
+    pub(crate) fn from_cells(cells: &[Cell; CHUNK_AREA], version: u64) -> Self {
         let filled = cells.iter().filter(|&&c| c != EMPTY).count() as u32;
         Self {
             cells: Box::new(*cells),
@@ -67,7 +101,7 @@ impl Chunk {
     }
 
     #[inline]
-    pub fn cells(&self) -> &[Material; CHUNK_AREA] {
+    pub fn cells(&self) -> &[Cell; CHUNK_AREA] {
         &self.cells
     }
 
@@ -90,10 +124,10 @@ impl Chunk {
     /// Sets a cell and returns the previous value. Bumps `version` only if
     /// the value actually changed.
     #[inline]
-    pub(crate) fn set_index(&mut self, idx: usize, m: Material, version: u64) -> Material {
-        let old = std::mem::replace(&mut self.cells[idx], m);
-        if old != m {
-            match (old == EMPTY, m == EMPTY) {
+    pub(crate) fn set_index(&mut self, idx: usize, c: Cell, version: u64) -> Cell {
+        let old = std::mem::replace(&mut self.cells[idx], c);
+        if old != c {
+            match (old == EMPTY, c == EMPTY) {
                 (true, false) => self.filled += 1,
                 (false, true) => self.filled -= 1,
                 _ => {}
@@ -107,6 +141,16 @@ impl Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_packing_roundtrips() {
+        let c = make_cell(7, 200);
+        assert_eq!((cell_texture(c), cell_color(c)), (7, 200));
+        assert_eq!(make_cell(0, 99), EMPTY, "empty cells carry no colour");
+        assert_eq!(normalize(make_cell(MAX_TEXTURES + 1, 3)), EMPTY);
+        assert_eq!(normalize(make_cell(5, 3)), make_cell(5, 3));
+        assert_eq!(normalize(3 << 8), EMPTY);
+    }
 
     #[test]
     fn chunk_pos_handles_negative_cells() {

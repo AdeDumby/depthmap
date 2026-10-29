@@ -8,6 +8,10 @@ description = "Multi-depth TTRPG map editor (wgpu + winit)"
 depthmap-core = { path = "../depthmap-core" }
 wgpu = "30"
 winit = "0.30"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+rfd = "0.17"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 env_logger = "0.11"

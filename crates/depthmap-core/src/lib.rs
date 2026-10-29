@@ -18,13 +18,15 @@
 pub mod camera;
 pub mod chunk;
 pub mod history;
+pub mod colors;
 pub mod io;
-pub mod palette;
 pub mod raster;
+pub mod texture;
 pub mod world;
 
 pub use camera::{Camera, LayerView};
-pub use chunk::{Chunk, ChunkPos, EMPTY, Material};
+pub use chunk::{Cell, Chunk, ChunkPos, EMPTY, cell_color, cell_texture, make_cell};
+pub use colors::ColorTable;
 pub use history::History;
 pub use world::World;
 

@@ -1,4 +1,4 @@
-use crate::{Material, World};
+use crate::{Cell, World};
 
 /// One changed cell. Undo history stores these deltas, never snapshots, so
 /// its cost scales with what you drew, not with the size of the map.
@@ -7,8 +7,8 @@ pub struct CellEdit {
     pub depth: u8,
     pub x: i64,
     pub y: i64,
-    pub old: Material,
-    pub new: Material,
+    pub old: Cell,
+    pub new: Cell,
 }
 
 const MAX_STROKES: usize = 2000;
@@ -27,7 +27,7 @@ impl History {
     }
 
     /// Paints one cell and records the change in the current stroke.
-    pub fn paint(&mut self, world: &mut World, depth: u8, x: i64, y: i64, m: Material) {
+    pub fn paint(&mut self, world: &mut World, depth: u8, x: i64, y: i64, m: Cell) {
         let old = world.set(depth, x, y, m);
         if old != m {
             self.current.push(CellEdit { depth, x, y, old, new: m });
