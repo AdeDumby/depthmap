@@ -1,0 +1,28 @@
+name: Build
+
+# Builds depthmap.exe on a GitHub Windows machine, so no local Rust install is
+# needed. Run it from the Actions tab ("Run workflow") or push to main, then
+# download the "depthmap-windows" artifact from the finished run.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use a recent stable Rust (the project needs 1.95+)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: depthmap-windows
+          path: target/release/depthmap.exe
+          if-no-files-found: error
