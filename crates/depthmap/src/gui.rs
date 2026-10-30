@@ -3,6 +3,8 @@
 //! [`Editor`] and [`UiState`], so it works with any egui backend (the app
 //! uses egui-winit; the tests render it offscreen).
 
+use std::path::PathBuf;
+
 use depthmap_core::camera::{MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
 use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
@@ -10,12 +12,35 @@ use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptio
 use crate::editor::{Editor, format_zoom};
 
 /// Things the UI cannot do itself (file dialogs, quitting); the app runs them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     New,
+    /// Pick a file with a dialog, then open it.
     Open,
+    /// Open this specific file (recent maps, the startup screen).
+    OpenPath(PathBuf),
     SaveAs,
     Quit,
+}
+
+/// A map in the recent list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentEntry {
+    pub path: PathBuf,
+    /// Checked once when the list is set, not every frame.
+    pub exists: bool,
+}
+
+impl RecentEntry {
+    pub fn name(&self) -> String {
+        self.path
+            .file_stem()
+            .map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+
+    pub fn folder(&self) -> String {
+        self.path.parent().map_or_else(String::new, |p| p.display().to_string())
+    }
 }
 
 /// Where interactive widgets were drawn last frame (screen points). Lets
@@ -27,6 +52,10 @@ pub struct UiLayout {
     pub zoom_out: Option<egui::Rect>,
     pub zoom_in: Option<egui::Rect>,
     pub zoom_reset: Option<egui::Rect>,
+    pub startup_continue: Option<egui::Rect>,
+    pub startup_open: Option<egui::Rect>,
+    pub startup_new: Option<egui::Rect>,
+    pub startup_recent: Vec<egui::Rect>,
 }
 
 pub struct UiState {
@@ -40,6 +69,9 @@ pub struct UiState {
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
     confirm: Option<Command>,
+    /// The welcome screen shown at launch.
+    startup: bool,
+    recent: Vec<RecentEntry>,
     ready: Vec<Command>,
     thumbs: Vec<egui::TextureHandle>,
     thumbs_rgb: Option<[u8; 3]>,
@@ -62,6 +94,8 @@ impl UiState {
             show_help: false,
             show_about: false,
             confirm: None,
+            startup: false,
+            recent: Vec::new(),
             ready: Vec::new(),
             thumbs: Vec::new(),
             thumbs_rgb: None,
@@ -71,7 +105,10 @@ impl UiState {
     /// Asks for a command to run. Commands that would throw away unsaved
     /// work first show a confirmation dialog.
     pub fn request(&mut self, cmd: Command, modified: bool) {
-        let destructive = matches!(cmd, Command::New | Command::Open | Command::Quit);
+        let destructive = matches!(
+            cmd,
+            Command::New | Command::Open | Command::OpenPath(_) | Command::Quit
+        );
         if destructive && modified {
             self.confirm = Some(cmd);
         } else {
@@ -86,6 +123,31 @@ impl UiState {
 
     pub fn confirm_open(&self) -> bool {
         self.confirm.is_some()
+    }
+
+    /// Shows the welcome screen (continue last map / open / new).
+    pub fn open_startup(&mut self) {
+        self.startup = true;
+    }
+
+    pub fn close_startup(&mut self) {
+        self.startup = false;
+    }
+
+    pub fn startup_open(&self) -> bool {
+        self.startup
+    }
+
+    /// Replaces the recent-maps list (most recent first).
+    pub fn set_recent(&mut self, paths: &[PathBuf]) {
+        self.recent = paths
+            .iter()
+            .map(|p| RecentEntry { path: p.clone(), exists: p.is_file() })
+            .collect();
+    }
+
+    pub fn recent(&self) -> &[RecentEntry] {
+        &self.recent
     }
 
     pub fn toggle_help(&mut self) {
@@ -139,6 +201,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         zoom_panel(ctx, ed, st);
     }
     dialogs(ctx, ed, st);
+    startup_window(ctx, st);
 }
 
 fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -151,6 +214,20 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 if item(ui, "Open...", "Ctrl+O") {
                     st.request(Command::Open, ed.modified());
                 }
+                ui.menu_button("Open recent", |ui| {
+                    if st.recent.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No recent maps"));
+                    }
+                    for entry in st.recent.clone().iter().take(8) {
+                        let button = ui
+                            .add_enabled(entry.exists, egui::Button::new(entry.name()))
+                            .on_hover_text(entry.path.display().to_string());
+                        if button.clicked() {
+                            st.request(Command::OpenPath(entry.path.clone()), ed.modified());
+                            ui.close();
+                        }
+                    }
+                });
                 ui.separator();
                 if item(ui, "Save", "Ctrl+S") {
                     if !ed.save() {
@@ -350,6 +427,11 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     ))
                     .weak(),
                 );
+                ui.label(RichText::new(format!("snap: {}", snap_label(ed.camera.depth))).weak())
+                    .on_hover_text(
+                        "Strokes snap to the cells of the depth you are drawing on.\n\
+                         The grid is only an overlay; it never changes the map.",
+                    );
             });
 
             ui.horizontal(|ui| {
@@ -413,8 +495,105 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
         });
 }
 
+/// Cell size of a depth relative to a depth-0 cell, e.g. `1/16 cell`.
+pub fn snap_label(depth: u8) -> String {
+    let n = (depth_subdiv() as u128).pow(depth as u32);
+    if depth == 0 { "1 cell".to_string() } else { format!("1/{n} cell") }
+}
+
+fn depth_subdiv() -> i64 {
+    depthmap_core::SUBDIV
+}
+
+fn startup_window(ctx: &egui::Context, st: &mut UiState) {
+    st.layout.startup_continue = None;
+    st.layout.startup_open = None;
+    st.layout.startup_new = None;
+    st.layout.startup_recent.clear();
+    if !st.startup {
+        return;
+    }
+    let recent = st.recent.clone();
+    let last = recent.iter().find(|e| e.exists).cloned();
+    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let mut chosen: Option<Command> = None;
+
+    egui::Window::new("Welcome to depthmap")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.label("Pick up where you left off, open a map, or start a new one.");
+            ui.add_space(6.0);
+
+            if let Some(entry) = &last {
+                let fill = ui.visuals().selection.bg_fill;
+                let button = egui::Button::new(
+                    RichText::new(format!("Continue with  {}", entry.name())).size(17.0).strong(),
+                )
+                .fill(fill);
+                let resp = ui.add_sized([ui.available_width(), 44.0], button);
+                st.layout.startup_continue = Some(resp.rect);
+                ui.label(RichText::new(entry.folder()).weak().small());
+                if resp.clicked() || enter {
+                    chosen = Some(Command::OpenPath(entry.path.clone()));
+                }
+                ui.add_space(4.0);
+            }
+
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 6.0) / 2.0;
+                let open = ui.add_sized([w, 32.0], egui::Button::new("Open map..."));
+                st.layout.startup_open = Some(open.rect);
+                if open.clicked() {
+                    chosen = Some(Command::Open);
+                }
+                let new = ui.add_sized([w, 32.0], egui::Button::new("New map"));
+                st.layout.startup_new = Some(new.rect);
+                if new.clicked() {
+                    chosen = Some(Command::New);
+                }
+            });
+
+            if !recent.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("Recent maps").strong());
+                for entry in recent.iter().take(8) {
+                    let text = if entry.exists {
+                        format!("{}    {}", entry.name(), entry.folder())
+                    } else {
+                        format!("{}    (file not found)", entry.name())
+                    };
+                    let resp = ui.add_enabled(
+                        entry.exists,
+                        egui::Button::new(text).frame(false).min_size(vec2(ui.available_width(), 24.0)),
+                    );
+                    st.layout.startup_recent.push(resp.rect);
+                    if resp.clicked() {
+                        chosen = Some(Command::OpenPath(entry.path.clone()));
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    "A map is one .dmap file. Save writes to the open map; \
+                     a new map asks where to save the first time.",
+                )
+                .weak()
+                .small(),
+            );
+        });
+
+    if let Some(cmd) = chosen {
+        st.ready.push(cmd);
+    }
+}
+
 fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
-    if let Some(cmd) = st.confirm {
+    if let Some(cmd) = st.confirm.clone() {
         egui::Window::new("Unsaved changes")
             .collapsible(false)
             .resizable(false)
@@ -426,7 +605,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     if ui.button("Save").clicked() {
                         st.confirm = None;
                         if ed.save() {
-                            st.ready.push(cmd);
+                            st.ready.push(cmd.clone());
                         } else {
                             // Untitled: pick a file first; the user then retries.
                             st.ready.push(Command::SaveAs);
@@ -513,7 +692,7 @@ impl Gui {
     /// True while the pointer is over any panel or window (so clicks there
     /// must not paint).
     pub fn pointer_over_ui(&self) -> bool {
-        self.ctx.is_pointer_over_egui() || self.state.confirm_open()
+        self.ctx.is_pointer_over_egui() || self.state.confirm_open() || self.state.startup_open()
     }
 
     /// Draws the UI into `target` on top of what is already there.
@@ -569,6 +748,21 @@ impl Gui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_a_specific_map_also_asks_before_discarding_work() {
+        let mut st = UiState::new();
+        st.request(Command::OpenPath(PathBuf::from("/maps/a.dmap")), true);
+        assert!(st.confirm_open());
+        assert!(st.take_commands().is_empty());
+    }
+
+    #[test]
+    fn snap_label_shows_the_cell_size_of_each_depth() {
+        assert_eq!(snap_label(0), "1 cell");
+        assert_eq!(snap_label(1), "1/4 cell");
+        assert_eq!(snap_label(3), "1/64 cell");
+    }
 
     #[test]
     fn destructive_commands_ask_first_only_when_there_are_unsaved_changes() {

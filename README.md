@@ -11,15 +11,41 @@ cargo run --release -- --stress 4096   # 16M-cell test map
 cargo test                             # core + editor + UI + headless GPU render tests
 ```
 
+## Starting up and where maps are stored
+
+* A map is **one `.dmap` file** (a small header + zstd-compressed color table
+  and chunks; the layout is documented at the top of
+  `crates/depthmap-core/src/io.rs`). You choose where it lives; the app never
+  copies it anywhere else.
+* On launch a **welcome screen** offers *Continue with <last map>* (also bound
+  to Enter), *Open map...*, *New map* and the recent list. Launching with a file
+  (`depthmap my.dmap`) skips it.
+* **Save** (Ctrl+S) writes to the map that is open; an untitled map asks for a
+  file name the first time. *Save As* picks a new file.
+* The list of recent maps is a plain text file, one path per line, newest
+  first (at most 10): `%APPDATA%\depthmap\recent.txt` on Windows,
+  `~/Library/Application Support/depthmap/recent.txt` on macOS,
+  `~/.config/depthmap/recent.txt` on Linux. File dialogs open in the folder of
+  the last map.
+
 ## Interface
 
 * **Menu bar** (top): File (New, Open, Save, Save As, Quit), Edit (Undo, Redo),
-  View (grid, panels, zoom actions), Help (controls, about). Destructive
-  actions ask before discarding unsaved changes.
+  View (grid, panels, zoom actions), Help (controls, about). File also has
+  *Open recent*. Destructive actions ask before discarding unsaved changes.
 * **Textures panel** (floating, left): 14 textures (flagstone, cobblestone,
   brick, planks, dirt, grass, sand, water, hatch, ...). Every texture can be
   painted in **any color**: pick a swatch or use the color picker. Brush size
   slider below.
+* **Grid overlay**: the cell grid of the depth you are drawing on, plus the
+  parent depths (heavier lines) and, as you approach the next depth, the finer
+  grid fading in. It is purely an overlay: it never changes the map, and since
+  every line's strength depends only on its on-screen spacing, nothing jumps
+  when the camera switches depth. The zoom panel shows the cell size strokes
+  snap to ("snap: 1/16 cell").
+* **Backdrop**: zooming past a layer's cells fades it to a light backdrop
+  behind the layer you are drawing on (opacity set by the *Parent layer*
+  slider), again smoothly.
 * **Zoom panel** (floating, right): zoom readout, `−` / `1:1` / `+`, a zoom
   slider, jump one depth up/down, opacity of the parent-layer backdrop, grid
   toggle.

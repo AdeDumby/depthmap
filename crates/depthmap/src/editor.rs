@@ -31,6 +31,9 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     pub status: String,
     saved_revision: u64,
+    /// Last file successfully read or written, until taken (see
+    /// [`Editor::take_touched_path`]).
+    touched: Option<PathBuf>,
     stroke: Option<Tool>,
     stroke_cell: Cell,
     last_cell: Option<(i64, i64)>,
@@ -58,6 +61,7 @@ impl Editor {
             cursor_px: None,
             path: None,
             status: String::new(),
+            touched: None,
             stroke: None,
             stroke_cell: EMPTY,
             last_cell: None,
@@ -268,6 +272,7 @@ impl Editor {
             Ok(()) => {
                 self.path = Some(path.to_path_buf());
                 self.saved_revision = self.world.revision();
+                self.touched = Some(path.to_path_buf());
                 self.status = format!("Saved {}", path.display());
             }
             Err(e) => self.status = format!("Save failed: {e}"),
@@ -283,10 +288,17 @@ impl Editor {
                 self.camera = Camera::new();
                 self.path = Some(path.to_path_buf());
                 self.saved_revision = self.world.revision();
+                self.touched = Some(path.to_path_buf());
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
+    }
+
+    /// The file that was last opened or saved successfully, once. The app uses
+    /// this to keep its recent-maps list up to date.
+    pub fn take_touched_path(&mut self) -> Option<PathBuf> {
+        self.touched.take()
     }
 
     /// Suggested file name for the "Save as" dialog.
@@ -507,6 +519,8 @@ mod tests {
 
         e2.load_from(&dir.join("missing.dmap"));
         assert!(e2.status.starts_with("Open failed"));
+        assert_eq!(e2.take_touched_path(), Some(path.clone()), "failed open must not count");
+        assert_eq!(e2.take_touched_path(), None, "reported only once");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

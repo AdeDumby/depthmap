@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use depthmap::editor::Editor;
 use depthmap::gui::{Command, Gui};
 use depthmap::renderer::{FrameStats, RenderOptions, Renderer};
+use depthmap::settings::Recent;
 use depthmap_core::texture::TEXTURE_COUNT;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -123,10 +124,14 @@ struct App {
     last_title: String,
     repaint_at: Option<Instant>,
     stats: FrameStats,
+    /// Maps opened or saved recently (stored in the user's config folder).
+    recent: Recent,
+    /// Show the welcome screen once the window exists.
+    show_startup: bool,
 }
 
 impl App {
-    fn new(editor: Editor) -> Self {
+    fn new(editor: Editor, recent: Recent, show_startup: bool) -> Self {
         Self {
             gfx: None,
             editor,
@@ -137,6 +142,35 @@ impl App {
             last_title: String::new(),
             repaint_at: None,
             stats: FrameStats::default(),
+            recent,
+            show_startup,
+        }
+    }
+
+    /// Folder the file dialogs should start in: next to the open map,
+    /// otherwise next to the last map used.
+    fn dialog_dir(&self) -> Option<PathBuf> {
+        self.editor
+            .path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .filter(|d| d.is_dir())
+            .map(PathBuf::from)
+            .or_else(|| self.recent.dialog_dir())
+    }
+
+    /// Records the map that was just opened or saved in the recent list.
+    fn sync_recent(&mut self) {
+        let Some(path) = self.editor.take_touched_path() else { return };
+        self.recent.push(&path);
+        if let Some(g) = self.gfx.as_mut() {
+            g.gui.state.set_recent(self.recent.paths());
+        }
+    }
+
+    fn close_startup(&mut self) {
+        if let Some(g) = self.gfx.as_mut() {
+            g.gui.state.close_startup();
         }
     }
 
@@ -161,14 +195,32 @@ impl App {
 
     fn run_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
         match cmd {
-            Command::New => self.editor.new_map(),
+            Command::New => {
+                self.editor.new_map();
+                self.close_startup();
+            }
             Command::Open => {
-                let picked = rfd::FileDialog::new()
+                let mut dialog = rfd::FileDialog::new()
                     .set_title("Open map")
-                    .add_filter("depthmap", &["dmap"])
-                    .pick_file();
-                if let Some(path) = picked {
+                    .add_filter("depthmap", &["dmap"]);
+                if let Some(dir) = self.dialog_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
                     self.editor.load_from(&path);
+                    self.close_startup();
+                }
+            }
+            Command::OpenPath(path) => {
+                if path.is_file() {
+                    self.editor.load_from(&path);
+                    self.close_startup();
+                } else {
+                    self.editor.status = format!("{} no longer exists", path.display());
+                    self.recent.remove(&path);
+                    if let Some(g) = self.gfx.as_mut() {
+                        g.gui.state.set_recent(self.recent.paths());
+                    }
                 }
             }
             Command::SaveAs => {
@@ -176,7 +228,7 @@ impl App {
                     .set_title("Save map as")
                     .add_filter("depthmap", &["dmap"])
                     .set_file_name(self.editor.file_name_for_dialog());
-                if let Some(dir) = self.editor.path.as_deref().and_then(|p| p.parent()) {
+                if let Some(dir) = self.dialog_dir() {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(mut path) = dialog.save_file() {
@@ -266,10 +318,8 @@ impl App {
         for cmd in gfx.gui.state.take_commands() {
             self.run_command(cmd, event_loop);
             self.request_redraw();
-            if self.gfx.is_none() {
-                break;
-            }
         }
+        self.sync_recent();
     }
 
     fn key(&mut self, event: &winit::event::KeyEvent) {
@@ -356,7 +406,12 @@ impl ApplicationHandler for App {
         );
         let size = window.inner_size();
         self.editor.resize(size.width as f64, size.height as f64);
-        self.gfx = Some(Gfx::new(window));
+        let mut gfx = Gfx::new(window);
+        gfx.gui.state.set_recent(self.recent.paths());
+        if self.show_startup {
+            gfx.gui.state.open_startup();
+        }
+        self.gfx = Some(gfx);
         self.request_redraw();
     }
 
@@ -463,6 +518,9 @@ fn main() {
     }
 
     let mut editor = Editor::new();
+    // Launched with a file (or a stress test): go straight to it. Otherwise
+    // the welcome screen offers the last map, opening another, or a new one.
+    let show_startup = file.is_none() && stress.is_none();
     if let Some(path) = file {
         if path.exists() {
             editor.load_from(&path);
@@ -473,9 +531,10 @@ fn main() {
     if let Some(n) = stress {
         depthmap::stress_fill(&mut editor.world, n);
     }
+    let recent = Recent::load();
     print!("{HELP}");
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::new(editor)).expect("run");
+    event_loop.run_app(&mut App::new(editor, recent, show_startup)).expect("run");
 }

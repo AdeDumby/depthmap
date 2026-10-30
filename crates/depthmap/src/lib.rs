@@ -1,6 +1,7 @@
 pub mod editor;
 pub mod gui;
 pub mod renderer;
+pub mod settings;
 
 /// Fills a `n`×`n` cell area at depth 0 with a noisy pattern, plus a scatter
 /// of detail at depth 1, for performance testing (`depthmap --stress 4000`).

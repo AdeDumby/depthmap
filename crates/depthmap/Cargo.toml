@@ -12,6 +12,7 @@ egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
 rfd = "0.17"
+dirs = "7"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 env_logger = "0.11"

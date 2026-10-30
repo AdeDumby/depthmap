@@ -8,15 +8,20 @@
 //! * Grid and cursor are a single analytic full-screen pass.
 
 use bytemuck::{Pod, Zeroable};
-use depthmap_core::camera::Camera;
+use depthmap_core::camera::{Camera, ZOOM_HI};
 use depthmap_core::colors::MAX_COLORS;
 use depthmap_core::texture::{self, MAX_TEXTURES, MIP_LEVELS, TILE};
 use depthmap_core::{CHUNK_SHIFT, CHUNK_SIZE, ChunkPos, MAX_DEPTH, SUBDIV, World};
 use rustc_hash::FxHashMap;
 
-/// Each ancestor layer beyond the first is this much fainter than the one
-/// below it.
+/// Each ancestor layer is this much fainter than the one below it.
 const GHOST_FALLOFF: f32 = 0.55;
+/// A layer starts to fade into the backdrop once its cells are bigger than the
+/// size at which the camera switches depth, and has reached the ghost opacity
+/// after this many more depth steps (0.5 = once zoomed in a further 2x).
+const FADE_STEPS: f64 = 0.5;
+/// Cells of the coarsest grid level the overlay shader draws (`SUBDIV^5`).
+const GRID_PERIOD: i64 = 1024;
 /// Layers whose cells would be thinner than this are not drawn.
 const MIN_CELL_PX: f64 = 0.5;
 /// Page background (sRGB).
@@ -45,7 +50,7 @@ struct Globals {
 struct OverlayUniform {
     viewport: [f32; 2],
     ppc: f32,
-    major: f32,
+    depth: f32,
     frac: [f32; 2],
     cell_mod: [f32; 2],
     cursor_min: [f32; 2],
@@ -460,11 +465,34 @@ impl Renderer {
         );
     }
 
-    fn opacity_for(active: u8, k: u8, ghost: f32) -> f32 {
-        if k >= active {
+    /// Opacity of a layer whose cells are `ppc_k` pixels wide.
+    ///
+    /// It depends only on that on-screen size, never on which depth is
+    /// "active", so it is continuous across the camera's depth switches:
+    ///
+    /// * solid while its cells are no bigger than the switch size,
+    /// * fading to the ghost opacity over the next `FADE_STEPS` of zoom,
+    /// * staying exactly at the ghost opacity for the rest of that depth,
+    /// * and stepping smoothly down to fainter ghosts for each layer above.
+    fn layer_opacity(ppc_k: f64, ghost: f32) -> f32 {
+        let ghost = ghost.clamp(0.0, 1.0);
+        let smooth = |x: f64| {
+            let x = x.clamp(0.0, 1.0) as f32;
+            x * x * (3.0 - 2.0 * x)
+        };
+        // Depth steps (log base SUBDIV) past the switch size.
+        let t = (ppc_k / ZOOM_HI).log(SUBDIV as f64);
+        if t <= 0.0 {
             1.0
+        } else if t < FADE_STEPS {
+            1.0 - (1.0 - ghost) * smooth(t / FADE_STEPS)
+        } else if t < 1.0 {
+            ghost
         } else {
-            ghost * GHOST_FALLOFF.powi((active - k - 1) as i32)
+            let n = t.floor();
+            let prev = ghost * GHOST_FALLOFF.powi(n as i32 - 1);
+            let next = ghost * GHOST_FALLOFF.powi(n as i32);
+            prev + (next - prev) * smooth((t - n) / FADE_STEPS)
         }
     }
 
@@ -491,7 +519,7 @@ impl Renderer {
             if ppc_k < MIN_CELL_PX {
                 continue;
             }
-            let opacity = Self::opacity_for(camera.depth, k, opts.ghost_opacity);
+            let opacity = Self::layer_opacity(ppc_k, opts.ghost_opacity);
             if opacity < 0.03 {
                 continue;
             }
@@ -585,11 +613,12 @@ impl Renderer {
         let overlay = OverlayUniform {
             viewport: [size.0 as f32, size.1 as f32],
             ppc: camera.ppc as f32,
-            major: if camera.depth > 0 { 1.0 } else { 0.0 },
+            depth: camera.depth as f32,
             frac: [view.frac.0 as f32, view.frac.1 as f32],
+            // The coarsest grid level drawn is 4^5 = 1024 cells wide.
             cell_mod: [
-                view.cell.0.rem_euclid(SUBDIV) as f32,
-                view.cell.1.rem_euclid(SUBDIV) as f32,
+                view.cell.0.rem_euclid(GRID_PERIOD) as f32,
+                view.cell.1.rem_euclid(GRID_PERIOD) as f32,
             ],
             cursor_min: cursor.map_or([0.0; 2], |(cx, cy)| {
                 [
@@ -650,4 +679,54 @@ impl Renderer {
 #[inline]
 fn chunk_origin(pos: ChunkPos) -> (i64, i64) {
     pos.origin()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_opacity_never_jumps_and_only_decreases_with_zoom() {
+        for ghost in [0.0f32, 0.2, 0.35, 1.0] {
+            let mut last = Renderer::layer_opacity(1.0, ghost);
+            let mut ppc = 1.0f64;
+            let mut worst_step = 0.0f32;
+            while ppc < 1.0e7 {
+                ppc *= 1.002; // 0.2% zoom steps, far finer than a mouse wheel notch
+                let o = Renderer::layer_opacity(ppc, ghost);
+                assert!(o <= last + 1e-6, "ghost {ghost}: opacity rose at ppc {ppc}");
+                worst_step = worst_step.max(last - o);
+                last = o;
+            }
+            assert!(worst_step < 0.01, "ghost {ghost}: pop of {worst_step} in opacity");
+        }
+    }
+
+    #[test]
+    fn layer_opacity_hits_the_chosen_ghost_level() {
+        let ghost = 0.35;
+        // Cells no bigger than the switch size: solid.
+        assert_eq!(Renderer::layer_opacity(ZOOM_HI, ghost), 1.0);
+        assert_eq!(Renderer::layer_opacity(10.0, ghost), 1.0);
+        // The direct parent after zooming in a bit: exactly the ghost level.
+        for ppc in [ZOOM_HI * 2.1, ZOOM_HI * 3.0, ZOOM_HI * 3.9] {
+            assert!((Renderer::layer_opacity(ppc, ghost) - ghost).abs() < 1e-6, "{ppc}");
+        }
+        // Grandparent: fainter by the falloff.
+        let g2 = Renderer::layer_opacity(ZOOM_HI * 4.0 * 2.1, ghost);
+        assert!((g2 - ghost * GHOST_FALLOFF).abs() < 1e-6);
+        // Slider extremes.
+        assert_eq!(Renderer::layer_opacity(ZOOM_HI * 3.0, 0.0), 0.0);
+        assert!((Renderer::layer_opacity(ZOOM_HI * 3.0, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn opacity_is_the_same_on_both_sides_of_a_depth_switch() {
+        // A layer's own cell size is what matters, not the active depth, so
+        // the same physical layer gets the same opacity either side of a hop.
+        let (ghost, before, after) = (0.35, ZOOM_HI * 3.99, ZOOM_HI * 4.01);
+        let a = Renderer::layer_opacity(before, ghost);
+        let b = Renderer::layer_opacity(after, ghost);
+        assert!((a - b).abs() < 0.01);
+    }
 }

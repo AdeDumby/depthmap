@@ -250,6 +250,9 @@ fn parent_layer_is_ghosted_behind_the_detail_layer() {
     let mut cam = Camera::new();
     cam.zoom_at(2.5, W as f64 * 0.5, H as f64 * 0.5, W as f64, H as f64);
     assert_eq!(cam.depth, 1, "ppc = {}", cam.ppc);
+    // Zoomed far enough into depth 1 that the parent has settled at its
+    // ghost opacity (it is still solid right after the depth switch).
+    cam.ppc = 40.0;
     // Put the camera in the middle of the lava cell: depth-1 cell (2,2).
     cam.cell = (2, 2);
     cam.frac = (0.5, 0.5);
@@ -329,4 +332,88 @@ fn stress_map_renders_and_reports_every_chunk() {
     cam.ppc = 32.0;
     let (_, stats) = gpu.render(&world, &cam, &RenderOptions::default(), "stress_near");
     assert!(stats.chunks_drawn >= 1);
+}
+
+/// Largest per-channel difference between two frames.
+fn max_diff(a: &[u8], b: &[u8]) -> i32 {
+    a.iter().zip(b).map(|(&x, &y)| (x as i32 - y as i32).abs()).max().unwrap()
+}
+
+#[test]
+fn grid_and_ghost_are_identical_either_side_of_a_depth_switch() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    // Detail on three consecutive depths so every layer shows up.
+    let mut world = World::new();
+    world.set(0, 1, 1, make_cell(1, 9));
+    world.set(1, 5, 5, make_cell(1, 8));
+    world.set(1, 6, 5, make_cell(1, 5));
+    world.set(2, 21, 21, make_cell(1, 10));
+    world.set(2, 22, 21, make_cell(1, 1));
+
+    // The camera sits exactly on the switch size at depth 1 (ppc 64) ...
+    let mut before = Camera::new();
+    before.depth = 1;
+    before.cell = (5, 5);
+    before.frac = (0.3, 0.6);
+    before.ppc = 63.999;
+    // ... and the very same view after it has re-based onto depth 2.
+    let mut after = before;
+    after.ppc = 64.001;
+    after.normalize();
+    assert_eq!(before.depth, 1);
+    assert_eq!(after.depth, 2, "should have switched depth");
+
+    let opts = RenderOptions { show_grid: true, ..NO_GRID };
+    let (a, _) = gpu.render(&world, &before, &opts, "hop_before");
+    let (b, _) = gpu.render(&world, &after, &opts, "hop_after");
+    let d = max_diff(&a, &b);
+    assert!(d <= 6, "frames differ by {d} across a depth switch: grid or ghosting pops");
+
+    // The same holds when the grid is the only thing on screen.
+    let empty = World::new();
+    let (a, _) = gpu.render(&empty, &before, &opts, "hop_grid_before");
+    let (b, _) = gpu.render(&empty, &after, &opts, "hop_grid_after");
+    let d = max_diff(&a, &b);
+    assert!(d <= 4, "grid differs by {d} across a depth switch");
+}
+
+#[test]
+fn grid_shows_every_nearby_depth_with_heavier_parent_lines() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let world = World::new();
+    let mut cam = Camera::new();
+    cam.depth = 2;
+    cam.ppc = 40.0;
+    cam.cell = (0, 0); // cell edges (and parent edges) pass through the view centre
+    cam.frac = (0.0, 0.0);
+    let opts = RenderOptions { show_grid: true, ..NO_GRID };
+    let (img, _) = gpu.render(&world, &cam, &opts, "levels");
+    let bg = [230u8, 222, 204];
+    let dark = |x: u32, y: u32| bg[0] as i32 - px(&img, x, y)[0] as i32;
+
+    // Row far from any horizontal line; sample vertical lines.
+    let y = H / 2 + 17;
+    let cell_line = dark(W / 2 + 40, y); // an ordinary cell edge of this depth
+    let parent_line = dark(W / 2 + 160, y); // edge of the parent (4 cells = 160 px)
+    let between = dark(W / 2 + 20, y);
+    assert!(cell_line > between + 8, "cell edge missing: {cell_line} vs {between}");
+    assert!(
+        parent_line > cell_line + 15,
+        "parent edge should be heavier: {parent_line} vs {cell_line}"
+    );
+
+    // The next finer level starts to show up inside a cell as the camera
+    // approaches the depth switch.
+    cam.ppc = 60.0;
+    let (img, _) = gpu.render(&world, &cam, &opts, "levels_fine");
+    let dark = |x: u32, y: u32| bg[0] as i32 - px(&img, x, y)[0] as i32;
+    let quarter = dark(W / 2 + 15, y); // 1/4 cell = 15 px: next depth's cell edge
+    let between = dark(W / 2 + 7, y);
+    assert!(quarter > between + 3, "finer grid should be fading in: {quarter} vs {between}");
 }

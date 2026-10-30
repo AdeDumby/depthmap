@@ -7,6 +7,7 @@ use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::texture::TEXTURE_COUNT;
 use depthmap_core::{EMPTY, World, make_cell};
 use egui::{Event, PointerButton, Pos2, RawInput, Rect, vec2};
+use std::path::PathBuf;
 
 const W: f32 = 1280.0;
 const H: f32 = 800.0;
@@ -159,6 +160,112 @@ fn undo_menu_entries_follow_the_history() {
     assert!(h.ed.world.get(0, 0, 0) == EMPTY && h.ed.history.can_redo());
     let _ = World::new();
     let _ = make_cell(1, 0);
+}
+
+fn temp_maps(tag: &str, names: &[&str], create: &[bool]) -> (PathBuf, Vec<PathBuf>) {
+    let dir = std::env::temp_dir().join(format!("depthmap-ui-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+    for (p, &make) in paths.iter().zip(create) {
+        if make {
+            std::fs::write(p, b"map").unwrap();
+        }
+    }
+    (dir, paths)
+}
+
+fn enter_key() -> Event {
+    Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    }
+}
+
+#[test]
+fn startup_offers_the_last_map_and_clicking_it_opens_it() {
+    let (dir, maps) = temp_maps("last", &["tavern.dmap", "keep.dmap"], &[true, true]);
+    let mut h = Harness::new();
+    h.st.set_recent(&maps);
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.layout.startup_continue.is_some());
+    assert!(h.st.layout.startup_open.is_some() && h.st.layout.startup_new.is_some());
+    assert_eq!(h.st.layout.startup_recent.len(), 2);
+
+    h.click(h.st.layout.startup_continue.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::OpenPath(maps[0].clone())]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn enter_continues_with_the_last_map() {
+    let (dir, maps) = temp_maps("enter", &["a.dmap"], &[true]);
+    let mut h = Harness::new();
+    h.st.set_recent(&maps);
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![enter_key()]);
+    assert_eq!(h.st.take_commands(), vec![Command::OpenPath(maps[0].clone())]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn startup_skips_deleted_maps_and_never_opens_them() {
+    // Most recent map was deleted: continue with the newest one that still exists.
+    let (dir, maps) = temp_maps("gone", &["deleted.dmap", "real.dmap"], &[false, true]);
+    let mut h = Harness::new();
+    h.st.set_recent(&maps);
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.startup_continue.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::OpenPath(maps[1].clone())]);
+
+    // The deleted entry is listed but cannot be clicked.
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.startup_recent[0].center());
+    assert!(h.st.take_commands().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn startup_without_history_offers_open_and_new_only() {
+    let mut h = Harness::new();
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.layout.startup_continue.is_none());
+    assert!(h.st.layout.startup_recent.is_empty());
+
+    h.click(h.st.layout.startup_new.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::New]);
+    h.click(h.st.layout.startup_open.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::Open]);
+    // Enter does nothing when there is no map to continue with.
+    h.frame(vec![enter_key()]);
+    assert!(h.st.take_commands().is_empty());
+}
+
+#[test]
+fn startup_stays_until_the_app_closes_it_and_blocks_the_canvas() {
+    let mut h = Harness::new();
+    h.st.open_startup();
+    h.frame(vec![]);
+    assert!(h.st.startup_open());
+    // Choosing "Open..." and cancelling the dialog must leave the screen up.
+    h.click(h.st.layout.startup_open.unwrap().center());
+    assert!(h.st.startup_open());
+    h.st.close_startup();
+    h.frame(vec![]);
+    assert!(!h.st.startup_open());
+    assert!(h.st.layout.startup_new.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -325,4 +432,44 @@ fn full_window_renders_map_and_interface() {
     assert_ne!(px(zoom_btn.x as u32, zoom_btn.y as u32), bg);
     // The map itself is visible in the middle.
     assert_ne!(px(PW / 2 + 20, PH / 2 + 60), bg);
+}
+
+#[test]
+fn startup_screen_renders() {
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let (dir, maps) = temp_maps(
+        "shot",
+        &["Tavern of the Wandering Bear.dmap", "Dragon keep, level 2.dmap", "old-test.dmap"],
+        &[true, true, false],
+    );
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = depthmap::renderer::Renderer::new(gpu.device.clone(), gpu.queue.clone(), format);
+    let mut gui = Gui::new(&gpu.device, format);
+    let mut ed = Editor::new();
+    ed.resize(PW as f64, PH as f64);
+    gui.state.set_recent(&maps);
+    gui.state.open_startup();
+    let view = gpu.target.create_view(&Default::default());
+    for i in 0..3 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+            time: Some(i as f64 * 0.1),
+            ..Default::default()
+        };
+        let out = gui.run(input, &mut ed);
+        renderer.render(&view, (PW, PH), &ed.world, &ed.camera, &Default::default());
+        gui.paint(&gpu.device, &gpu.queue, &view, [PW, PH], out);
+    }
+    let img = read_back(&gpu);
+    save_png("ui_startup", &img);
+    let r = gui.state.layout.startup_continue.expect("continue button");
+    let px = |x: f32, y: f32| {
+        let i = (((y as u32) * PW + x as u32) * 4) as usize;
+        [img[i], img[i + 1], img[i + 2]]
+    };
+    assert_ne!(px(r.min.x + 6.0, r.center().y), [230, 222, 204], "welcome window not drawn");
+    std::fs::remove_dir_all(dir).unwrap();
 }
