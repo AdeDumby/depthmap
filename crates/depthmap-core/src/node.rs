@@ -8,7 +8,7 @@ pub const MAX_NAME_CHARS: usize = 80;
 pub const MAX_DESCRIPTION_CHARS: usize = 4000;
 /// Icon size multiplier range (1.0 = one cell of the node's depth wide).
 pub const MIN_SCALE: f32 = 0.25;
-pub const MAX_SCALE: f32 = 4.0;
+pub const MAX_SCALE: f32 = 10.0;
 
 /// What a node looks like.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
