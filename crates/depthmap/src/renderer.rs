@@ -57,7 +57,14 @@ struct OverlayUniform {
     cursor_size: f32,
     cursor_on: f32,
     grid: f32,
+    /// Deepest depth of the map; grid levels past it do not exist.
+    max_depth: f32,
+    /// 1.0 when the map has edges (and everything outside is dimmed).
+    bounded: f32,
     _pad: f32,
+    /// The map's corners in cells relative to the view cell.
+    map_min: [f32; 2],
+    map_max: [f32; 2],
 }
 
 /// Per-frame view settings.
@@ -511,7 +518,7 @@ impl Renderer {
         self.instances.clear();
 
         // ---- gather visible chunks of every drawable depth, coarse to fine
-        for k in 0..=MAX_DEPTH {
+        for k in 0..=world.spec().max_depth.min(MAX_DEPTH) {
             if world.layer_is_empty(k) {
                 continue;
             }
@@ -608,6 +615,7 @@ impl Renderer {
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         let view = camera.view();
+        let map_extent = world.spec().extent(camera.depth);
         let half = opts.brush_half as f32;
         let cursor = opts.cursor;
         let overlay = OverlayUniform {
@@ -629,7 +637,16 @@ impl Renderer {
             cursor_size: 2.0 * half + 1.0,
             cursor_on: if cursor.is_some() { 1.0 } else { 0.0 },
             grid: if opts.show_grid { 1.0 } else { 0.0 },
+            max_depth: world.spec().max_depth as f32,
+            bounded: if map_extent.is_some() { 1.0 } else { 0.0 },
             _pad: 0.0,
+            map_min: [
+                (-view.cell.0 as f64) as f32,
+                (-view.cell.1 as f64) as f32,
+            ],
+            map_max: map_extent.map_or([0.0; 2], |(w, h)| {
+                [(w - view.cell.0) as f32, (h - view.cell.1) as f32]
+            }),
         };
         self.queue
             .write_buffer(&self.overlay_buf, 0, bytemuck::bytes_of(&overlay));

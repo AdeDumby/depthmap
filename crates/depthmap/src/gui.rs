@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 
 use depthmap_core::camera::{MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL};
+use depthmap_core::spec::{MAX_MAP_SIZE, MIN_MAP_SIZE};
+use depthmap_core::{Fill, MAX_DEPTH, MapSpec, Shape};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
 use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
 
@@ -14,7 +16,11 @@ use crate::editor::{Editor, format_zoom};
 /// Things the UI cannot do itself (file dialogs, quitting); the app runs them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Asks for a new map; the UI shows the New Map dialog itself and later
+    /// produces [`Command::Create`].
     New,
+    /// Start an empty map of this size and depth.
+    Create(MapSpec),
     /// Pick a file with a dialog, then open it.
     Open,
     /// Open this specific file (recent maps, the startup screen).
@@ -56,6 +62,35 @@ pub struct UiLayout {
     pub startup_open: Option<egui::Rect>,
     pub startup_new: Option<egui::Rect>,
     pub startup_recent: Vec<egui::Rect>,
+    pub shapes: Vec<egui::Rect>,
+    pub fills: Vec<egui::Rect>,
+    pub border_toggle: Option<egui::Rect>,
+    pub eraser_toggle: Option<egui::Rect>,
+    pub new_presets: Vec<egui::Rect>,
+    pub new_create: Option<egui::Rect>,
+    pub new_cancel: Option<egui::Rect>,
+}
+
+/// The New Map dialog's fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewMapForm {
+    pub width: u32,
+    pub height: u32,
+    /// How many times the map can be zoomed into.
+    pub depths: u8,
+}
+
+impl Default for NewMapForm {
+    fn default() -> Self {
+        let s = MapSpec::DEFAULT_NEW;
+        Self { width: s.width, height: s.height, depths: s.max_depth }
+    }
+}
+
+impl NewMapForm {
+    pub fn spec(&self) -> MapSpec {
+        MapSpec::new(self.width, self.height, self.depths)
+    }
 }
 
 pub struct UiState {
@@ -71,6 +106,8 @@ pub struct UiState {
     confirm: Option<Command>,
     /// The welcome screen shown at launch.
     startup: bool,
+    /// The New Map dialog, while it is open.
+    new_map: Option<NewMapForm>,
     recent: Vec<RecentEntry>,
     ready: Vec<Command>,
     thumbs: Vec<egui::TextureHandle>,
@@ -95,6 +132,7 @@ impl UiState {
             show_about: false,
             confirm: None,
             startup: false,
+            new_map: None,
             recent: Vec::new(),
             ready: Vec::new(),
             thumbs: Vec::new(),
@@ -112,8 +150,41 @@ impl UiState {
         if destructive && modified {
             self.confirm = Some(cmd);
         } else {
-            self.ready.push(cmd);
+            self.dispatch(cmd);
         }
+    }
+
+    /// Runs a command that needs no confirmation (any more). `New` only
+    /// opens the dialog; the app never sees it.
+    fn dispatch(&mut self, cmd: Command) {
+        match cmd {
+            Command::New => self.open_new_map(),
+            cmd => self.ready.push(cmd),
+        }
+    }
+
+    /// Opens the New Map dialog with the default size.
+    pub fn open_new_map(&mut self) {
+        self.new_map = Some(NewMapForm::default());
+    }
+
+    pub fn new_map_open(&self) -> bool {
+        self.new_map.is_some()
+    }
+
+    pub fn new_map_form(&self) -> Option<NewMapForm> {
+        self.new_map
+    }
+
+    pub fn set_new_map_form(&mut self, form: NewMapForm) {
+        if self.new_map.is_some() {
+            self.new_map = Some(form);
+        }
+    }
+
+    /// The app calls this once a map was created.
+    pub fn close_new_map(&mut self) {
+        self.new_map = None;
     }
 
     /// Commands the app should execute now.
@@ -194,6 +265,8 @@ pub fn setup_style(ctx: &egui::Context) {
 pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     let ctx = &ui.ctx().clone();
     menu_bar(ui, ed, st);
+    // Dialogs that ask for something block the Enter shortcut of the welcome screen.
+    let modal = st.new_map.is_some() || st.confirm.is_some();
     if st.show_tools {
         tools_panel(ctx, ed, st);
     }
@@ -201,7 +274,8 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         zoom_panel(ctx, ed, st);
     }
     dialogs(ctx, ed, st);
-    startup_window(ctx, st);
+    startup_window(ctx, st, modal);
+    new_map_window(ctx, st);
 }
 
 fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -309,14 +383,25 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.refresh_thumbs(ctx, ed.brush_rgb);
     st.layout.textures.clear();
     st.layout.swatches.clear();
+    st.layout.shapes.clear();
+    st.layout.fills.clear();
+    st.layout.border_toggle = None;
+    st.layout.eraser_toggle = None;
+    let max_height = (ctx.content_rect().height() - 70.0).max(240.0);
     egui::Window::new("Textures")
         .anchor(Align2::LEFT_TOP, [10.0, 40.0])
         .resizable(false)
         .collapsible(true)
         .show(ctx, |ui| {
+          egui::ScrollArea::vertical()
+              .min_scrolled_height(max_height)
+              .max_height(max_height)
+              .auto_shrink([false, true])
+              .show(ui, |ui| {
             const COLUMNS: usize = 4;
             const THUMB: f32 = 46.0;
             ui.set_width(COLUMNS as f32 * (THUMB + 6.0));
+            ui.set_max_width(COLUMNS as f32 * (THUMB + 6.0));
 
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
@@ -407,6 +492,40 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 );
             });
             ed.brush_half = half;
+            let eraser = ui
+                .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
+                .on_hover_text("Brush and shapes remove cells instead of painting");
+            st.layout.eraser_toggle = Some(eraser.rect);
+
+            ui.separator();
+            ui.label(RichText::new("Shape  (right mouse drag)").strong());
+            egui::Grid::new("shape_grid").spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, shape) in Shape::ALL.into_iter().enumerate() {
+                    let r = ui.selectable_value(&mut ed.shape, shape, shape.name());
+                    st.layout.shapes.push(r.rect);
+                    if i % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+            ui.label(RichText::new("Fill").strong());
+            egui::Grid::new("fill_grid").spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, fill) in Fill::ALL.into_iter().enumerate() {
+                    let r = ui.selectable_value(&mut ed.fill, fill, fill.name());
+                    st.layout.fills.push(r.rect);
+                    if i % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+            let border = ui
+                .add_enabled(
+                    ed.fill != Fill::Outline && ed.shape != Shape::Line,
+                    egui::Checkbox::new(&mut ed.border, "Solid border around the fill"),
+                )
+                .on_hover_text("Brush size sets the border / outline thickness");
+            st.layout.border_toggle = Some(border.rect);
+          });
         });
 }
 
@@ -421,12 +540,16 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 ui.label(RichText::new(ed.zoom_label()).size(26.0).strong());
                 ui.label(
                     RichText::new(format!(
-                        "depth {}  ·  {:.1} px/cell",
+                        "depth {} of {}  ·  {:.1} px/cell",
                         ed.camera.depth,
+                        ed.spec().max_depth,
                         ed.pixels_per_cell()
                     ))
                     .weak(),
                 );
+                if let Some((w, h)) = ed.spec().extent(0) {
+                    ui.label(RichText::new(format!("map {w} × {h} cells")).weak());
+                }
                 ui.label(RichText::new(format!("snap: {}", snap_label(ed.camera.depth))).weak())
                     .on_hover_text(
                         "Strokes snap to the cells of the depth you are drawing on.\n\
@@ -455,8 +578,8 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 
             let mut level = ed.zoom_level();
             ui.spacing_mut().slider_width = 170.0;
-            let slider = egui::Slider::new(&mut level, MIN_ZOOM_LEVEL..=MAX_ZOOM_LEVEL)
-                .show_value(false);
+            let (lo, hi) = ed.zoom_range();
+            let slider = egui::Slider::new(&mut level, lo..=hi).show_value(false);
             if ui.add(slider).changed() {
                 ed.set_zoom_level(level);
             }
@@ -473,7 +596,10 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     ed.jump_depth(-1);
                 }
                 if ui
-                    .add_sized([w, 26.0], egui::Button::new("Down one"))
+                    .add_enabled(
+                        ed.camera.depth < ed.spec().max_depth,
+                        egui::Button::new("Down one").min_size(vec2(w, 26.0)),
+                    )
                     .on_hover_text("Into the next, finer layer")
                     .clicked()
                 {
@@ -489,7 +615,7 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             )
             .on_hover_text("Opacity of the layer behind the one you are drawing on");
             ui.checkbox(&mut st.show_grid, "Show grid");
-            if ui.button("Reset view").clicked() {
+            if ui.button("Show whole map").clicked() {
                 ed.reset_view();
             }
         });
@@ -505,17 +631,18 @@ fn depth_subdiv() -> i64 {
     depthmap_core::SUBDIV
 }
 
-fn startup_window(ctx: &egui::Context, st: &mut UiState) {
+fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     st.layout.startup_continue = None;
     st.layout.startup_open = None;
     st.layout.startup_new = None;
     st.layout.startup_recent.clear();
-    if !st.startup {
+    // The New Map dialog takes over; the welcome screen returns if it is cancelled.
+    if !st.startup || st.new_map.is_some() {
         return;
     }
     let recent = st.recent.clone();
     let last = recent.iter().find(|e| e.exists).cloned();
-    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let enter = !modal && ctx.input(|i| i.key_pressed(egui::Key::Enter));
     let mut chosen: Option<Command> = None;
 
     egui::Window::new("Welcome to depthmap")
@@ -588,13 +715,134 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState) {
         });
 
     if let Some(cmd) = chosen {
-        st.ready.push(cmd);
+        st.dispatch(cmd);
+    }
+}
+
+/// `1234567` -> `1,234,567`.
+fn grouped(n: i64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn new_map_window(ctx: &egui::Context, st: &mut UiState) {
+    st.layout.new_presets.clear();
+    st.layout.new_create = None;
+    st.layout.new_cancel = None;
+    let Some(mut form) = st.new_map else { return };
+    let mut create = false;
+    let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut rects = Vec::new();
+    let mut create_rect = None;
+    let mut cancel_rect = None;
+
+    egui::Window::new("New map")
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Map size").strong());
+            ui.label(
+                RichText::new("Cells across the whole map, as seen fully zoomed out.")
+                    .weak()
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                for n in [32u32, 64, 128, 256, 512, 1024] {
+                    let selected = form.width == n && form.height == n;
+                    let r = ui.selectable_label(selected, format!("{n}"));
+                    rects.push(r.rect);
+                    if r.clicked() {
+                        form.width = n;
+                        form.height = n;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Width");
+                ui.add(
+                    egui::DragValue::new(&mut form.width)
+                        .range(MIN_MAP_SIZE..=MAX_MAP_SIZE)
+                        .speed(1.0),
+                );
+                ui.label("Height");
+                ui.add(
+                    egui::DragValue::new(&mut form.height)
+                        .range(MIN_MAP_SIZE..=MAX_MAP_SIZE)
+                        .speed(1.0),
+                );
+                ui.label("cells");
+            });
+
+            ui.separator();
+            ui.label(RichText::new("Depth").strong());
+            ui.label(
+                RichText::new("How many times you can zoom into a cell to draw finer detail.")
+                    .weak()
+                    .small(),
+            );
+            let mut depths = form.depths;
+            ui.spacing_mut().slider_width = 250.0;
+            ui.add(egui::Slider::new(&mut depths, 0..=MAX_DEPTH));
+            form.depths = depths;
+
+            let spec = form.spec();
+            if let Some((fw, fh)) = spec.finest_extent() {
+                let per = depthmap_core::SUBDIV.pow(spec.max_depth as u32);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Finest layer: {} × {} cells\n1 map cell = {} × {} cells at the deepest zoom",
+                        grouped(fw),
+                        grouped(fh),
+                        grouped(per),
+                        grouped(per)
+                    ))
+                    .weak(),
+                );
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let c = ui.add_sized(
+                    [140.0, 30.0],
+                    egui::Button::new(RichText::new("Create").strong())
+                        .fill(ui.visuals().selection.bg_fill),
+                );
+                create_rect = Some(c.rect);
+                create = c.clicked();
+                let x = ui.add_sized([100.0, 30.0], egui::Button::new("Cancel"));
+                cancel_rect = Some(x.rect);
+                cancel |= x.clicked();
+            });
+        });
+
+    st.layout.new_presets = rects;
+    st.layout.new_create = create_rect;
+    st.layout.new_cancel = cancel_rect;
+    if create {
+        st.new_map = None;
+        st.ready.push(Command::Create(form.spec()));
+    } else if cancel {
+        st.new_map = None;
+    } else {
+        st.new_map = Some(form);
     }
 }
 
 fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     if let Some(cmd) = st.confirm.clone() {
         egui::Window::new("Unsaved changes")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -605,7 +853,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     if ui.button("Save").clicked() {
                         st.confirm = None;
                         if ed.save() {
-                            st.ready.push(cmd.clone());
+                            st.dispatch(cmd.clone());
                         } else {
                             // Untitled: pick a file first; the user then retries.
                             st.ready.push(Command::SaveAs);
@@ -613,7 +861,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     }
                     if ui.button("Discard").clicked() {
                         st.confirm = None;
-                        st.ready.push(cmd);
+                        st.dispatch(cmd);
                     }
                     if ui.button("Cancel").clicked() {
                         st.confirm = None;
@@ -631,7 +879,9 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 egui::Grid::new("help").striped(true).show(ui, |ui| {
                     for (k, v) in [
                         ("Left mouse", "Paint with the selected texture and color"),
-                        ("Right mouse", "Erase"),
+                        ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
+                        ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
+                        ("Esc", "Cancel the shape being dragged"),
                         ("Middle mouse / Space + drag", "Pan"),
                         ("Mouse wheel", "Zoom (deeper zoom = finer layer)"),
                         ("WASD / arrow keys", "Pan (physical key positions)"),
@@ -692,7 +942,10 @@ impl Gui {
     /// True while the pointer is over any panel or window (so clicks there
     /// must not paint).
     pub fn pointer_over_ui(&self) -> bool {
-        self.ctx.is_pointer_over_egui() || self.state.confirm_open() || self.state.startup_open()
+        self.ctx.is_pointer_over_egui()
+            || self.state.confirm_open()
+            || self.state.startup_open()
+            || self.state.new_map_open()
     }
 
     /// Draws the UI into `target` on top of what is already there.
@@ -758,6 +1011,20 @@ mod tests {
     }
 
     #[test]
+    fn new_map_with_unsaved_work_asks_first_then_opens_the_dialog() {
+        let mut st = UiState::new();
+        st.request(Command::New, true);
+        assert!(st.confirm_open() && !st.new_map_open());
+    }
+
+    #[test]
+    fn grouped_numbers() {
+        assert_eq!(grouped(7), "7");
+        assert_eq!(grouped(1234), "1,234");
+        assert_eq!(grouped(4_398_046_511_104), "4,398,046,511,104");
+    }
+
+    #[test]
     fn snap_label_shows_the_cell_size_of_each_depth() {
         assert_eq!(snap_label(0), "1 cell");
         assert_eq!(snap_label(1), "1/4 cell");
@@ -768,8 +1035,8 @@ mod tests {
     fn destructive_commands_ask_first_only_when_there_are_unsaved_changes() {
         let mut st = UiState::new();
         st.request(Command::New, false);
-        assert_eq!(st.take_commands(), vec![Command::New]);
-        assert!(!st.confirm_open());
+        assert!(st.take_commands().is_empty(), "New opens the dialog instead");
+        assert!(st.new_map_open() && !st.confirm_open());
 
         st.request(Command::Open, true);
         assert!(st.confirm_open());

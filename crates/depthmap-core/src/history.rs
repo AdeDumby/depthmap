@@ -34,6 +34,13 @@ impl History {
         }
     }
 
+    /// Records edits that were already applied to the world (a shape that
+    /// was previewed live) as one undo step.
+    pub fn record_applied(&mut self, edits: Vec<CellEdit>) {
+        self.current.extend(edits);
+        self.end_stroke();
+    }
+
     /// Closes the current stroke so it becomes one undo step.
     pub fn end_stroke(&mut self) {
         if self.current.is_empty() {
@@ -114,6 +121,25 @@ mod tests {
         assert!(h.redo(&mut w));
         assert_eq!((w.get(0, 2, 0), w.get(0, 3, 0), w.get(1, 40, -3)), (2, EMPTY, 5));
         assert!(!h.redo(&mut w));
+    }
+
+    #[test]
+    fn applied_edits_become_one_undo_step() {
+        let mut w = World::new();
+        let mut h = History::new();
+        let mut edits = Vec::new();
+        for x in 0..4 {
+            let old = w.set(0, x, 0, 3);
+            edits.push(CellEdit { depth: 0, x, y: 0, old, new: 3 });
+        }
+        h.record_applied(edits);
+        assert!(h.can_undo());
+        assert!(h.undo(&mut w));
+        assert_eq!(w.total_chunks(), 0);
+        assert!(h.redo(&mut w));
+        assert_eq!(w.get(0, 3, 0), 3);
+        h.record_applied(Vec::new());
+        assert!(!h.can_redo() || h.can_undo(), "an empty record changes nothing");
     }
 
     #[test]

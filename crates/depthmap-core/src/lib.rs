@@ -21,13 +21,17 @@ pub mod history;
 pub mod colors;
 pub mod io;
 pub mod raster;
+pub mod shape;
+pub mod spec;
 pub mod texture;
 pub mod world;
 
 pub use camera::{Camera, LayerView};
 pub use chunk::{Cell, Chunk, ChunkPos, EMPTY, cell_color, cell_texture, make_cell};
 pub use colors::ColorTable;
-pub use history::History;
+pub use history::{CellEdit, History};
+pub use shape::{Fill, Shape, ShapeStyle};
+pub use spec::MapSpec;
 pub use world::World;
 
 /// Children per axis: one cell at depth `d` becomes `SUBDIV²` cells at `d + 1`.

@@ -245,7 +245,11 @@ fn startup_without_history_offers_open_and_new_only() {
     assert!(h.st.layout.startup_recent.is_empty());
 
     h.click(h.st.layout.startup_new.unwrap().center());
-    assert_eq!(h.st.take_commands(), vec![Command::New]);
+    assert!(h.st.take_commands().is_empty(), "New opens the size dialog first");
+    assert!(h.st.new_map_open());
+    h.st.close_new_map();
+    h.frame(vec![]);
+    h.frame(vec![]);
     h.click(h.st.layout.startup_open.unwrap().center());
     assert_eq!(h.st.take_commands(), vec![Command::Open]);
     // Enter does nothing when there is no map to continue with.
@@ -472,4 +476,171 @@ fn startup_screen_renders() {
     };
     assert_ne!(px(r.min.x + 6.0, r.center().y), [230, 222, 204], "welcome window not drawn");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---- New Map dialog ---------------------------------------------------------
+
+#[test]
+fn new_map_dialog_asks_for_size_and_depth_then_creates() {
+    let mut h = Harness::new();
+    h.st.open_startup();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.startup_new.unwrap().center());
+    assert!(h.st.new_map_open());
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.new_presets.len(), 6);
+    assert_eq!(h.st.new_map_form().unwrap().width, 128, "defaults offered");
+
+    // Pick the 256 preset by clicking it.
+    h.click(h.st.layout.new_presets[3].center());
+    let form = h.st.new_map_form().unwrap();
+    assert_eq!((form.width, form.height), (256, 256));
+
+    // A custom, non-square size and depth (as typed or dragged in the fields).
+    h.st.set_new_map_form(depthmap::gui::NewMapForm { width: 90, height: 40, depths: 5 });
+    h.frame(vec![]);
+    h.click(h.st.layout.new_create.unwrap().center());
+    assert!(!h.st.new_map_open());
+    assert_eq!(h.st.take_commands(), vec![Command::Create(depthmap_core::MapSpec::new(90, 40, 5))]);
+}
+
+#[test]
+fn new_map_dialog_can_be_cancelled_by_button_or_escape() {
+    let mut h = Harness::new();
+    h.st.open_new_map();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.new_cancel.unwrap().center());
+    assert!(!h.st.new_map_open());
+    assert!(h.st.take_commands().is_empty());
+
+    h.st.open_new_map();
+    h.frame(vec![]);
+    h.frame(vec![Event::Key {
+        key: egui::Key::Escape,
+        physical_key: Some(egui::Key::Escape),
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    }]);
+    assert!(!h.st.new_map_open());
+    assert!(h.st.take_commands().is_empty());
+}
+
+#[test]
+fn new_map_dialog_is_modal_and_does_not_let_enter_open_the_last_map() {
+    let (dir, maps) = temp_maps("modal", &["a.dmap"], &[true]);
+    let mut h = Harness::new();
+    h.st.set_recent(&maps);
+    h.st.open_startup();
+    h.st.open_new_map();
+    h.frame(vec![]);
+    h.frame(vec![enter_key()]);
+    assert!(h.st.take_commands().is_empty());
+    assert!(h.st.new_map_open());
+    h.hover(Pos2::new(W * 0.5, H * 0.5));
+    assert!(h.ctx.is_pointer_over_egui());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn creating_applies_to_the_editor() {
+    let mut h = Harness::new();
+    h.ed.new_map(depthmap_core::MapSpec::new(50, 50, 2));
+    assert_eq!(h.ed.spec().max_depth, 2);
+    h.frame(vec![]);
+    // The zoom panel reflects the map.
+    assert!(h.ed.zoom_range().1 <= 5.0 + 1e-9);
+}
+
+// ---- shape controls -----------------------------------------------------------
+
+#[test]
+fn clicking_shape_and_fill_buttons_selects_them() {
+    use depthmap_core::{Fill, Shape};
+    let mut h = Harness::new();
+    assert_eq!(h.st.layout.shapes.len(), Shape::ALL.len());
+    assert_eq!(h.st.layout.fills.len(), Fill::ALL.len());
+    for (i, shape) in Shape::ALL.iter().enumerate() {
+        h.click(h.st.layout.shapes[i].center());
+        assert_eq!(h.ed.shape, *shape);
+    }
+    for (i, fill) in Fill::ALL.iter().enumerate() {
+        h.click(h.st.layout.fills[i].center());
+        assert_eq!(h.ed.fill, *fill);
+    }
+}
+
+#[test]
+fn border_toggle_only_applies_to_filled_shapes_and_eraser_toggles() {
+    use depthmap_core::{Fill, Shape};
+    let mut h = Harness::new();
+    h.ed.shape = Shape::Rectangle;
+    h.ed.fill = Fill::Outline;
+    h.frame(vec![]);
+    h.click(h.st.layout.border_toggle.unwrap().center());
+    assert!(!h.ed.border, "disabled for an outline");
+
+    h.ed.fill = Fill::Dither50;
+    h.frame(vec![]);
+    h.click(h.st.layout.border_toggle.unwrap().center());
+    assert!(h.ed.border);
+
+    h.ed.shape = Shape::Line;
+    h.ed.border = false;
+    h.frame(vec![]);
+    h.click(h.st.layout.border_toggle.unwrap().center());
+    assert!(!h.ed.border, "lines have no fill");
+
+    assert!(!h.ed.eraser);
+    h.click(h.st.layout.eraser_toggle.unwrap().center());
+    assert!(h.ed.eraser);
+}
+
+#[test]
+fn every_tool_control_is_reachable_in_a_short_window() {
+    // 1280 x 720 is a common laptop size: the panel must scroll, not run off screen.
+    let mut h = Harness::new();
+    h.ed.resize(1280.0, 720.0);
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    for r in [h.st.layout.eraser_toggle.unwrap(), h.st.layout.shapes[0]] {
+        h.hover(r.center());
+        assert!(h.ctx.is_pointer_over_egui());
+    }
+}
+
+#[test]
+fn new_map_dialog_renders_over_the_welcome_screen() {
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = depthmap::renderer::Renderer::new(gpu.device.clone(), gpu.queue.clone(), format);
+    let mut gui = Gui::new(&gpu.device, format);
+    let mut ed = Editor::with_spec(depthmap_core::MapSpec::new(64, 40, 3));
+    ed.resize(PW as f64, PH as f64);
+    gui.state.open_startup();
+    gui.state.open_new_map();
+    gui.state.set_new_map_form(depthmap::gui::NewMapForm { width: 256, height: 256, depths: 6 });
+    let view = gpu.target.create_view(&Default::default());
+    for i in 0..3 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+            time: Some(i as f64 * 0.1),
+            ..Default::default()
+        };
+        let out = gui.run(input, &mut ed);
+        renderer.render(&view, (PW, PH), &ed.world, &ed.camera, &Default::default());
+        gui.paint(&gpu.device, &gpu.queue, &view, [PW, PH], out);
+    }
+    let img = read_back(&gpu);
+    save_png("ui_new_map", &img);
+    let r = gui.state.layout.new_create.expect("create button");
+    let i = (((r.center().y as u32) * PW + (r.min.x as u32 + 6)) * 4) as usize;
+    assert_ne!([img[i], img[i + 1], img[i + 2]], [230, 222, 204]);
 }

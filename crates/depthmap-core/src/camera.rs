@@ -63,6 +63,10 @@ pub struct Camera {
     pub cell: (i64, i64),
     pub frac: (f64, f64),
     pub ppc: f64,
+    /// Zoom-out limit, in pixels per cell *at depth 0* (see [`MIN_PPC`]).
+    pub min_ppc: f64,
+    /// Deepest depth the camera may descend to (the map's depth).
+    pub max_depth: u8,
 }
 
 impl Default for Camera {
@@ -78,7 +82,15 @@ impl Camera {
             cell: (0, 0),
             frac: (0.0, 0.0),
             ppc: BASE_PPC,
+            min_ppc: MIN_PPC,
+            max_depth: MAX_DEPTH,
         }
+    }
+
+    /// Lowest and highest [`zoom_level`](Self::zoom_level) allowed by this
+    /// camera's limits.
+    pub fn zoom_range(&self) -> (f64, f64) {
+        ((self.min_ppc / BASE_PPC).log2(), 2.0 * self.max_depth as f64 + 1.0)
     }
 
     /// Total zoom as a base-2 logarithm: `0` is the default view, `+1`
@@ -91,7 +103,8 @@ impl Camera {
     /// Zooms to an absolute `zoom_level`, keeping the screen point
     /// `(sx, sy)` fixed.
     pub fn set_zoom_level(&mut self, level: f64, sx: f64, sy: f64, vw: f64, vh: f64) {
-        let level = level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        let (lo, hi) = self.zoom_range();
+        let level = level.clamp(lo, hi);
         let factor = (level - self.zoom_level()).exp2();
         self.zoom_at(factor, sx, sy, vw, vh);
     }
@@ -179,9 +192,9 @@ impl Camera {
     pub fn zoom_at(&mut self, factor: f64, sx: f64, sy: f64, vw: f64, vh: f64) {
         let mut new_ppc = self.ppc * factor;
         if self.depth == 0 {
-            new_ppc = new_ppc.max(MIN_PPC);
+            new_ppc = new_ppc.max(self.min_ppc);
         }
-        if self.depth == MAX_DEPTH {
+        if self.depth >= self.max_depth {
             new_ppc = new_ppc.min(ZOOM_HI);
         }
         let f = new_ppc / self.ppc;
@@ -201,7 +214,17 @@ impl Camera {
         self.carry();
         let n = SUBDIV;
         let nf = n as f64;
-        while self.ppc >= ZOOM_HI && self.depth < MAX_DEPTH {
+        // A camera left deeper than the map allows climbs back up first.
+        while self.depth > self.max_depth {
+            self.frac = (
+                (self.cell.0.rem_euclid(n) as f64 + self.frac.0) / nf,
+                (self.cell.1.rem_euclid(n) as f64 + self.frac.1) / nf,
+            );
+            self.cell = (self.cell.0.div_euclid(n), self.cell.1.div_euclid(n));
+            self.ppc *= nf;
+            self.depth -= 1;
+        }
+        while self.ppc >= ZOOM_HI && self.depth < self.max_depth {
             let (fx, fy) = (self.frac.0 * nf, self.frac.1 * nf);
             let (flx, fly) = (fx.floor(), fy.floor());
             self.cell = (self.cell.0 * n + flx as i64, self.cell.1 * n + fly as i64);
@@ -219,9 +242,9 @@ impl Camera {
             self.depth -= 1;
         }
         if self.depth == 0 {
-            self.ppc = self.ppc.max(MIN_PPC);
+            self.ppc = self.ppc.max(self.min_ppc);
         }
-        if self.depth == MAX_DEPTH {
+        if self.depth == self.max_depth {
             self.ppc = self.ppc.min(ZOOM_HI);
         }
     }
@@ -379,6 +402,43 @@ mod tests {
         }
         assert_eq!(c.depth, MAX_DEPTH);
         assert!(c.ppc <= ZOOM_HI);
+    }
+
+    #[test]
+    fn map_limits_cap_depth_and_zoom_out() {
+        let mut c = Camera::new();
+        c.max_depth = 2;
+        c.min_ppc = 4.0;
+        for _ in 0..200 {
+            c.zoom_at(2.0, 10.0, 10.0, VW, VH);
+        }
+        assert_eq!(c.depth, 2);
+        assert!(c.ppc <= ZOOM_HI);
+        for _ in 0..200 {
+            c.zoom_at(0.5, 10.0, 10.0, VW, VH);
+        }
+        assert_eq!((c.depth, c.ppc), (0, 4.0));
+        let (lo, hi) = c.zoom_range();
+        assert!((lo - (4.0f64 / 32.0).log2()).abs() < 1e-12 && hi == 5.0);
+        c.set_zoom_level(100.0, 0.0, 0.0, VW, VH);
+        assert!((c.zoom_level() - 5.0).abs() < 1e-9 && c.depth == 2);
+        c.set_zoom_level(-100.0, 0.0, 0.0, VW, VH);
+        assert!((c.zoom_level() - lo).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_camera_deeper_than_the_map_climbs_back_up() {
+        let mut c = Camera::new();
+        c.depth = 5;
+        c.cell = (4100, 9000);
+        c.ppc = 20.0;
+        c.max_depth = 3;
+        let before = c.world_pos();
+        c.normalize();
+        assert_eq!(c.depth, 3);
+        assert!(c.ppc <= ZOOM_HI);
+        let after = c.world_pos();
+        assert!((before.0 - after.0).abs() < 1e-9 && (before.1 - after.1).abs() < 1e-9);
     }
 
     #[test]

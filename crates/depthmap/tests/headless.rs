@@ -5,7 +5,7 @@
 use depthmap::renderer::{RenderOptions, Renderer};
 use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::texture;
-use depthmap_core::{Camera, World, make_cell};
+use depthmap_core::{Camera, MapSpec, World, make_cell};
 
 const W: u32 = 512;
 const H: u32 = 384;
@@ -416,4 +416,53 @@ fn grid_shows_every_nearby_depth_with_heavier_parent_lines() {
     let quarter = dark(W / 2 + 15, y); // 1/4 cell = 15 px: next depth's cell edge
     let between = dark(W / 2 + 7, y);
     assert!(quarter > between + 3, "finer grid should be fading in: {quarter} vs {between}");
+}
+
+#[test]
+fn bounded_map_dims_everything_outside_and_outlines_the_edge() {
+    let Some(mut gpu) = gpu() else { return eprintln!("no GPU adapter; skipping") };
+    let cam = Camera::new(); // the centre of the screen is the map's top-left corner
+    let plain = World::new();
+    let map = World::with_spec(MapSpec::new(8, 8, 1));
+    let (a, _) = gpu.render(&plain, &cam, &NO_GRID, "bounds_off");
+    let (b, _) = gpu.render(&map, &cam, &NO_GRID, "bounds_on");
+
+    // Inside the map (right of and below the centre): untouched.
+    let inside = (400, 300);
+    assert_eq!(px(&a, inside.0, inside.1), px(&b, inside.0, inside.1));
+    // Outside (left of and above): clearly darker.
+    for out in [(100, 100), (100, 300), (400, 50)] {
+        let (pa, pb) = (px(&a, out.0, out.1), px(&b, out.0, out.1));
+        assert!(pb[0] < pa[0] / 2 + 10 && pb[1] < pa[1] / 2 + 10, "{out:?}: {pa:?} -> {pb:?}");
+    }
+    // The vertical edge at x = 256 and the horizontal one at y = 192 are drawn
+    // in the amber border colour.
+    for edge in [(256, 300), (400, 192)] {
+        let p = px(&b, edge.0, edge.1);
+        assert!(p[0] > 180 && p[0] > p[2] + 60, "edge pixel {edge:?} = {p:?}");
+    }
+}
+
+#[test]
+fn grid_stops_at_the_maps_deepest_level_and_outside_the_map() {
+    let Some(mut gpu) = gpu() else { return eprintln!("no GPU adapter; skipping") };
+    let cam = Camera::new();
+    let grid = RenderOptions { show_grid: true, ..NO_GRID };
+    // A map with no deeper level: the 1/4-cell grid that would fade in does not exist.
+    let shallow = World::with_spec(MapSpec { width: 0, height: 0, max_depth: 0 });
+    let deep = World::new();
+    let (s, _) = gpu.render(&shallow, &cam, &grid, "grid_shallow");
+    let (d, _) = gpu.render(&deep, &cam, &grid, "grid_deep");
+    // 8 px right of a cell line the finer grid has a line.
+    let (x, y) = (256 + 8, 300);
+    assert!(px(&d, x, y)[0] < px(&s, x, y)[0], "{:?} vs {:?}", px(&d, x, y), px(&s, x, y));
+    // The ordinary cell line is there in both.
+    assert_eq!(px(&d, 288, 300), px(&s, 288, 300));
+
+    // No grid lines outside a bounded map: a pixel on a cell line out there is
+    // exactly the dimmed background.
+    let map = World::with_spec(MapSpec::new(8, 8, 1));
+    let (g, _) = gpu.render(&map, &cam, &grid, "grid_bounded");
+    let (n, _) = gpu.render(&map, &cam, &NO_GRID, "grid_bounded_off");
+    assert_eq!(px(&g, 224, 100), px(&n, 224, 100));
 }

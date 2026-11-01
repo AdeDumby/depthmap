@@ -18,7 +18,8 @@ use winit::window::{Window, WindowId};
 const HELP: &str = "\
 depthmap [FILE] [--stress N]
 
-  LMB paint            RMB erase            MMB / Space+LMB pan
+  LMB paint            RMB drag shape       MMB / Space+LMB pan
+  Shift+mouse erase    E eraser toggle      Esc cancel shape
   wheel zoom           WASD / arrows pan    1-9, 0 texture
   [ ] brush size       Ctrl+Z / Ctrl+Y undo / redo
   Ctrl+N/O/S new / open / save   Ctrl+Shift+S save as   F1 help
@@ -195,9 +196,14 @@ impl App {
 
     fn run_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
         match cmd {
-            Command::New => {
-                self.editor.new_map();
+            // The UI handles `New` itself (it opens the New Map dialog).
+            Command::New => {}
+            Command::Create(spec) => {
+                self.editor.new_map(spec);
                 self.close_startup();
+                if let Some(g) = self.gfx.as_mut() {
+                    g.gui.state.close_new_map();
+                }
             }
             Command::Open => {
                 let mut dialog = rfd::FileDialog::new()
@@ -358,6 +364,10 @@ impl App {
         if !pressed {
             return;
         }
+        if let Key::Named(NamedKey::Escape) = event.logical_key {
+            self.editor.cancel_shape();
+            return;
+        }
         if let Key::Named(NamedKey::F1) = event.logical_key {
             if let Some(g) = self.gfx.as_mut() {
                 g.gui.state.toggle_help();
@@ -382,6 +392,7 @@ impl App {
         }
         if let Key::Character(c) = &event.logical_key {
             match c.as_str() {
+                "e" | "E" => self.editor.eraser = !self.editor.eraser,
                 "[" => self.editor.change_brush(-1),
                 "]" => self.editor.change_brush(1),
                 _ => {}
@@ -473,10 +484,13 @@ impl ApplicationHandler for App {
                     // Clicks that land on a panel or dialog belong to egui.
                     (_, true) if over_ui || consumed => {}
                     (MouseButton::Left, true) if self.space => self.editor.set_panning(true),
+                    (MouseButton::Left, true) if self.mods.shift_key() => self.editor.begin_erase(),
                     (MouseButton::Left, true) => self.editor.begin_paint(),
-                    (MouseButton::Right, true) => self.editor.begin_erase(),
+                    // Right button: drag out a shape (Shift erases with it).
+                    (MouseButton::Right, true) => self.editor.begin_shape(self.mods.shift_key()),
                     (MouseButton::Middle, true) => self.editor.set_panning(true),
-                    // Releases always end whatever was in progress.
+                    (MouseButton::Right, false) => self.editor.end_shape(),
+                    // Other releases end the brush stroke and panning.
                     (_, false) => {
                         self.editor.end_stroke();
                         self.editor.set_panning(false);
@@ -517,7 +531,12 @@ fn main() {
         }
     }
 
-    let mut editor = Editor::new();
+    // A stress test is an unbounded sandbox; otherwise start from a default-sized map.
+    let mut editor = if stress.is_some() {
+        Editor::new()
+    } else {
+        Editor::with_spec(depthmap_core::MapSpec::DEFAULT_NEW)
+    };
     // Launched with a file (or a stress test): go straight to it. Otherwise
     // the welcome screen offers the last map, opening another, or a new one.
     let show_startup = file.is_none() && stress.is_none();

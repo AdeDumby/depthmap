@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 
 use crate::chunk::{Cell, Chunk, ChunkPos, EMPTY, local_index, normalize};
 use crate::colors::ColorTable;
+use crate::spec::MapSpec;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
 /// Source of chunk version stamps. Global rather than per-world on purpose:
@@ -23,6 +24,7 @@ pub struct World {
     layers: Vec<FxHashMap<ChunkPos, Chunk>>,
     /// Number of edits so far (see [`World::revision`]).
     clock: u64,
+    spec: MapSpec,
 }
 
 impl Default for World {
@@ -32,12 +34,29 @@ impl Default for World {
 }
 
 impl World {
+    /// An empty, unbounded map (every depth, no size limit).
     pub fn new() -> Self {
+        Self::with_spec(MapSpec::UNBOUNDED)
+    }
+
+    /// An empty map of the given size and depth.
+    pub fn with_spec(spec: MapSpec) -> Self {
         Self {
             colors: ColorTable::new(),
             layers: (0..=MAX_DEPTH).map(|_| FxHashMap::default()).collect(),
             clock: 0,
+            spec,
         }
+    }
+
+    pub fn spec(&self) -> MapSpec {
+        self.spec
+    }
+
+    /// True if the cell lies inside the map.
+    #[inline]
+    pub fn in_bounds(&self, depth: u8, x: i64, y: i64) -> bool {
+        self.spec.contains(depth, x, y)
     }
 
     #[inline]
@@ -49,8 +68,14 @@ impl World {
 
     /// Sets a cell and returns the previous value. Chunks are created on
     /// demand and dropped again when their last cell is erased.
+    ///
+    /// Cells outside the map (see [`MapSpec`]) are ignored; like any other
+    /// no-op, that returns `m` itself.
     pub fn set(&mut self, depth: u8, x: i64, y: i64, m: Cell) -> Cell {
         let m = normalize(m);
+        if !self.spec.contains(depth, x, y) {
+            return m;
+        }
         let pos = ChunkPos::containing(x, y);
         let idx = local_index(x, y);
         let layer = &mut self.layers[depth as usize];
@@ -99,6 +124,13 @@ impl World {
     /// changed in between (used for the "unsaved changes" flag).
     pub fn revision(&self) -> u64 {
         self.clock
+    }
+
+    /// Puts the edit counter back to an earlier value. Only valid when the
+    /// map has been restored to exactly the state it had at that revision
+    /// (cancelling a shape preview), so the "unsaved changes" flag stays honest.
+    pub fn rewind_revision(&mut self, to: u64) {
+        self.clock = self.clock.min(to);
     }
 
     #[inline]
@@ -255,6 +287,32 @@ mod tests {
         assert!(w.revision() > r);
         let r = w.revision();
         w.set(0, 0, 0, 1);
+        assert_eq!(w.revision(), r);
+    }
+
+    #[test]
+    fn cells_outside_the_map_are_ignored() {
+        let mut w = World::with_spec(MapSpec::new(8, 8, 1));
+        assert_eq!(w.set(0, 8, 0, 3), 3, "rejected like a no-op");
+        assert_eq!(w.set(0, -1, 0, 3), 3);
+        assert_eq!(w.set(2, 0, 0, 3), 3, "depth 2 does not exist in this map");
+        assert_eq!(w.total_chunks(), 0);
+        assert_eq!(w.revision(), 0);
+        assert_eq!(w.set(1, 31, 31, 3), EMPTY);
+        assert_eq!(w.get(1, 31, 31), 3);
+        assert_eq!(w.set(1, 32, 31, 3), 3);
+        assert_eq!(w.total_chunks(), 1);
+    }
+
+    #[test]
+    fn rewinding_the_revision_never_moves_it_forward() {
+        let mut w = World::new();
+        w.set(0, 0, 0, 1);
+        let r = w.revision();
+        w.set(0, 1, 0, 1);
+        w.rewind_revision(r);
+        assert_eq!(w.revision(), r);
+        w.rewind_revision(r + 100);
         assert_eq!(w.revision(), r);
     }
 

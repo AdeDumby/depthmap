@@ -19,11 +19,15 @@ struct Overlay {
     cursor_size: f32,
     cursor_on: f32,
     grid: f32,           // 1.0 = draw grid lines
+    max_depth: f32,      // deepest depth of the map
+    bounded: f32,        // 1.0 = the map has edges
+    pad: f32,
+    map_min: vec2<f32>,  // map corners in cells relative to the view cell
+    map_max: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> o: Overlay;
 
-const MAX_DEPTH: i32 = 16;
 const MIN_LEVEL_PX: f32 = 2.5;   // finer than this is invisible
 const MAX_LEVEL_PX: f32 = 8192.0; // coarser than this is off screen
 
@@ -48,6 +52,11 @@ fn level_lines(pa: vec2<f32>, spacing: f32) -> f32 {
     return line * strength * visible;
 }
 
+// `src` over the premultiplied colour `dst`.
+fn over(dst: vec4<f32>, rgb: vec3<f32>, a: f32) -> vec4<f32> {
+    return vec4<f32>(rgb * a + dst.rgb * (1.0 - a), a + dst.a * (1.0 - a));
+}
+
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Cells relative to the view cell; all values stay small, so f32 is exact enough.
@@ -57,10 +66,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var grid = 0.0;
     if (o.grid > 0.5) {
         let depth = i32(o.depth + 0.5);
+        let deepest = i32(o.max_depth + 0.5);
         // o = +2 .. -5: two finer levels down to five coarser ones.
         for (var lvl = 2; lvl >= -5; lvl = lvl - 1) {
             let k = depth + lvl;
-            if (k < 0 || k > MAX_DEPTH) {
+            if (k < 0 || k > deepest) {
                 continue;
             }
             let spacing = exp2(f32(-2 * lvl));
@@ -81,8 +91,25 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
-    // Dark grid lines under a white cursor, straight alpha.
-    let a = grid + cur * (1.0 - grid);
-    let rgb = select(vec3<f32>(0.0), vec3<f32>(1.0), a > 0.0) * (cur * (1.0 - grid) / max(a, 1e-5));
-    return vec4<f32>(rgb, a);
+    // Signed distance (pixels, positive outside) to the edge of the map.
+    var outside = 0.0;
+    var edge = 0.0;
+    if (o.bounded > 0.5) {
+        let lo = o.map_min - p;
+        let hi = p - o.map_max;
+        let sd = max(max(lo.x, hi.x), max(lo.y, hi.y)) * o.ppc;
+        outside = smoothstep(0.0, 1.0, sd);
+        edge = 1.0 - smoothstep(1.0, 2.2, abs(sd));
+        // No grid outside the map.
+        grid = grid * (1.0 - outside);
+    }
+
+    // Layers composited back to front onto premultiplied alpha:
+    // dimmed surroundings, brush cursor, map border, grid lines.
+    var acc = vec4<f32>(0.0);
+    acc = over(acc, vec3<f32>(0.0), 0.55 * outside);
+    acc = over(acc, vec3<f32>(1.0), cur);
+    acc = over(acc, vec3<f32>(0.98, 0.66, 0.16), 0.9 * edge);
+    acc = over(acc, vec3<f32>(0.0), grid);
+    return vec4<f32>(acc.rgb / max(acc.a, 1e-5), acc.a);
 }
