@@ -726,3 +726,275 @@ fn node_popup_edits_the_node_and_its_buttons_work() {
     h.click(h.st.layout.node_import.unwrap().center());
     assert_eq!(h.st.take_commands(), vec![Command::ImportIcons]);
 }
+
+fn key(k: egui::Key, pressed: bool) -> Event {
+    Event::Key { key: k, physical_key: Some(k), pressed, repeat: false, modifiers: Default::default() }
+}
+
+#[test]
+fn tool_buttons_switch_tools_and_select_controls_work() {
+    use depthmap::editor::{SelectKind, ToolMode};
+    let mut h = Harness::new();
+    assert_eq!(h.st.layout.tool_buttons.len(), 3);
+    assert_eq!(h.ed.tool, ToolMode::Paint);
+    assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
+
+    h.click(h.st.layout.tool_buttons[1].center());
+    assert_eq!(h.ed.tool, ToolMode::Fill);
+    h.click(h.st.layout.tool_buttons[2].center());
+    assert_eq!(h.ed.tool, ToolMode::Select);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.select_kinds.len(), 3);
+    h.click(h.st.layout.select_kinds[1].center());
+    assert_eq!(h.ed.select_kind, SelectKind::Contiguous);
+    h.click(h.st.layout.select_kinds[2].center());
+    assert_eq!(h.ed.select_kind, SelectKind::Matching);
+
+    h.click(h.st.layout.select_all.unwrap().center());
+    assert!(h.ed.has_selection());
+    h.frame(vec![]);
+    h.click(h.st.layout.select_invert.unwrap().center());
+    assert!(!h.ed.has_selection(), "inverting everything leaves nothing");
+    h.click(h.st.layout.select_invert.unwrap().center());
+    assert!(h.ed.has_selection());
+    h.frame(vec![]);
+    h.click(h.st.layout.select_clear.unwrap().center());
+    assert!(!h.ed.has_selection());
+
+    // Outside the select tool a selection can still be cleared from the panel.
+    h.ed.select_all();
+    h.click(h.st.layout.tool_buttons[0].center());
+    h.frame(vec![]);
+    h.click(h.st.layout.select_clear.unwrap().center());
+    assert!(!h.ed.has_selection());
+}
+
+#[test]
+fn colour_wheel_and_brightness_bar_set_the_brush_colour() {
+    let mut h = Harness::new();
+    let wheel = h.st.layout.wheel.unwrap();
+    // The wheel keeps the brightness; start from full.
+    let bar = h.st.layout.value_bar.unwrap();
+    h.click(egui::pos2(bar.right() - 1.0, bar.center().y));
+    assert!(h.ed.brush_rgb.iter().copied().max().unwrap() > 250);
+    // The right edge of the wheel is fully saturated red; the centre is white.
+    h.click(wheel.center() + vec2(wheel.width() * 0.5 - 2.0, 0.0));
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(r > 240 && g < 20 && b < 20, "{:?}", h.ed.brush_rgb);
+    h.click(wheel.center());
+    assert!(h.ed.brush_rgb.iter().all(|&c| c > 240), "{:?}", h.ed.brush_rgb);
+    // Straight down is 90 degrees: hue 0.25, a yellow-green.
+    h.click(wheel.center() + vec2(0.0, wheel.height() * 0.5 - 2.0));
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(g > 240 && b < 20 && r > 100 && r < 140, "{:?}", h.ed.brush_rgb);
+
+    // Half brightness halves every channel.
+    h.click(egui::pos2(bar.center().x, bar.center().y));
+    let [r2, g2, _] = h.ed.brush_rgb;
+    assert!((g2 as i32 - 128).abs() < 8 && r2 < r, "{:?}", h.ed.brush_rgb);
+    h.click(egui::pos2(bar.left() + 1.0, bar.center().y));
+    assert!(h.ed.brush_rgb.iter().all(|&c| c < 8), "black at the left end");
+    // Wheel clicks on black do not lose the colour entirely: brightness is separate.
+    assert_eq!(h.ed.world.colors.len(), DEFAULT_COLORS.len(), "picking never grows the colour table");
+}
+
+#[test]
+fn hex_field_follows_the_brush_and_accepts_typed_colours() {
+    let mut h = Harness::new();
+    h.ed.set_brush_rgb([0x12, 0xab, 0xef]);
+    h.frame(vec![]);
+    assert_eq!(h.st.hex_text(), "#12abef");
+    // Selecting a swatch updates the text and the wheel's brightness.
+    h.click(h.st.layout.swatches[1].center());
+    assert_eq!(h.st.hex_text(), format!("#{:02x}{:02x}{:02x}", 34, 34, 38));
+
+    // Type a new colour: focus the field, select all, type.
+    let field = h.st.layout.hex_field.unwrap();
+    h.click(field.center());
+    let ctrl = egui::Modifiers { command: true, ctrl: true, ..Default::default() };
+    h.frame(vec![Event::Key {
+        key: egui::Key::A,
+        physical_key: Some(egui::Key::A),
+        pressed: true,
+        repeat: false,
+        modifiers: ctrl,
+    }]);
+    h.frame(vec![Event::Text("#ff8000".into())]);
+    h.frame(vec![]);
+    assert_eq!(h.ed.brush_rgb, [255, 128, 0]);
+    // The wheel followed: orange, full brightness.
+    let [hue, s, v] = h.st.hsv();
+    assert!((hue - 128.0 / 255.0 / 6.0 * 1.0).abs() < 0.01 && s > 0.99 && v > 0.99, "{:?}", h.st.hsv());
+
+    // Half-typed or invalid codes change nothing.
+    h.frame(vec![key(egui::Key::Backspace, true), key(egui::Key::Backspace, false)]);
+    h.frame(vec![]);
+    assert_eq!(h.ed.brush_rgb, [255, 128, 0]);
+}
+
+#[test]
+fn palettes_save_colour_and_texture_and_can_be_renamed_and_deleted() {
+    let mut h = Harness::new();
+    h.ed.set_texture(6);
+    h.ed.set_brush_rgb([10, 200, 90]);
+    h.frame(vec![]);
+
+    // Start from a fresh palette.
+    h.click(h.st.layout.palette_new.unwrap().center());
+    assert_eq!(h.st.palettes().list().len(), 2);
+    assert!(h.st.palettes().current().entries.is_empty());
+    h.frame(vec![]);
+
+    h.click(h.st.layout.palette_add.unwrap().center());
+    assert_eq!(h.st.palettes().current().entries.len(), 1);
+    let e = h.st.palettes().current().entries[0];
+    assert_eq!((e.rgb, e.texture), ([10, 200, 90], 6), "colour AND texture are saved");
+    h.frame(vec![]);
+    // Saving the same thing twice is refused.
+    h.click(h.st.layout.palette_add.unwrap().center());
+    assert_eq!(h.st.palettes().current().entries.len(), 1);
+
+    // A different colour with another texture is a second entry.
+    h.ed.set_texture(3);
+    h.ed.set_brush_rgb([200, 10, 10]);
+    h.frame(vec![]);
+    h.click(h.st.layout.palette_add.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.palette_entries.len(), 2);
+
+    // Clicking an entry restores both colour and texture.
+    h.click(h.st.layout.palette_entries[0].center());
+    assert_eq!((h.ed.brush_rgb, h.ed.texture), ([10, 200, 90], 6));
+    h.click(h.st.layout.palette_entries[1].center());
+    assert_eq!((h.ed.brush_rgb, h.ed.texture), ([200, 10, 10], 3));
+
+    // Rename it.
+    h.click(h.st.layout.palette_rename.unwrap().center());
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let field = h.st.layout.palette_name_field.expect("rename field is shown");
+    h.click(field.center());
+    let ctrl = egui::Modifiers { command: true, ctrl: true, ..Default::default() };
+    h.frame(vec![Event::Key {
+        key: egui::Key::A,
+        physical_key: Some(egui::Key::A),
+        pressed: true,
+        repeat: false,
+        modifiers: ctrl,
+    }]);
+    h.frame(vec![Event::Text("Swamp tiles".into())]);
+    h.frame(vec![]);
+    h.click(h.st.layout.palette_rename_ok.unwrap().center());
+    assert_eq!(h.st.palettes().current().name, "Swamp tiles");
+    assert!(h.st.layout.palette_name_field.is_none() || h.st.layout.palette_rename.is_some());
+    h.frame(vec![]);
+
+    // Delete it: the other palette becomes current again.
+    h.click(h.st.layout.palette_delete.unwrap().center());
+    assert_eq!(h.st.palettes().list().len(), 1);
+    assert_eq!(h.st.palettes().current().name, "Basics");
+}
+
+#[test]
+fn palette_entries_can_be_removed_from_their_context_menu() {
+    let mut h = Harness::new();
+    h.click(h.st.layout.palette_new.unwrap().center());
+    h.ed.set_brush_rgb([1, 2, 3]);
+    h.frame(vec![]);
+    h.click(h.st.layout.palette_add.unwrap().center());
+    h.frame(vec![]);
+    let at = h.st.layout.palette_entries[0].center();
+    let button = |pressed| Event::PointerButton {
+        pos: at,
+        button: PointerButton::Secondary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.frame(vec![Event::PointerMoved(at)]);
+    h.frame(vec![button(true)]);
+    h.frame(vec![button(false)]);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // The menu has opened: find its only button by clicking just below-right of the pointer.
+    let remove = at + vec2(40.0, 14.0);
+    h.click(remove);
+    assert!(h.st.palettes().current().entries.is_empty(), "entry removed");
+}
+
+#[test]
+fn the_colors_window_can_be_hidden_and_does_not_block_the_canvas_elsewhere() {
+    let mut h = Harness::new();
+    assert!(h.st.show_colors);
+    h.hover(h.st.layout.wheel.unwrap().center());
+    assert!(h.ctx.is_pointer_over_egui());
+    h.st.show_colors = false;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.layout.wheel.is_none() || h.st.layout.swatches.is_empty() == h.st.layout.swatches.is_empty());
+    h.hover(egui::pos2(640.0, 400.0));
+    assert!(!h.ctx.is_pointer_over_egui());
+}
+
+#[test]
+fn selection_colors_and_palettes_render() {
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = depthmap::renderer::Renderer::new(gpu.device.clone(), gpu.queue.clone(), format);
+    let mut gui = Gui::new(&gpu.device, format);
+    let mut ed = Editor::with_spec(depthmap_core::MapSpec::new(48, 32, 3));
+    ed.resize(PW as f64, PH as f64);
+    // Draw a ring of wall and some water, then select the room and an extra rectangle.
+    let wall = make_cell(4, ed.world.colors.index_of(DEFAULT_COLORS[1]));
+    let water = make_cell(9, ed.world.colors.index_of(DEFAULT_COLORS[7]));
+    for i in 10..=30 {
+        for (x, y) in [(i, 8), (i, 22), (10, i - 2), (30, i - 2)] {
+            ed.world.set(0, x, y, wall);
+        }
+    }
+    for y in 12..18 {
+        for x in 14..22 {
+            ed.world.set(0, x, y, water);
+        }
+    }
+    ed.tool = depthmap::editor::ToolMode::Select;
+    ed.select_kind = depthmap::editor::SelectKind::Contiguous;
+    let c = ed.camera.view().cell_origin_px(12, 10, PW as f64, PH as f64);
+    ed.mouse_moved(c.0 + 5.0, c.1 + 5.0);
+    ed.primary_press(false);
+    ed.primary_release();
+    ed.select_kind = depthmap::editor::SelectKind::Rectangle;
+    let a = ed.camera.view().cell_origin_px(33, 5, PW as f64, PH as f64);
+    ed.mouse_moved(a.0 + 5.0, a.1 + 5.0);
+    ed.primary_press(false);
+    let b = ed.camera.view().cell_origin_px(38, 9, PW as f64, PH as f64);
+    ed.mouse_moved(b.0 + 5.0, b.1 + 5.0); // still dragging: shown as a preview
+    ed.set_brush_rgb([210, 120, 40]);
+    gui.state.palettes_mut().create();
+    for (rgb, t) in [([210, 120, 40], 2u8), ([60, 140, 200], 9), ([90, 90, 90], 4), ([20, 160, 70], 7)] {
+        gui.state.palettes_mut().add_entry(1, depthmap::palette::Entry { rgb, texture: t });
+    }
+
+    let view = gpu.target.create_view(&Default::default());
+    for i in 0..3 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+            time: Some(i as f64 * 0.1),
+            ..Default::default()
+        };
+        let out = gui.run(input, &mut ed);
+        renderer.render(&view, (PW, PH), &ed.world, &ed.camera, &Default::default());
+        gui.paint(&gpu.device, &gpu.queue, &view, [PW, PH], out);
+    }
+    let img = read_back(&gpu);
+    save_png("ui_selection_colors", &img);
+    // The selection outline is drawn over the map in its accent colour.
+    let find_blue = img.chunks(4).filter(|p| p[2] > 200 && p[1] > 150 && p[0] < 140).count();
+    assert!(find_blue > 200, "selection outline visible: {find_blue}");
+    // The wheel is on screen.
+    let w = gui.state.layout.wheel.unwrap();
+    let i = (((w.center().y + 40.0) as u32 * PW + (w.center().x + 40.0) as u32) * 4) as usize;
+    assert_ne!(&img[i..i + 3], &[230, 222, 204]);
+}

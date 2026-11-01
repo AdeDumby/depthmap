@@ -86,6 +86,25 @@ cargo test                             # core + editor + UI + headless GPU rende
 | Ctrl+N / O / S, Ctrl+Shift+S | new / open / save, save as |
 | F1 | controls |
 
+## Fill, selection and colours
+
+**Tools** (top of the Tools panel): *Brush* (B), *Fill* (G), *Select* (M).
+
+* **Fill** - click to replace the whole connected area of identical cells (same
+  texture and colour) with the current texture and colour; Shift erases it. One undo
+  step. Areas over 2 million cells (an open, unbounded canvas) are refused.
+* **Select** - *Rectangle* (drag), *Connected* (click: the connected identical cells) or
+  *Same tiles* (click: every identical cell on the layer). Every new selection is
+  **added** to the current one. **Right click inverts** it, **Esc** (or Ctrl+D) clears it,
+  Ctrl+A selects all, Ctrl+I inverts. While something is selected, the brush, eraser,
+  shapes and fill cannot change cells outside it, which makes it easy to paint one area.
+  Selections work across zoom levels and are not part of the saved map or the undo history.
+* **Colors window** (View menu, or C): a hue/saturation wheel with a brightness bar, a hex
+  field, the map's colours, and **palettes**. *Save current* stores the colour **and** the
+  selected texture as an entry, so a palette works as a small tileset; click an entry to use
+  both, right click to remove it. Palettes can be created, renamed and deleted, and are kept
+  per user in the config folder (`palettes.txt`), not inside a map.
+
 ## Nodes
 
 Nodes are points of interest. Press **N** (or *Add node* in the tools panel / Edit

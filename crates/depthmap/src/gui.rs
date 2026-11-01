@@ -13,7 +13,9 @@ use depthmap_core::{Fill, Icon, MAX_DEPTH, MapSpec, Shape, World};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
 use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
 
-use crate::editor::{Editor, format_zoom};
+use crate::editor::{Editor, SelectKind, ToolMode, format_zoom};
+use crate::palette::{self, Entry, Palettes};
+use crate::wheel;
 
 /// Things the UI cannot do itself (file dialogs, quitting); the app runs them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +83,22 @@ pub struct UiLayout {
     pub node_delete: Option<egui::Rect>,
     pub node_cancel: Option<egui::Rect>,
     pub node_import: Option<egui::Rect>,
+    /// Brush, Fill, Select.
+    pub tool_buttons: Vec<egui::Rect>,
+    pub select_kinds: Vec<egui::Rect>,
+    pub select_all: Option<egui::Rect>,
+    pub select_invert: Option<egui::Rect>,
+    pub select_clear: Option<egui::Rect>,
+    pub wheel: Option<egui::Rect>,
+    pub value_bar: Option<egui::Rect>,
+    pub hex_field: Option<egui::Rect>,
+    pub palette_new: Option<egui::Rect>,
+    pub palette_rename: Option<egui::Rect>,
+    pub palette_delete: Option<egui::Rect>,
+    pub palette_add: Option<egui::Rect>,
+    pub palette_entries: Vec<egui::Rect>,
+    pub palette_name_field: Option<egui::Rect>,
+    pub palette_rename_ok: Option<egui::Rect>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -136,6 +154,8 @@ pub struct UiState {
     pub ghost_opacity: f32,
     pub show_tools: bool,
     pub show_zoom: bool,
+    /// The colour wheel and palettes window.
+    pub show_colors: bool,
     show_help: bool,
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
@@ -154,6 +174,17 @@ pub struct UiState {
     seen_icons_rev: u64,
     /// Node whose name field should grab the keyboard when its popup opens.
     focus_node: Option<depthmap_core::NodeId>,
+    palettes: Palettes,
+    /// Hue, saturation, brightness of the brush colour (kept so that greys
+    /// do not lose their hue while you drag the brightness around).
+    hsv: [f32; 3],
+    hsv_rgb: [u8; 3],
+    hex_text: String,
+    wheel_tex: Option<egui::TextureHandle>,
+    tile_cache: std::collections::HashMap<(u8, [u8; 3]), egui::TextureHandle>,
+    /// The palette name being edited.
+    renaming: Option<String>,
+    palette_note: String,
 }
 
 impl Default for UiState {
@@ -171,6 +202,7 @@ impl UiState {
             ghost_opacity: 0.35,
             show_tools: true,
             show_zoom: true,
+            show_colors: true,
             show_help: false,
             show_about: false,
             confirm: None,
@@ -184,7 +216,77 @@ impl UiState {
             icon_names: Vec::new(),
             seen_icons_rev: u64::MAX,
             focus_node: None,
+            palettes: Palettes::in_memory(),
+            hsv: [0.0, 0.0, 1.0],
+            hsv_rgb: [255, 255, 255],
+            hex_text: String::new(),
+            wheel_tex: None,
+            tile_cache: Default::default(),
+            renaming: None,
+            palette_note: String::new(),
         }
+    }
+
+    pub fn palettes(&self) -> &Palettes {
+        &self.palettes
+    }
+
+    pub fn palettes_mut(&mut self) -> &mut Palettes {
+        &mut self.palettes
+    }
+
+    /// Uses these palettes (the app passes the ones stored on disk).
+    pub fn set_palettes(&mut self, palettes: Palettes) {
+        self.palettes = palettes;
+        self.renaming = None;
+    }
+
+    /// The text in the hex colour field.
+    pub fn hex_text(&self) -> &str {
+        &self.hex_text
+    }
+
+    /// Hue, saturation and brightness shown on the wheel.
+    pub fn hsv(&self) -> [f32; 3] {
+        self.hsv
+    }
+
+    /// Follows the brush colour when something else changed it (a swatch, a
+    /// palette entry), keeping the hue of greys.
+    fn follow_brush(&mut self, rgb: [u8; 3]) {
+        if self.hsv_rgb == rgb {
+            return;
+        }
+        self.hsv_rgb = rgb;
+        let [h, s, v] = wheel::rgb_to_hsv(rgb);
+        self.hsv = [if s < 0.001 || v < 0.001 { self.hsv[0] } else { h }, s, v];
+    }
+
+    fn wheel_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        self.wheel_tex
+            .get_or_insert_with(|| {
+                const N: usize = 192;
+                ctx.load_texture(
+                    "colour-wheel",
+                    egui::ColorImage::from_rgba_unmultiplied([N, N], &wheel::wheel_rgba(N)),
+                    TextureOptions::LINEAR,
+                )
+            })
+            .id()
+    }
+
+    /// A texture tile in a colour, for palette entries.
+    fn tile_texture(&mut self, ctx: &egui::Context, texture_id: u8, rgb: [u8; 3]) -> egui::TextureId {
+        self.tile_cache
+            .entry((texture_id, rgb))
+            .or_insert_with(|| {
+                ctx.load_texture(
+                    format!("tile-{texture_id}-{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]),
+                    egui::ColorImage::from_rgba_unmultiplied([TILE, TILE], &texture::tinted_rgba(texture_id, rgb)),
+                    TextureOptions::LINEAR,
+                )
+            })
+            .id()
     }
 
     /// The picture for an icon, uploading it on first use. Imported icons
@@ -403,6 +505,10 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     if st.show_zoom {
         zoom_panel(ctx, ed, st);
     }
+    if st.show_colors {
+        colors_window(ctx, ed, st);
+    }
+    selection_layer(ctx, ed);
     nodes_layer(ctx, ed, st);
     dialogs(ctx, ed, st);
     node_popup(ctx, ed, st);
@@ -464,6 +570,18 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     }
                 });
                 ui.separator();
+                if item(ui, "Select all", "Ctrl+A") {
+                    ed.select_all();
+                }
+                if item(ui, "Invert selection", "Ctrl+I") {
+                    ed.invert_selection();
+                }
+                ui.add_enabled_ui(ed.has_selection(), |ui| {
+                    if item(ui, "Deselect", "Ctrl+D / Esc") {
+                        ed.clear_selection();
+                    }
+                });
+                ui.separator();
                 if item(ui, "Add node", "N") {
                     ed.start_placing_node();
                 }
@@ -472,7 +590,8 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.checkbox(&mut st.show_grid, "Show grid");
                 ui.checkbox(&mut st.show_checker, "Checker overlay (darken every other cell)");
                 ui.checkbox(&mut ed.show_nodes, "Show nodes");
-                ui.checkbox(&mut st.show_tools, "Textures & colors panel");
+                ui.checkbox(&mut st.show_tools, "Textures & tools panel");
+                ui.checkbox(&mut st.show_colors, "Colors window");
                 ui.checkbox(&mut st.show_zoom, "Zoom panel");
                 ui.separator();
                 if item(ui, "Zoom in", "") {
@@ -534,15 +653,19 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
 fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.refresh_thumbs(ctx, ed.brush_rgb);
     st.layout.textures.clear();
-    st.layout.swatches.clear();
     st.layout.shapes.clear();
+    st.layout.tool_buttons.clear();
+    st.layout.select_kinds.clear();
+    st.layout.select_all = None;
+    st.layout.select_invert = None;
+    st.layout.select_clear = None;
     st.layout.fills.clear();
     st.layout.border_toggle = None;
     st.layout.eraser_toggle = None;
     st.layout.place_node = None;
     st.layout.import_icons = None;
     let max_height = (ctx.content_rect().height() - 70.0).max(240.0);
-    egui::Window::new("Textures")
+    egui::Window::new("Tools")
         .anchor(Align2::LEFT_TOP, [10.0, 40.0])
         .max_width(260.0)
         .resizable(false)
@@ -558,6 +681,9 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             ui.set_width(COLUMNS as f32 * (THUMB + 6.0));
             ui.set_max_width(COLUMNS as f32 * (THUMB + 6.0));
 
+            tool_section(ui, ed, st);
+            ui.separator();
+            ui.label(RichText::new("Texture").strong());
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
                 .show(ui, |ui| {
@@ -590,52 +716,6 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     }
                 });
             ui.label(RichText::new(texture::name(ed.texture)).strong());
-
-            ui.separator();
-            ui.label(RichText::new("Color").strong());
-            let swatch_columns = 8;
-            let colors: Vec<[u8; 3]> = ed.world.colors.as_slice().to_vec();
-            egui::ScrollArea::vertical()
-                .max_height(116.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    egui::Grid::new("swatches").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
-                        for (i, rgb) in colors.iter().enumerate() {
-                            let (rect, resp) =
-                                ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                            ui.painter()
-                                .rect_filled(rect, 3.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                            let selected = ed.brush_rgb == *rgb;
-                            st.layout.swatches.push(rect);
-                            let stroke = if selected {
-                                Stroke::new(2.5, ui.visuals().selection.stroke.color)
-                            } else {
-                                Stroke::new(1.0, Color32::from_black_alpha(120))
-                            };
-                            ui.painter()
-                                .rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-                            if resp
-                                .on_hover_text(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]))
-                                .clicked()
-                            {
-                                ed.set_brush_rgb(*rgb);
-                            }
-                            if (i + 1) % swatch_columns == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                });
-            ui.horizontal(|ui| {
-                let mut rgb = ed.brush_rgb;
-                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                    ed.set_brush_rgb(rgb);
-                }
-                ui.label(format!(
-                    "Any color  #{:02x}{:02x}{:02x}",
-                    ed.brush_rgb[0], ed.brush_rgb[1], ed.brush_rgb[2]
-                ));
-            });
 
             ui.separator();
             let mut half = ed.brush_half;
@@ -908,6 +988,473 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     }
 }
 
+/// Brush / Fill / Select buttons and the selection controls.
+fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    ui.label(RichText::new("Tool").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (mode, label, tip) in [
+            (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
+            (ToolMode::Fill, "Fill", "Bucket (G): click to fill the connected area of identical cells. Shift erases it."),
+            (ToolMode::Select, "Select", "Selection (M): painting is limited to the selected cells"),
+        ] {
+            let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
+            st.layout.tool_buttons.push(r.rect);
+            if r.clicked() {
+                ed.tool = mode;
+            }
+        }
+    });
+    match ed.tool {
+        ToolMode::Fill => {
+            ui.label(RichText::new("Click: fill the connected area of the same tile (Shift: erase)").weak().small());
+        }
+        ToolMode::Select => {
+            ui.horizontal_wrapped(|ui| {
+                for kind in SelectKind::ALL {
+                    let r = ui.selectable_label(ed.select_kind == kind, kind.name()).on_hover_text(kind.hint());
+                    st.layout.select_kinds.push(r.rect);
+                    if r.clicked() {
+                        ed.select_kind = kind;
+                    }
+                }
+            });
+            ui.label(RichText::new(format!("{}. Right click inverts; new selections add.", ed.select_kind.hint())).weak().small());
+            ui.horizontal(|ui| {
+                let all = ui.small_button("All").on_hover_text("Select everything (Ctrl+A)");
+                st.layout.select_all = Some(all.rect);
+                if all.clicked() {
+                    ed.select_all();
+                }
+                let inv = ui.small_button("Invert").on_hover_text("Select what is not selected (right click, Ctrl+I)");
+                st.layout.select_invert = Some(inv.rect);
+                if inv.clicked() {
+                    ed.invert_selection();
+                }
+                let clear = ui.add_enabled(ed.has_selection(), egui::Button::new("Clear").small());
+                st.layout.select_clear = Some(clear.rect);
+                if clear.on_hover_text("Drop the selection (Esc, Ctrl+D)").clicked() {
+                    ed.clear_selection();
+                }
+            });
+        }
+        ToolMode::Paint => {}
+    }
+    if let Some(summary) = ed.selection_summary() {
+        ui.label(RichText::new(summary).color(Color32::from_rgb(90, 190, 255)));
+        if ed.tool != ToolMode::Select {
+            ui.label(RichText::new("Painting is limited to it.").weak().small());
+            let clear = ui.small_button("Clear selection  (Esc)");
+            st.layout.select_clear = Some(clear.rect);
+            if clear.clicked() {
+                ed.clear_selection();
+            }
+        }
+    }
+}
+
+/// Draws the selection (and the rectangle being dragged) over the map.
+fn selection_layer(ctx: &egui::Context, ed: &Editor) {
+    if ed.tool != ToolMode::Paint && !ctx.is_pointer_over_egui() {
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    let preview = ed.select_preview();
+    if ed.selection().is_none() && preview.is_none() {
+        return;
+    }
+    let ppp = ctx.pixels_per_point();
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("selection")))
+        .with_clip_rect(ctx.content_rect());
+    if let Some(s) = ed.selection() {
+        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(90, 190, 255));
+    }
+    if let Some(s) = &preview {
+        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(255, 214, 90));
+    }
+}
+
+fn draw_selection(
+    painter: &egui::Painter,
+    ed: &Editor,
+    sel: &depthmap_core::Selection,
+    ppp: f32,
+    colour: Color32,
+) {
+    use depthmap_core::selection::spans_subtract;
+    /// Enough for any sane selection; keeps a pathological one from stalling the frame.
+    const MAX_SHAPES: usize = 20_000;
+    let v = ed.camera.at_depth(sel.depth());
+    let (vw, vh) = ed.viewport;
+    let ((x0, y0), (x1, y1)) = v.visible_cells(vw, vh);
+    let (mut x0, mut y0, mut x1, mut y1) = (x0 - 1, y0 - 1, x1 + 1, y1 + 1);
+    if let Some((w, h)) = ed.spec().extent(sel.depth()) {
+        (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(w - 1), y1.min(h - 1));
+    }
+    let blocks = sel.blocks(x0, x1, y0, y1);
+    let at = |cx: i64, cy: i64| {
+        let (x, y) = v.cell_origin_px(cx, cy, vw, vh);
+        egui::pos2(x as f32 / ppp, y as f32 / ppp)
+    };
+    let fill = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 56);
+    let mut lines: Vec<[egui::Pos2; 2]> = Vec::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if lines.len() > MAX_SHAPES {
+            break;
+        }
+        for &(a, c) in &b.spans {
+            painter.rect_filled(egui::Rect::from_two_pos(at(a, b.y0), at(c + 1, b.y1 + 1)), 0.0, fill);
+            lines.push([at(a, b.y0), at(a, b.y1 + 1)]);
+            lines.push([at(c + 1, b.y0), at(c + 1, b.y1 + 1)]);
+        }
+        // Top and bottom edges: only where the neighbouring rows are not selected.
+        let above = i.checked_sub(1).map(|j| &blocks[j]).filter(|p| p.y1 + 1 == b.y0);
+        let below = blocks.get(i + 1).filter(|n| n.y0 == b.y1 + 1);
+        for (row, edge_y) in [(above, b.y0), (below, b.y1 + 1)] {
+            let open = match row {
+                Some(r) => spans_subtract(&b.spans, &r.spans),
+                None => b.spans.clone(),
+            };
+            for (a, c) in open {
+                lines.push([at(a, edge_y), at(c + 1, edge_y)]);
+            }
+        }
+    }
+    for l in &lines {
+        painter.line_segment(*l, Stroke::new(3.0, Color32::from_black_alpha(150)));
+    }
+    for l in &lines {
+        painter.line_segment(*l, Stroke::new(1.5, colour));
+    }
+}
+
+/// The colour wheel, hex field, map colours and palettes.
+fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    let l = &mut st.layout;
+    l.swatches.clear();
+    l.palette_entries.clear();
+    (l.wheel, l.value_bar, l.hex_field) = (None, None, None);
+    (l.palette_new, l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None, None);
+    (l.palette_name_field, l.palette_rename_ok) = (None, None);
+    st.follow_brush(ed.brush_rgb);
+
+    let screen = ctx.content_rect();
+    // A Window does not grow around a ScrollArea by itself, so give it the
+    // height it needs (or what the screen has).
+    let max_height = (screen.height() - 90.0).clamp(260.0, 620.0);
+    let mut open = st.show_colors;
+    let mut acts: Vec<PaletteAct> = Vec::new();
+    egui::Window::new("Colors")
+        // Left of the zoom panel, so the two do not cover each other.
+        .default_pos(egui::pos2((screen.right() - 500.0).max(290.0), 40.0))
+        .resizable(false)
+        .collapsible(true)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .min_scrolled_height(max_height)
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(250.0);
+                    wheel_section(ui, ctx, ed, st);
+                    ui.separator();
+                    ui.label(RichText::new("Map colors").strong());
+                    let colors: Vec<[u8; 3]> = ed.world.colors.as_slice().to_vec();
+                    egui::Grid::new("swatches").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
+                        for (i, rgb) in colors.iter().enumerate() {
+                            let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                            ui.painter().rect_filled(rect, 3.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                            st.layout.swatches.push(rect);
+                            let stroke = if ed.brush_rgb == *rgb {
+                                Stroke::new(2.5, ui.visuals().selection.stroke.color)
+                            } else {
+                                Stroke::new(1.0, Color32::from_black_alpha(120))
+                            };
+                            ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                            let tip = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                            if resp.on_hover_text(tip).clicked() {
+                                ed.set_brush_rgb(*rgb);
+                            }
+                            if (i + 1) % 9 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    palette_section(ui, ctx, ed, st, &mut acts);
+                });
+        });
+    st.show_colors = open;
+
+    let mut changed = false;
+    for act in acts {
+        let cur = st.palettes.current_index();
+        match act {
+            PaletteAct::Select(i) => {
+                st.palettes.select(i);
+                st.renaming = None;
+            }
+            PaletteAct::New => {
+                changed |= st.palettes.create().is_some();
+                st.renaming = None;
+                if !changed {
+                    st.palette_note = "Too many palettes".into();
+                }
+            }
+            PaletteAct::StartRename => st.renaming = Some(st.palettes.current().name.clone()),
+            PaletteAct::Rename(name) => {
+                if st.palettes.rename(cur, &name) {
+                    st.renaming = None;
+                    st.palette_note.clear();
+                    changed = true;
+                } else {
+                    st.palette_note = "A palette needs a name".into();
+                }
+            }
+            PaletteAct::CancelRename => st.renaming = None,
+            PaletteAct::Delete => {
+                st.palettes.delete(cur);
+                st.renaming = None;
+                changed = true;
+            }
+            PaletteAct::Add => {
+                let entry = Entry { rgb: ed.brush_rgb, texture: ed.texture };
+                if st.palettes.add_entry(cur, entry) {
+                    st.palette_note.clear();
+                    changed = true;
+                } else {
+                    st.palette_note = "Already in this palette (or it is full)".into();
+                }
+            }
+            PaletteAct::Remove(i) => {
+                st.palettes.remove_entry(cur, i);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Err(e) = st.palettes.save() {
+            ed.status = e;
+        }
+    }
+}
+
+enum PaletteAct {
+    Select(usize),
+    New,
+    StartRename,
+    Rename(String),
+    CancelRename,
+    Delete,
+    Add,
+    Remove(usize),
+}
+
+fn wheel_section(ui: &mut egui::Ui, ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    const SIZE: f32 = 150.0;
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    let mut picked = false;
+    ui.vertical_centered(|ui| {
+        let (rect, resp) = ui.allocate_exact_size(vec2(SIZE, SIZE), Sense::click_and_drag());
+        st.layout.wheel = Some(rect);
+        let tex = st.wheel_texture(ctx);
+        let dim = (st.hsv[2] * 255.0).round() as u8;
+        ui.painter().image(tex, rect, uv, Color32::from_gray(dim));
+        let radius = SIZE * 0.5;
+        if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let c = rect.center();
+                let (h, s) = wheel::wheel_to_hs((p.x - c.x) / radius, (p.y - c.y) / radius);
+                st.hsv[0] = h;
+                st.hsv[1] = s;
+                picked = true;
+            }
+        }
+        let (mx, my) = wheel::hs_to_wheel(st.hsv[0], st.hsv[1]);
+        let at = rect.center() + vec2(mx, my) * radius;
+        ui.painter().circle_stroke(at, 6.0, Stroke::new(2.5, Color32::BLACK));
+        ui.painter().circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+
+        // Brightness: a bar from black to the full colour.
+        let (bar, bresp) = ui.allocate_exact_size(vec2(SIZE, 16.0), Sense::click_and_drag());
+        st.layout.value_bar = Some(bar);
+        let full = wheel::hsv_to_rgb(st.hsv[0], st.hsv[1], 1.0);
+        let right = Color32::from_rgb(full[0], full[1], full[2]);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(bar.left_top(), Color32::BLACK);
+        mesh.colored_vertex(bar.right_top(), right);
+        mesh.colored_vertex(bar.right_bottom(), right);
+        mesh.colored_vertex(bar.left_bottom(), Color32::BLACK);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().add(egui::Shape::mesh(mesh));
+        ui.painter().rect_stroke(bar, 2.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
+        if bresp.is_pointer_button_down_on() || bresp.dragged() || bresp.clicked() {
+            if let Some(p) = bresp.interact_pointer_pos() {
+                st.hsv[2] = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+                picked = true;
+            }
+        }
+        let x = bar.left() + bar.width() * st.hsv[2];
+        ui.painter().line_segment([egui::pos2(x, bar.top() - 1.0), egui::pos2(x, bar.bottom() + 1.0)], Stroke::new(3.0, Color32::BLACK));
+        ui.painter().line_segment([egui::pos2(x, bar.top() - 1.0), egui::pos2(x, bar.bottom() + 1.0)], Stroke::new(1.5, Color32::WHITE));
+    });
+    if picked {
+        let rgb = wheel::hsv_to_rgb(st.hsv[0], st.hsv[1], st.hsv[2]);
+        st.hsv_rgb = rgb;
+        ed.set_brush_rgb(rgb);
+    }
+
+    // Hex code.
+    let hex_id = egui::Id::unique("hex-field");
+    let typing = ui.memory(|m| m.has_focus(hex_id));
+    let canonical = format!("#{:02x}{:02x}{:02x}", ed.brush_rgb[0], ed.brush_rgb[1], ed.brush_rgb[2]);
+    if !typing && st.hex_text != canonical {
+        st.hex_text = canonical;
+    }
+    ui.horizontal(|ui| {
+        let (sw, _) = ui.allocate_exact_size(vec2(30.0, 22.0), Sense::hover());
+        let c = ed.brush_rgb;
+        ui.painter().rect_filled(sw, 3.0, Color32::from_rgb(c[0], c[1], c[2]));
+        ui.painter().rect_stroke(sw, 3.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut st.hex_text)
+                .id(hex_id)
+                .desired_width(74.0)
+                .char_limit(7)
+                .font(egui::TextStyle::Monospace),
+        );
+        st.layout.hex_field = Some(edit.rect);
+        if edit.changed() {
+            if let Some(rgb) = palette::parse_hex(&st.hex_text) {
+                st.follow_brush(rgb);
+                st.hsv_rgb = rgb;
+                ed.set_brush_rgb(rgb);
+            }
+        }
+        ui.label(RichText::new(format!("rgb {} {} {}", c[0], c[1], c[2])).weak().small());
+    });
+}
+
+fn palette_section(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    st: &mut UiState,
+    acts: &mut Vec<PaletteAct>,
+) {
+    ui.label(RichText::new("Palettes").strong())
+        .on_hover_text("A palette entry remembers a colour and the texture that was selected with it");
+    let names: Vec<String> = st.palettes.list().iter().map(|p| p.name.clone()).collect();
+    let cur = st.palettes.current_index();
+    egui::ComboBox::from_id_salt("palette_select")
+        .selected_text(names[cur].clone())
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            for (i, n) in names.iter().enumerate() {
+                if ui.selectable_label(i == cur, n).clicked() {
+                    acts.push(PaletteAct::Select(i));
+                }
+            }
+        });
+
+    if let Some(buf) = st.renaming.as_mut() {
+        let mut name = std::mem::take(buf);
+        ui.horizontal(|ui| {
+            let edit = ui.add(egui::TextEdit::singleline(&mut name).desired_width(130.0).char_limit(palette::MAX_NAME_CHARS));
+            st.layout.palette_name_field = Some(edit.rect);
+            if !edit.has_focus() && !edit.lost_focus() {
+                edit.request_focus();
+            }
+            let ok = ui.button("OK");
+            st.layout.palette_rename_ok = Some(ok.rect);
+            let cancel = ui.button("Cancel");
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if ok.clicked() || enter {
+                acts.push(PaletteAct::Rename(name.clone()));
+            } else if cancel.clicked() || escape {
+                acts.push(PaletteAct::CancelRename);
+            }
+        });
+        if let Some(buf) = st.renaming.as_mut() {
+            *buf = name;
+        }
+    } else {
+        ui.horizontal(|ui| {
+            let new = ui.small_button("New").on_hover_text("Start an empty palette");
+            st.layout.palette_new = Some(new.rect);
+            if new.clicked() {
+                acts.push(PaletteAct::New);
+            }
+            let rename = ui.small_button("Rename");
+            st.layout.palette_rename = Some(rename.rect);
+            if rename.clicked() {
+                acts.push(PaletteAct::StartRename);
+            }
+            let delete = ui.small_button("Delete").on_hover_text("Delete this palette (the last one is only emptied)");
+            st.layout.palette_delete = Some(delete.rect);
+            if delete.clicked() {
+                acts.push(PaletteAct::Delete);
+            }
+        });
+    }
+
+    // Save the current colour and texture.
+    ui.horizontal(|ui| {
+        let tex = st.tile_texture(ctx, ed.texture, ed.brush_rgb);
+        let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+        ui.painter().image(tex, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        let add = ui
+            .button("Save current")
+            .on_hover_text("Adds the current colour together with the selected texture to this palette");
+        st.layout.palette_add = Some(add.rect);
+        if add.clicked() {
+            acts.push(PaletteAct::Add);
+        }
+    });
+    if !st.palette_note.is_empty() {
+        ui.label(RichText::new(st.palette_note.clone()).weak().small());
+    }
+
+    let entries = st.palettes.current().entries.clone();
+    if entries.is_empty() {
+        ui.label(RichText::new("Empty. Pick a colour and a texture, then Save current.").weak().small());
+        return;
+    }
+    egui::ScrollArea::vertical().id_salt("palette_entries").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new("palette_grid").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
+            for (i, e) in entries.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                st.layout.palette_entries.push(rect);
+                let tex = st.tile_texture(ctx, e.texture, e.rgb);
+                ui.painter().image(tex, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                let stroke = if ed.brush_rgb == e.rgb && ed.texture == e.texture {
+                    Stroke::new(2.5, ui.visuals().selection.stroke.color)
+                } else {
+                    Stroke::new(1.0, Color32::from_black_alpha(120))
+                };
+                ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+                let tip = format!("{}  {}\nClick to use, right click to remove", e.hex(), texture::name(e.texture));
+                let resp = resp.on_hover_text(tip);
+                if resp.clicked() {
+                    ed.set_brush_rgb(e.rgb);
+                    ed.set_texture(e.texture);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Remove from palette").clicked() {
+                        acts.push(PaletteAct::Remove(i));
+                        ui.close();
+                    }
+                });
+                if (i + 1) % 8 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    });
+}
+
 /// `rect` shrunk to the shape of a picture of `aspect` (w, h), centred.
 fn fit_rect(rect: egui::Rect, aspect: (f32, f32)) -> egui::Rect {
     let big = aspect.0.max(aspect.1).max(1.0);
@@ -1174,7 +1721,7 @@ fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 }
 
 /// `1234567` -> `1,234,567`.
-fn grouped(n: i64) -> String {
+pub fn grouped(n: i64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -1335,7 +1882,13 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Left mouse", "Paint with the selected texture and color"),
                         ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
                         ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("Esc", "Cancel the shape being dragged / placing a node / close the node popup"),
+                        ("B / G / M", "Brush / Fill / Select tool"),
+                        ("Fill tool (click)", "Fill the connected area of identical cells (Shift erases it)"),
+                        ("Select tool", "Drag a rectangle, or click to pick connected / same tiles; each new selection adds"),
+                        ("Right mouse (Select)", "Invert the selection"),
+                        ("Ctrl+A / Ctrl+D / Ctrl+I", "Select all / deselect / invert selection"),
+                        ("C", "Show or hide the Colors window"),
+                        ("Esc", "Cancel the shape / node placing / node popup, then clear the selection"),
                         ("N", "Add a node: then click the map"),
                         ("Click / drag a node", "Edit it / move it"),
                         ("Delete", "Delete the node whose popup is open"),

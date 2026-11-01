@@ -23,6 +23,7 @@ pub mod icons;
 pub mod io;
 pub mod node;
 pub mod raster;
+pub mod selection;
 pub mod shape;
 pub mod spec;
 pub mod texture;
@@ -33,6 +34,7 @@ pub use chunk::{Cell, Chunk, ChunkPos, EMPTY, cell_color, cell_texture, make_cel
 pub use colors::ColorTable;
 pub use history::{CellEdit, History, NodeEdit};
 pub use node::{Icon, Node, NodeId};
+pub use selection::Selection;
 pub use shape::{Fill, Shape, ShapeStyle};
 pub use spec::MapSpec;
 pub use world::World;

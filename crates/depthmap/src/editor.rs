@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use depthmap_core::camera::{BASE_PPC, MIN_PPC};
 use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::raster::{line_cells, square_cells};
+use depthmap_core::selection::{
+    RegionError, Rows, Selection, MAX_REGION_CELLS, region_of_same, region_of_same_everywhere,
+    rows_cell_count,
+};
 use depthmap_core::shape::{Clip, shape_cells};
 use depthmap_core::{
     Camera, Cell, CellEdit, EMPTY, Fill, History, Icon, MapSpec, Node, NodeId, Shape, ShapeStyle,
@@ -28,6 +32,56 @@ const MIN_FIT_PPC: f64 = 0.02;
 enum Tool {
     Paint,
     Erase,
+}
+
+/// What the left mouse button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolMode {
+    /// Brush strokes.
+    Paint,
+    /// Bucket: replace a whole connected area of equal cells.
+    Fill,
+    /// Choose the area that painting is limited to.
+    Select,
+}
+
+/// How Select picks cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectKind {
+    /// Drag a rectangle.
+    Rectangle,
+    /// Click: the connected area of identical cells.
+    Contiguous,
+    /// Click: every cell on this layer identical to the one clicked.
+    Matching,
+}
+
+impl SelectKind {
+    pub const ALL: [SelectKind; 3] = [SelectKind::Rectangle, SelectKind::Contiguous, SelectKind::Matching];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SelectKind::Rectangle => "Rectangle",
+            SelectKind::Contiguous => "Connected",
+            SelectKind::Matching => "Same tiles",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SelectKind::Rectangle => "Drag a rectangle",
+            SelectKind::Contiguous => "Click: the connected cells with the same colour and texture",
+            SelectKind::Matching => "Click: every cell on this layer with the same colour and texture",
+        }
+    }
+}
+
+/// Biggest rectangle (in rows) a drag may select.
+const MAX_RECT_ROWS: i64 = 1 << 18;
+
+struct SelectDrag {
+    depth: u8,
+    anchor: (i64, i64),
 }
 
 pub struct Editor {
@@ -76,6 +130,11 @@ pub struct Editor {
     shape_buf: Vec<(i64, i64)>,
     node_session: Option<NodeSession>,
     node_drag: Option<NodeDrag>,
+    /// What the left mouse button does.
+    pub tool: ToolMode,
+    pub select_kind: SelectKind,
+    selection: Option<Selection>,
+    select_drag: Option<SelectDrag>,
 }
 
 /// The node whose popup is open. Edits go to the world live; closing the
@@ -188,6 +247,10 @@ impl Editor {
             shape_buf: Vec::new(),
             node_session: None,
             node_drag: None,
+            tool: ToolMode::Paint,
+            select_kind: SelectKind::Rectangle,
+            selection: None,
+            select_drag: None,
         }
     }
 
@@ -293,9 +356,13 @@ impl Editor {
         let depth = self.camera.depth;
         let half = self.brush_half;
         let from = self.last_cell.unwrap_or(cell);
-        let (world, history) = (&mut self.world, &mut self.history);
+        let (world, history, sel) = (&mut self.world, &mut self.history, &self.selection);
         line_cells(from, cell, |x, y| {
-            square_cells((x, y), half, |a, b| history.paint(world, depth, a, b, m));
+            square_cells((x, y), half, |a, b| {
+                if sel.as_ref().is_none_or(|s| s.contains(depth, a, b)) {
+                    history.paint(world, depth, a, b, m);
+                }
+            });
         });
         self.last_cell = Some(cell);
     }
@@ -690,6 +757,225 @@ impl Editor {
         ok
     }
 
+    // ---- fill and selection -------------------------------------------------
+
+    /// Left button pressed on the map (not on a panel or node).
+    pub fn primary_press(&mut self, shift: bool) {
+        match self.tool {
+            ToolMode::Paint if shift => self.begin_erase(),
+            ToolMode::Paint => self.begin_paint(),
+            ToolMode::Fill => {
+                self.fill_at_cursor(shift);
+            }
+            ToolMode::Select => self.begin_select(),
+        }
+    }
+
+    /// Left button released.
+    pub fn primary_release(&mut self) {
+        self.end_stroke();
+        self.end_select();
+    }
+
+    /// Right button pressed: inverts the selection while selecting, draws a
+    /// shape otherwise.
+    pub fn secondary_press(&mut self, shift: bool) {
+        if self.tool == ToolMode::Select {
+            self.invert_selection();
+        } else {
+            self.begin_shape(shift);
+        }
+    }
+
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Short description for the tools panel.
+    pub fn selection_summary(&self) -> Option<String> {
+        let s = self.selection.as_ref()?;
+        Some(match s.cell_count() {
+            Some(n) => format!("{} cells selected (depth {})", crate::gui::grouped(n as i64), s.depth()),
+            None => format!("Everything but the unselected area (depth {})", s.depth()),
+        })
+    }
+
+    /// Whether painting may change this cell (always, with no selection).
+    pub fn selected(&self, depth: u8, x: i64, y: i64) -> bool {
+        self.selection.as_ref().is_none_or(|s| s.contains(depth, x, y))
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.select_drag = None;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection = Some(Selection::all(self.camera.depth));
+        self.status = "Everything selected".into();
+    }
+
+    /// Selects what is not selected (everything, if nothing is).
+    pub fn invert_selection(&mut self) {
+        match self.selection.as_mut() {
+            Some(s) => s.invert(),
+            None => self.selection = Some(Selection::all(self.camera.depth)),
+        }
+        if self.selection.as_ref().is_some_and(|s| s.is_empty()) {
+            self.selection = None; // inverting "everything" leaves nothing
+        }
+    }
+
+    /// Adds to the selection (OR).
+    fn add_selection(&mut self, sel: Selection) {
+        if sel.is_empty() {
+            return;
+        }
+        match self.selection.as_mut() {
+            Some(s) => {
+                if !s.union(&sel) {
+                    self.status = "Selection too large to combine; zoom out or press Esc first".into();
+                }
+            }
+            None => self.selection = Some(sel),
+        }
+    }
+
+    /// Starts a selection at the mouse: a rectangle drag, or an immediate
+    /// region pick, depending on [`SelectKind`].
+    pub fn begin_select(&mut self) {
+        let Some(cell) = self.cursor_cell() else { return };
+        let depth = self.camera.depth;
+        match self.select_kind {
+            SelectKind::Rectangle => self.select_drag = Some(SelectDrag { depth, anchor: cell }),
+            kind => {
+                if !self.world.in_bounds(depth, cell.0, cell.1) {
+                    return;
+                }
+                let found = if kind == SelectKind::Contiguous {
+                    region_of_same(&self.world, depth, cell, |_, _| true)
+                } else {
+                    region_of_same_everywhere(&self.world, depth, cell, |_, _| true)
+                };
+                match found {
+                    Ok(rows) => self.add_region(depth, rows),
+                    Err(e) => self.status = region_error(e, "select"),
+                }
+            }
+        }
+    }
+
+    fn add_region(&mut self, depth: u8, rows: Rows) {
+        let n = rows_cell_count(&rows);
+        self.add_selection(Selection::from_rows(depth, rows));
+        self.status = format!("{} cells selected", crate::gui::grouped(n as i64));
+    }
+
+    /// The rectangle being dragged, as a selection (for drawing it).
+    pub fn select_preview(&self) -> Option<Selection> {
+        let drag = self.select_drag.as_ref()?;
+        let cursor = self.cursor_cell()?;
+        let cursor = convert_cell(cursor, self.camera.depth, drag.depth);
+        self.rect_selection(drag.depth, drag.anchor, cursor)
+    }
+
+    fn rect_selection(&self, depth: u8, a: (i64, i64), b: (i64, i64)) -> Option<Selection> {
+        let (mut a, mut b) = (a, b);
+        if let Some((w, h)) = self.spec().extent(depth) {
+            // Only the part inside the map can be selected.
+            let clamp = |p: (i64, i64)| (p.0.clamp(0, w - 1), p.1.clamp(0, h - 1));
+            let (lo, hi) = ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)));
+            if hi.0 < 0 || hi.1 < 0 || lo.0 >= w || lo.1 >= h {
+                return None;
+            }
+            (a, b) = (clamp(lo), clamp(hi));
+        }
+        if (a.1 - b.1).abs() >= MAX_RECT_ROWS {
+            return None;
+        }
+        Some(Selection::rect(depth, a, b))
+    }
+
+    /// Left button released: the dragged rectangle joins the selection.
+    pub fn end_select(&mut self) {
+        let Some(drag) = self.select_drag.take() else { return };
+        let Some(cursor) = self.cursor_cell() else { return };
+        let cursor = convert_cell(cursor, self.camera.depth, drag.depth);
+        match self.rect_selection(drag.depth, drag.anchor, cursor) {
+            Some(sel) => {
+                self.add_selection(sel);
+                self.status.clear();
+            }
+            None => self.status = "Rectangle is outside the map or too tall".into(),
+        }
+    }
+
+    /// Replaces a whole connected area of equal cells with the brush (or
+    /// with nothing, when erasing). Limited to the selection, if any.
+    /// Returns whether anything changed.
+    pub fn fill_at_cursor(&mut self, erase: bool) -> bool {
+        let Some(start) = self.cursor_cell() else { return false };
+        let depth = self.camera.depth;
+        if !self.world.in_bounds(depth, start.0, start.1) {
+            return false;
+        }
+        if !self.selected(depth, start.0, start.1) {
+            self.status = "That cell is outside the selection".into();
+            return false;
+        }
+        let new = if erase || self.eraser {
+            EMPTY
+        } else {
+            make_cell(self.texture, self.world.colors.index_of(self.brush_rgb))
+        };
+        if self.world.get(depth, start.0, start.1) == new {
+            self.status = "Already filled with that".into();
+            return false;
+        }
+        let sel = &self.selection;
+        let rows = match region_of_same(&self.world, depth, start, |x, y| {
+            sel.as_ref().is_none_or(|s| s.contains(depth, x, y))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = region_error(e, "fill");
+                return false;
+            }
+        };
+        let n = rows_cell_count(&rows);
+        for (y, spans) in rows {
+            for (x0, x1) in spans {
+                for x in x0..=x1 {
+                    self.history.paint(&mut self.world, depth, x, y, new);
+                }
+            }
+        }
+        self.history.end_stroke();
+        self.status = format!("Filled {} cells", crate::gui::grouped(n as i64));
+        true
+    }
+
+    /// Escape: backs out of whatever is going on, innermost first, and
+    /// finally drops the selection.
+    pub fn escape(&mut self) {
+        if self.placing_node {
+            self.cancel_placing_node();
+        } else if self.open_node_id().is_some() {
+            self.close_node(true);
+        } else if self.shape_drag.is_some() {
+            self.cancel_shape();
+        } else if self.select_drag.is_some() {
+            self.select_drag = None;
+        } else if self.selection.is_some() {
+            self.clear_selection();
+            self.status = "Selection cleared".into();
+        }
+    }
+
     // ---- shapes -----------------------------------------------------------
 
     /// Starts dragging a shape from the cell under the mouse. With `erase`
@@ -780,6 +1066,9 @@ impl Editor {
                 Self::rewind(&mut self.world, &mut drag);
                 shape_cells(&style, drag.anchor, cursor, clip, &mut self.shape_buf);
                 for &(x, y) in &self.shape_buf {
+                    if self.selection.as_ref().is_some_and(|s| !s.contains(depth, x, y)) {
+                        continue;
+                    }
                     let old = self.world.set(depth, x, y, drag.cell);
                     if old != drag.cell {
                         drag.edits.push(CellEdit { depth, x, y, old, new: drag.cell });
@@ -825,6 +1114,8 @@ impl Editor {
         self.node_session = None;
         self.node_drag = None;
         self.placing_node = false;
+        self.selection = None;
+        self.select_drag = None;
         self.icons_revision += 1;
     }
 
@@ -921,6 +1212,16 @@ impl Editor {
 
 /// The cell at depth `to` that stands for `cell` at depth `from`: the
 /// containing cell when going coarser, the middle sub-cell when going finer.
+fn region_error(e: RegionError, verb: &str) -> String {
+    match e {
+        RegionError::TooLarge => format!(
+            "Area too large to {verb} (over {} cells); it may be open. Zoom out or close the gap",
+            crate::gui::grouped(MAX_REGION_CELLS as i64)
+        ),
+        RegionError::Everything => "Empty cells cannot be matched everywhere; use Connected".into(),
+    }
+}
+
 fn convert_cell(cell: (i64, i64), from: u8, to: u8) -> (i64, i64) {
     if to >= from {
         let s = depthmap_core::SUBDIV.pow((to - from) as u32);
@@ -1573,5 +1874,266 @@ mod tests {
         assert!(e.import_icon(&bad).is_err());
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&e.icons_dir);
+    }
+
+    /// Screen position of the middle of a depth-0 cell of a bounded editor.
+    fn px(e: &Editor, x: i64, y: i64) -> (f64, f64) {
+        centre_of(e, (x, y))
+    }
+
+    /// A 16x16 map with a 3-cell-wide ring of cells drawn at depth 0.
+    fn walled() -> Editor {
+        let mut e = bounded(16, 16, 2);
+        let wall = make_cell(2, 1);
+        for i in 4..=11 {
+            for (x, y) in [(i, 4), (i, 11), (4, i), (11, i)] {
+                e.world.set(0, x, y, wall);
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn fill_replaces_only_the_connected_area_and_undoes_in_one_step() {
+        let mut e = walled();
+        e.texture = 3;
+        e.set_brush_rgb([10, 20, 30]);
+        e.tool = ToolMode::Fill;
+        let (x, y) = px(&e, 7, 7);
+        e.mouse_moved(x, y);
+        e.primary_press(false);
+        e.primary_release();
+        let want = make_cell(3, e.world.colors.index_of([10, 20, 30]));
+        assert_eq!(e.world.get(0, 5, 5), want);
+        assert_eq!(e.world.get(0, 10, 10), want);
+        assert_eq!(e.world.get(0, 4, 4), make_cell(2, 1), "walls untouched");
+        assert_eq!(e.world.get(0, 2, 2), EMPTY, "outside the ring untouched");
+        assert!(e.status.contains("Filled 36"), "{}", e.status);
+        e.undo();
+        assert_eq!(e.world.get(0, 5, 5), EMPTY);
+        assert!(!e.history.can_undo(), "the whole fill was one step");
+    }
+
+    #[test]
+    fn shift_fill_erases_and_refilling_with_the_same_thing_does_nothing() {
+        let mut e = walled();
+        e.tool = ToolMode::Fill;
+        let (x, y) = px(&e, 4, 4);
+        e.mouse_moved(x, y);
+        e.primary_press(true); // shift: erase the connected wall
+        assert_eq!(e.world.get(0, 4, 4), EMPTY);
+        assert_eq!(e.world.get(0, 11, 11), EMPTY);
+        let n = e.history.can_undo();
+        let (x, y) = px(&e, 1, 1);
+        e.mouse_moved(x, y);
+        assert!(!e.fill_at_cursor(true), "already empty");
+        assert!(n && e.status.contains("Already"));
+    }
+
+    #[test]
+    fn filling_an_open_area_is_refused_instead_of_freezing() {
+        let mut e = Editor::new(); // unbounded and empty
+        e.mouse_moved(500.0, 400.0);
+        assert!(!e.fill_at_cursor(false));
+        assert!(e.status.contains("too large"), "{}", e.status);
+        assert!(!e.history.can_undo());
+        assert_eq!(e.world.revision(), 0, "nothing was touched");
+    }
+
+    #[test]
+    fn dragging_selects_a_rectangle_and_further_drags_add_to_it() {
+        let mut e = bounded(16, 16, 2);
+        e.tool = ToolMode::Select;
+        let (a, b) = (px(&e, 2, 2), px(&e, 4, 3));
+        e.mouse_moved(a.0, a.1);
+        e.primary_press(false);
+        e.mouse_moved(b.0, b.1);
+        assert!(e.select_preview().is_some(), "the drag is previewed");
+        assert!(!e.has_selection(), "but not selected until released");
+        e.primary_release();
+        let s = e.selection().unwrap();
+        assert_eq!(s.cell_count(), Some(3 * 2));
+        assert!(s.contains(0, 4, 3) && !s.contains(0, 5, 3));
+
+        let (c, d) = (px(&e, 10, 10), px(&e, 10, 10));
+        e.mouse_moved(c.0, c.1);
+        e.primary_press(false);
+        e.mouse_moved(d.0, d.1);
+        e.primary_release();
+        let s = e.selection().unwrap();
+        assert_eq!(s.cell_count(), Some(7), "OR: the first rectangle is still there");
+        assert!(s.contains(0, 10, 10) && s.contains(0, 2, 2));
+    }
+
+    #[test]
+    fn rectangles_are_cut_off_at_the_map_edge() {
+        let mut e = bounded(16, 16, 1);
+        e.tool = ToolMode::Select;
+        let a = px(&e, 14, 14);
+        e.mouse_moved(a.0, a.1);
+        e.primary_press(false);
+        e.mouse_moved(a.0 + 400.0, a.1 + 300.0); // far outside the map
+        e.primary_release();
+        assert_eq!(e.selection().unwrap().cell_count(), Some(4), "only the 2x2 inside");
+    }
+
+    #[test]
+    fn right_click_inverts_while_selecting_and_draws_shapes_otherwise() {
+        let mut e = bounded(16, 16, 1);
+        e.tool = ToolMode::Select;
+        e.selection = Some(Selection::rect(0, (2, 2), (3, 3)));
+        e.secondary_press(false);
+        let s = e.selection().unwrap();
+        assert!(!s.contains(0, 2, 2) && s.contains(0, 8, 8));
+        e.secondary_press(false);
+        assert!(e.selection().unwrap().contains(0, 2, 2));
+        // With nothing selected, inverting selects everything.
+        e.clear_selection();
+        e.secondary_press(false);
+        assert!(e.selection().unwrap().contains(0, 0, 0));
+        // Brush mode: the right button starts a shape instead.
+        e.clear_selection();
+        e.tool = ToolMode::Paint;
+        let (x, y) = px(&e, 3, 3);
+        e.mouse_moved(x, y);
+        e.secondary_press(false);
+        assert!(e.shape_active() && !e.has_selection());
+        e.cancel_shape();
+    }
+
+    #[test]
+    fn escape_backs_out_step_by_step_and_finally_clears_the_selection() {
+        let mut e = bounded(16, 16, 1);
+        e.selection = Some(Selection::rect(0, (1, 1), (2, 2)));
+        e.start_placing_node();
+        e.escape();
+        assert!(!e.placing_node && e.has_selection(), "first Esc only leaves node placing");
+        e.escape();
+        assert!(!e.has_selection());
+        e.escape(); // nothing left to do
+    }
+
+    #[test]
+    fn painting_is_limited_to_the_selection() {
+        let mut e = bounded(16, 16, 1);
+        e.texture = 2;
+        e.brush_half = 1; // 3x3 brush
+        e.selection = Some(Selection::rect(0, (4, 4), (7, 7)));
+        let a = px(&e, 3, 5);
+        e.mouse_moved(a.0, a.1);
+        e.begin_paint();
+        let b = px(&e, 9, 5);
+        e.mouse_moved(b.0, b.1); // sweeps across and out of the selection
+        e.end_stroke();
+        for x in 0..16 {
+            let inside = (4..=7).contains(&x);
+            assert_eq!(e.world.get(0, x, 5) != EMPTY, inside, "x={x}");
+        }
+        assert_eq!(e.world.get(0, 5, 3), EMPTY, "above the selection");
+        assert_ne!(e.world.get(0, 5, 4), EMPTY, "the brush is 3 tall and the selection starts at row 4");
+        // The eraser obeys it too.
+        e.selection = Some(Selection::rect(0, (0, 0), (5, 15)));
+        let c = px(&e, 3, 5);
+        e.mouse_moved(c.0, c.1);
+        e.begin_erase();
+        let d = px(&e, 9, 5);
+        e.mouse_moved(d.0, d.1);
+        e.end_stroke();
+        assert_eq!(e.world.get(0, 5, 5), EMPTY);
+        assert_ne!(e.world.get(0, 6, 5), EMPTY, "outside the selection, survives");
+    }
+
+    #[test]
+    fn shapes_and_fills_stay_inside_the_selection() {
+        let mut e = bounded(16, 16, 1);
+        e.selection = Some(Selection::rect(0, (4, 4), (7, 7)));
+        e.shape = Shape::Rectangle;
+        e.fill = Fill::Solid;
+        let a = px(&e, 2, 2);
+        e.mouse_moved(a.0, a.1);
+        e.secondary_press(false);
+        let b = px(&e, 9, 9);
+        e.mouse_moved(b.0, b.1);
+        e.end_shape();
+        assert_ne!(e.world.get(0, 5, 5), EMPTY);
+        assert_eq!(e.world.get(0, 3, 3), EMPTY);
+        assert_eq!(e.world.get(0, 8, 8), EMPTY);
+        // Fill: the empty area is bounded by the selection, not just the map.
+        let mut f = bounded(16, 16, 1);
+        f.selection = Some(Selection::rect(0, (4, 4), (7, 7)));
+        f.tool = ToolMode::Fill;
+        let c = px(&f, 5, 5);
+        f.mouse_moved(c.0, c.1);
+        f.primary_press(false);
+        assert_eq!(f.world.get(0, 4, 4), make_cell(f.texture, f.world.colors.index_of(f.brush_rgb)));
+        assert_eq!(f.world.get(0, 8, 8), EMPTY);
+        assert_eq!(f.world.get(0, 3, 4), EMPTY);
+        // Clicking outside the selection with the bucket does nothing.
+        let out = px(&f, 12, 12);
+        f.mouse_moved(out.0, out.1);
+        assert!(!f.fill_at_cursor(false));
+        assert!(f.status.contains("outside the selection"));
+    }
+
+    #[test]
+    fn clicking_selects_connected_or_matching_tiles() {
+        let mut e = walled();
+        e.world.set(0, 14, 1, make_cell(2, 1)); // a lone cell of the same kind as the wall
+        e.tool = ToolMode::Select;
+        e.select_kind = SelectKind::Contiguous;
+        let w = px(&e, 4, 4);
+        e.mouse_moved(w.0, w.1);
+        e.primary_press(false);
+        e.primary_release();
+        let s = e.selection().unwrap().clone();
+        assert_eq!(s.cell_count(), Some(28), "the ring only");
+        assert!(!s.contains(0, 14, 1));
+
+        e.clear_selection();
+        e.select_kind = SelectKind::Matching;
+        e.primary_press(false);
+        e.primary_release();
+        assert_eq!(e.selection().unwrap().cell_count(), Some(29), "the ring and the lone cell");
+
+        // Connected selection of empty space works; "same tiles" on empty is refused.
+        e.clear_selection();
+        let o = px(&e, 0, 0);
+        e.mouse_moved(o.0, o.1);
+        e.select_kind = SelectKind::Matching;
+        e.primary_press(false);
+        assert!(!e.has_selection() && e.status.contains("Empty cells"));
+        e.select_kind = SelectKind::Contiguous;
+        e.primary_press(false);
+        assert_eq!(e.selection().unwrap().cell_count(), Some(256 - 29 - 36 + 0 - 0), "outside area");
+    }
+
+    #[test]
+    fn a_selection_made_zoomed_out_still_limits_painting_when_zoomed_in() {
+        let mut e = bounded(16, 16, 2);
+        e.selection = Some(Selection::rect(0, (4, 4), (4, 4))); // one coarse cell
+        // Go into depth 1 right at that cell.
+        let (x, y) = px(&e, 4, 4);
+        e.mouse_moved(x, y);
+        e.zoom(4.0);
+        assert!(e.camera.depth >= 1);
+        let d = e.camera.depth;
+        let s = depthmap_core::SUBDIV.pow(d as u32);
+        let inside = e.cursor_cell().unwrap();
+        assert!((4 * s..5 * s).contains(&inside.0) && (4 * s..5 * s).contains(&inside.1));
+        assert!(e.selected(d, inside.0, inside.1), "the zoomed-in cell is inside the coarse cell");
+        assert!(e.selected(d, 4 * s, 5 * s - 1) && e.selected(d, 5 * s - 1, 4 * s));
+        assert!(!e.selected(d, 4 * s - 1, 4 * s + 1) && !e.selected(d, 5 * s, 4 * s + 1));
+        assert!(!e.selected(d, 4 * s + 1, 4 * s - 1) && !e.selected(d, 4 * s + 1, 5 * s));
+    }
+
+    #[test]
+    fn new_and_loaded_maps_start_without_a_selection() {
+        let mut e = bounded(16, 16, 1);
+        e.selection = Some(Selection::all(0));
+        e.new_map(MapSpec::new(8, 8, 1));
+        assert!(!e.has_selection());
+        assert_eq!(e.selection_summary(), None);
+        e.select_all();
+        assert!(e.selection_summary().unwrap().contains("Everything"));
     }
 }

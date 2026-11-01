@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use depthmap::editor::Editor;
+use depthmap::editor::{Editor, ToolMode};
 use depthmap::gui::{Command, Gui};
 use depthmap::renderer::{FrameStats, RenderOptions, Renderer};
 use depthmap::settings::Recent;
@@ -19,6 +19,8 @@ const HELP: &str = "\
 depthmap [FILE] [--stress N]
 
   LMB paint            RMB drag shape       MMB / Space+LMB pan
+  B brush  G fill  M select (RMB inverts, further selections add, Esc clears)
+  Ctrl+A select all   Ctrl+D deselect   Ctrl+I invert selection
   Shift+mouse erase    E eraser toggle      Esc cancel shape / node
   N add node, click map   click node edit, drag moves   Del delete open node
   wheel zoom           WASD / arrows pan    1-9, 0 texture
@@ -350,8 +352,8 @@ impl App {
                 KeyCode::KeyW | KeyCode::ArrowUp => self.held.up = pressed,
                 KeyCode::KeyS | KeyCode::ArrowDown if !ctrl => self.held.down = pressed,
                 KeyCode::ArrowDown => self.held.down = pressed,
-                KeyCode::KeyA | KeyCode::ArrowLeft => self.held.left = pressed,
-                KeyCode::KeyD | KeyCode::ArrowRight => self.held.right = pressed,
+                KeyCode::KeyA | KeyCode::ArrowLeft if !(ctrl && pressed) => self.held.left = pressed,
+                KeyCode::KeyD | KeyCode::ArrowRight if !(ctrl && pressed) => self.held.right = pressed,
                 KeyCode::Space => self.space = pressed,
                 _ => {}
             }
@@ -378,13 +380,7 @@ impl App {
             return;
         }
         if let Key::Named(NamedKey::Escape) = event.logical_key {
-            if self.editor.placing_node {
-                self.editor.cancel_placing_node();
-            } else if self.editor.open_node_id().is_some() {
-                self.editor.close_node(true);
-            } else {
-                self.editor.cancel_shape();
-            }
+            self.editor.escape();
             return;
         }
         if let Key::Named(NamedKey::Delete) = event.logical_key {
@@ -401,6 +397,9 @@ impl App {
         if ctrl {
             if let Key::Character(c) = event.key_without_modifiers() {
                 match c.as_str() {
+                    "a" => self.editor.select_all(),
+                    "d" => self.editor.clear_selection(),
+                    "i" => self.editor.invert_selection(),
                     "z" if self.mods.shift_key() => self.editor.redo(),
                     "z" => self.editor.undo(),
                     "y" => self.editor.redo(),
@@ -416,6 +415,14 @@ impl App {
         if let Key::Character(c) = &event.logical_key {
             match c.as_str() {
                 "e" | "E" => self.editor.eraser = !self.editor.eraser,
+                "c" | "C" => {
+                    if let Some(g) = self.gfx.as_mut() {
+                        g.gui.state.show_colors = !g.gui.state.show_colors;
+                    }
+                }
+                "b" | "B" => self.editor.tool = ToolMode::Paint,
+                "g" | "G" => self.editor.tool = ToolMode::Fill,
+                "m" | "M" => self.editor.tool = ToolMode::Select,
                 "n" | "N" => {
                     if self.editor.placing_node {
                         self.editor.cancel_placing_node();
@@ -449,6 +456,7 @@ impl ApplicationHandler for App {
         self.editor.resize(size.width as f64, size.height as f64);
         let mut gfx = Gfx::new(window);
         gfx.gui.state.set_recent(self.recent.paths());
+        gfx.gui.state.set_palettes(depthmap::palette::Palettes::load());
         if self.show_startup {
             gfx.gui.state.open_startup();
         }
@@ -514,22 +522,21 @@ impl ApplicationHandler for App {
                     // Clicks that land on a panel or dialog belong to egui.
                     (_, true) if over_ui || consumed => {}
                     (MouseButton::Left, true) if self.space => self.editor.set_panning(true),
-                    (MouseButton::Left, true) if self.mods.shift_key() => self.editor.begin_erase(),
                     (MouseButton::Left, true) if self.editor.placing_node => {
                         self.editor.place_node_at_cursor();
                     }
                     // A node under the mouse is grabbed instead of painted over.
                     (MouseButton::Left, true) => {
                         if !self.editor.press_node() {
-                            self.editor.begin_paint();
+                            self.editor.primary_press(self.mods.shift_key());
                         }
                     }
                     // Right button: drag out a shape (Shift erases with it).
-                    (MouseButton::Right, true) => self.editor.begin_shape(self.mods.shift_key()),
+                    (MouseButton::Right, true) => self.editor.secondary_press(self.mods.shift_key()),
                     (MouseButton::Middle, true) => self.editor.set_panning(true),
                     (MouseButton::Right, false) => self.editor.end_shape(),
                     (MouseButton::Left, false) => {
-                        self.editor.end_stroke();
+                        self.editor.primary_release();
                         self.editor.end_node_drag();
                         self.editor.set_panning(false);
                     }
