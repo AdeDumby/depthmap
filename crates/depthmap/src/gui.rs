@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use depthmap_core::camera::{MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL};
 use depthmap_core::spec::{MAX_MAP_SIZE, MIN_MAP_SIZE};
-use depthmap_core::{Fill, MAX_DEPTH, MapSpec, Shape};
+use depthmap_core::icons::{self, BUILTIN_COUNT};
+use depthmap_core::node::{MAX_DESCRIPTION_CHARS, MAX_NAME_CHARS, MAX_SCALE, MIN_SCALE};
+use depthmap_core::{Fill, Icon, MAX_DEPTH, MapSpec, Shape, World};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
 use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
 
@@ -26,6 +28,8 @@ pub enum Command {
     /// Open this specific file (recent maps, the startup screen).
     OpenPath(PathBuf),
     SaveAs,
+    /// Pick PNG files with a dialog and import them as node icons.
+    ImportIcons,
     Quit,
 }
 
@@ -69,6 +73,36 @@ pub struct UiLayout {
     pub new_presets: Vec<egui::Rect>,
     pub new_create: Option<egui::Rect>,
     pub new_cancel: Option<egui::Rect>,
+    pub place_node: Option<egui::Rect>,
+    pub import_icons: Option<egui::Rect>,
+    /// Icon choices in the node popup: the built-in ones, then imported.
+    pub node_icons: Vec<egui::Rect>,
+    pub node_done: Option<egui::Rect>,
+    pub node_delete: Option<egui::Rect>,
+    pub node_cancel: Option<egui::Rect>,
+    pub node_import: Option<egui::Rect>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum IconKey {
+    Builtin(u8),
+    Custom(String, u64),
+}
+
+/// An icon uploaded to egui in two sizes (the small one avoids shimmering
+/// when the icon is drawn tiny).
+#[derive(Clone)]
+struct IconTex {
+    big: egui::TextureHandle,
+    small: egui::TextureHandle,
+    /// Width and height of the picture, for drawing it with the right shape.
+    aspect: (f32, f32),
+}
+
+impl IconTex {
+    fn id(&self, size: f32) -> egui::TextureId {
+        if size <= 40.0 { self.small.id() } else { self.big.id() }
+    }
 }
 
 /// The New Map dialog's fields.
@@ -114,6 +148,12 @@ pub struct UiState {
     ready: Vec<Command>,
     thumbs: Vec<egui::TextureHandle>,
     thumbs_rgb: Option<[u8; 3]>,
+    icon_cache: std::collections::HashMap<IconKey, IconTex>,
+    /// Icon files available in the Custom Icons folder or the map.
+    icon_names: Vec<String>,
+    seen_icons_rev: u64,
+    /// Node whose name field should grab the keyboard when its popup opens.
+    focus_node: Option<depthmap_core::NodeId>,
 }
 
 impl Default for UiState {
@@ -140,7 +180,94 @@ impl UiState {
             ready: Vec::new(),
             thumbs: Vec::new(),
             thumbs_rgb: None,
+            icon_cache: Default::default(),
+            icon_names: Vec::new(),
+            seen_icons_rev: u64::MAX,
+            focus_node: None,
         }
+    }
+
+    /// The picture for an icon, uploading it on first use. Imported icons
+    /// that cannot be decoded (or are missing) show the "missing" icon.
+    fn icon_tex(&mut self, ctx: &egui::Context, world: &World, icon: &Icon) -> IconTex {
+        let (key, image) = match icon {
+            Icon::Builtin(id) => (IconKey::Builtin(*id), None),
+            Icon::Custom(name) => match world.custom_icon(name) {
+                Some(c) => (IconKey::Custom(name.clone(), c.hash), Some(c)),
+                None => (IconKey::Builtin(0), None),
+            },
+        };
+        if let Some(t) = self.icon_cache.get(&key) {
+            return t.clone();
+        }
+        let img = match (&key, image) {
+            (IconKey::Custom(..), Some(c)) => {
+                icons::decode_png(&c.png).unwrap_or_else(|_| icons::builtin_image(0))
+            }
+            (IconKey::Builtin(id), _) => icons::builtin_image(*id),
+            _ => icons::builtin_image(0),
+        };
+        let upload = |name: String, img: &icons::Image| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba),
+                TextureOptions::LINEAR,
+            )
+        };
+        let tag = match &key {
+            IconKey::Builtin(id) => format!("b{id}"),
+            IconKey::Custom(n, h) => format!("{n}-{h}"),
+        };
+        let tex = IconTex {
+            big: upload(format!("icon-{tag}"), &icons::downscale(&img, 128)),
+            small: upload(format!("icon-{tag}-s"), &icons::downscale(&img, 32)),
+            aspect: (img.w as f32, img.h as f32),
+        };
+        self.icon_cache.insert(key, tex.clone());
+        tex
+    }
+
+    /// The picture for an icon file that is in the Custom Icons folder but
+    /// not (yet) in the map, for the picker.
+    fn icon_tex_from_file(&mut self, ctx: &egui::Context, dir: &std::path::Path, name: &str) -> IconTex {
+        let key = IconKey::Custom(format!("file:{name}"), 0);
+        if let Some(t) = self.icon_cache.get(&key) {
+            return t.clone();
+        }
+        let img = std::fs::read(dir.join(name))
+            .ok()
+            .and_then(|b| icons::decode_png(&b).ok())
+            .unwrap_or_else(|| icons::builtin_image(0));
+        let upload = |tag: &str, img: &icons::Image| {
+            ctx.load_texture(
+                format!("icon-file-{name}{tag}"),
+                egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba),
+                TextureOptions::LINEAR,
+            )
+        };
+        let tex = IconTex {
+            big: upload("", &icons::downscale(&img, 128)),
+            small: upload("-s", &icons::downscale(&img, 32)),
+            aspect: (img.w as f32, img.h as f32),
+        };
+        self.icon_cache.insert(key, tex.clone());
+        tex
+    }
+
+    /// Re-reads which icon files exist when something may have changed.
+    fn refresh_icon_names(&mut self, ed: &Editor) {
+        if self.seen_icons_rev == ed.icons_revision {
+            return;
+        }
+        self.seen_icons_rev = ed.icons_revision;
+        let mut names = icons::list_custom(&ed.icons_dir);
+        for (name, _) in ed.world.custom_icons() {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names.sort_by_key(|n| n.to_lowercase());
+        self.icon_names = names;
     }
 
     /// Asks for a command to run. Commands that would throw away unsaved
@@ -276,7 +403,9 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     if st.show_zoom {
         zoom_panel(ctx, ed, st);
     }
+    nodes_layer(ctx, ed, st);
     dialogs(ctx, ed, st);
+    node_popup(ctx, ed, st);
     startup_window(ctx, st, modal);
     new_map_window(ctx, st);
 }
@@ -315,6 +444,10 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     st.request(Command::SaveAs, ed.modified());
                 }
                 ui.separator();
+                if item(ui, "Import PNG icons...", "") {
+                    st.request(Command::ImportIcons, false);
+                }
+                ui.separator();
                 if item(ui, "Quit", "") {
                     st.request(Command::Quit, ed.modified());
                 }
@@ -330,10 +463,15 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         ed.redo();
                     }
                 });
+                ui.separator();
+                if item(ui, "Add node", "N") {
+                    ed.start_placing_node();
+                }
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut st.show_grid, "Show grid");
                 ui.checkbox(&mut st.show_checker, "Checker overlay (darken every other cell)");
+                ui.checkbox(&mut ed.show_nodes, "Show nodes");
                 ui.checkbox(&mut st.show_tools, "Textures & colors panel");
                 ui.checkbox(&mut st.show_zoom, "Zoom panel");
                 ui.separator();
@@ -401,6 +539,8 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.fills.clear();
     st.layout.border_toggle = None;
     st.layout.eraser_toggle = None;
+    st.layout.place_node = None;
+    st.layout.import_icons = None;
     let max_height = (ctx.content_rect().height() - 70.0).max(240.0);
     egui::Window::new("Textures")
         .anchor(Align2::LEFT_TOP, [10.0, 40.0])
@@ -540,6 +680,37 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 )
                 .on_hover_text("Brush size sets the border / outline thickness");
             st.layout.border_toggle = Some(border.rect);
+
+            ui.separator();
+            ui.label(RichText::new("Nodes").strong());
+            ui.horizontal(|ui| {
+                let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
+                let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                ui.painter().image(
+                    tex.id(24.0),
+                    fit_rect(rect, tex.aspect),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                let add = ui
+                    .selectable_label(ed.placing_node, "Add node  (N)")
+                    .on_hover_text("Then click the map. Click a node later to edit it, drag to move it.");
+                st.layout.place_node = Some(add.rect);
+                if add.clicked() {
+                    if ed.placing_node {
+                        ed.cancel_placing_node();
+                    } else {
+                        ed.start_placing_node();
+                    }
+                }
+            });
+            let import = ui
+                .button("Import PNG icons...")
+                .on_hover_text(format!("Copied to {}", ed.icons_dir.display()));
+            st.layout.import_icons = Some(import.rect);
+            if import.clicked() {
+                st.request(Command::ImportIcons, false);
+            }
           });
         });
 }
@@ -737,6 +908,271 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     }
 }
 
+/// `rect` shrunk to the shape of a picture of `aspect` (w, h), centred.
+fn fit_rect(rect: egui::Rect, aspect: (f32, f32)) -> egui::Rect {
+    let big = aspect.0.max(aspect.1).max(1.0);
+    let size = vec2(rect.width() * aspect.0 / big, rect.height() * aspect.1 / big);
+    egui::Rect::from_center_size(rect.center(), size)
+}
+
+/// Draws every visible node (icon and name) over the map.
+fn nodes_layer(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    let ppp = ctx.pixels_per_point();
+    let over_ui = ctx.is_pointer_over_egui();
+    if ed.placing_node && !over_ui {
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    } else if !over_ui && ed.cursor_px.is_some_and(|(x, y)| ed.node_at(x, y).is_some()) {
+        ctx.set_cursor_icon(if ed.node_dragging() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::PointingHand
+        });
+    }
+    if !ed.show_nodes && !ed.placing_node {
+        return;
+    }
+    let avail = ctx.content_rect();
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("nodes")))
+        .with_clip_rect(avail);
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+
+    if ed.show_nodes {
+        let open = ed.open_node_id();
+        let nodes: Vec<_> = ed.world.nodes().to_vec();
+        for n in &nodes {
+            let Some(s) = ed.node_screen(n) else { continue };
+            let size = s.size as f32 / ppp;
+            let centre = egui::pos2(s.centre.0 as f32 / ppp, s.centre.1 as f32 / ppp);
+            // Skip nodes whose icon and label are entirely off screen.
+            let reach = egui::Rect::from_center_size(centre, vec2(size + 400.0, size + 60.0));
+            if !reach.intersects(avail) {
+                continue;
+            }
+            let tex = st.icon_tex(ctx, &ed.world, &n.icon);
+            let rect = fit_rect(egui::Rect::from_center_size(centre, vec2(size, size)), tex.aspect);
+            painter.image(tex.id(size), rect, uv, Color32::WHITE);
+            if open == Some(n.id) {
+                painter.rect_stroke(
+                    rect.expand(3.0),
+                    4.0,
+                    Stroke::new(2.0, Color32::from_rgb(120, 200, 255)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if !n.name.is_empty() {
+                let at = egui::pos2(centre.x, centre.y + size * 0.5 + 2.0);
+                let font = egui::FontId::proportional(13.0);
+                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-1.0, -1.0), (1.0, 1.0)] {
+                    painter.text(
+                        at + vec2(dx, dy),
+                        Align2::CENTER_TOP,
+                        &n.name,
+                        font.clone(),
+                        Color32::from_black_alpha(230),
+                    );
+                }
+                painter.text(at, Align2::CENTER_TOP, &n.name, font, Color32::WHITE);
+            }
+        }
+    }
+
+    // A faint copy of the icon follows the mouse while placing.
+    if ed.placing_node && !over_ui {
+        if let Some((x, y)) = ed.cursor_px {
+            let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
+            let size = 32.0;
+            let rect = fit_rect(
+                egui::Rect::from_center_size(egui::pos2(x as f32 / ppp, y as f32 / ppp), vec2(size, size)),
+                tex.aspect,
+            );
+            painter.image(tex.id(size), rect, uv, Color32::from_white_alpha(150));
+        }
+    }
+}
+
+fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    st.layout.node_icons.clear();
+    st.layout.node_done = None;
+    st.layout.node_delete = None;
+    st.layout.node_cancel = None;
+    st.layout.node_import = None;
+    let Some(id) = ed.open_node_id() else {
+        st.focus_node = None;
+        return;
+    };
+    let Some(mut node) = ed.world.node(id).cloned() else {
+        ed.close_node(false);
+        return;
+    };
+    if st.focus_node.is_none() && st.seen_icons_rev != ed.icons_revision {
+        // Opening a node: a new one gets the keyboard in its name field.
+        st.focus_node = (node.name.is_empty()).then_some(id);
+    }
+    st.refresh_icon_names(ed);
+
+    let ppp = ctx.pixels_per_point();
+    let screen = ctx.content_rect();
+    let near = ed.node_screen(&node).map_or(screen.center(), |s| {
+        egui::pos2(s.centre.0 as f32 / ppp + 40.0, s.centre.1 as f32 / ppp - 20.0)
+    });
+    let pos = egui::pos2(
+        near.x.clamp(screen.left() + 10.0, (screen.right() - 330.0).max(10.0)),
+        near.y.clamp(screen.top() + 40.0, (screen.bottom() - 420.0).max(40.0)),
+    );
+
+    let mut open = true;
+    let (mut done, mut delete, mut cancel) = (false, false, false);
+    let mut chosen: Option<Icon> = None;
+    let mut import = false;
+    let names = st.icon_names.clone();
+    let mut thumbs: Vec<(Icon, IconTex)> = Vec::new();
+    for i in 1..=BUILTIN_COUNT {
+        let icon = Icon::Builtin(i);
+        let t = st.icon_tex(ctx, &ed.world, &icon);
+        thumbs.push((icon, t));
+    }
+    for name in &names {
+        let icon = Icon::Custom(name.clone());
+        // Icons from the folder that this map has not loaded yet are drawn
+        // from the file; only chosen ones are stored in the map.
+        let t = if ed.world.custom_icon(name).is_some() {
+            st.icon_tex(ctx, &ed.world, &icon)
+        } else {
+            st.icon_tex_from_file(ctx, &ed.icons_dir, name)
+        };
+        thumbs.push((icon, t));
+    }
+    let focus = st.focus_node == Some(id);
+
+    egui::Window::new("Node")
+        .id(egui::Id::unique(("node-popup", id)))
+        .default_pos(pos)
+        .resizable(false)
+        .collapsible(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.label(RichText::new("Name").strong());
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut node.name)
+                    .hint_text("Shown under the node")
+                    .char_limit(MAX_NAME_CHARS)
+                    .desired_width(f32::INFINITY),
+            );
+            if focus {
+                name.request_focus();
+            }
+            ui.label(RichText::new("Description").strong());
+            ui.add(
+                egui::TextEdit::multiline(&mut node.description)
+                    .hint_text("Notes about this place")
+                    .char_limit(MAX_DESCRIPTION_CHARS)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Icon").strong());
+                let label = match &node.icon {
+                    Icon::Builtin(i) => icons::builtin_name(*i).to_string(),
+                    Icon::Custom(n) => n.clone(),
+                };
+                ui.label(RichText::new(label).weak());
+            });
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    for (icon, tex) in &thumbs {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
+                        st.layout.node_icons.push(rect);
+                        let selected = node.icon == *icon;
+                        if selected {
+                            ui.painter().rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(rect, 4.0, Color32::from_white_alpha(25));
+                        }
+                        ui.painter().image(
+                            tex.id(32.0),
+                            fit_rect(rect.shrink(4.0), tex.aspect),
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        let tip = match icon {
+                            Icon::Builtin(i) => icons::builtin_name(*i).to_string(),
+                            Icon::Custom(n) => n.clone(),
+                        };
+                        if resp.on_hover_text(tip).clicked() {
+                            chosen = Some(icon.clone());
+                        }
+                    }
+                });
+            });
+            let imp = ui
+                .button("Import PNG...")
+                .on_hover_text(format!("Adds PNG files to {}", ed.icons_dir.display()));
+            st.layout.node_import = Some(imp.rect);
+            import = imp.clicked();
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Size").strong());
+                ui.add(
+                    egui::Slider::new(&mut node.scale, MIN_SCALE..=MAX_SCALE)
+                        .logarithmic(true)
+                        .custom_formatter(|v, _| format!("{v:.2}×")),
+                )
+                .on_hover_text("Icon size relative to one cell of this node's depth");
+                if ui.small_button("1×").clicked() {
+                    node.scale = 1.0;
+                }
+            });
+            ui.label(
+                RichText::new(format!("depth {}  ·  cell {}, {}", node.depth, node.x, node.y)).weak(),
+            );
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                let d = ui.add_sized(
+                    [90.0, 28.0],
+                    egui::Button::new(RichText::new("Done").strong()).fill(ui.visuals().selection.bg_fill),
+                );
+                st.layout.node_done = Some(d.rect);
+                done = d.clicked();
+                let x = ui.add_sized([90.0, 28.0], egui::Button::new("Delete"));
+                st.layout.node_delete = Some(x.rect);
+                delete = x.clicked();
+                let c = ui
+                    .add_sized([90.0, 28.0], egui::Button::new("Cancel"))
+                    .on_hover_text("Throw away what you changed in this popup");
+                st.layout.node_cancel = Some(c.rect);
+                cancel = c.clicked();
+            });
+        });
+
+    if focus {
+        st.focus_node = None;
+    }
+    if let Some(icon) = chosen {
+        ed.choose_icon(icon);
+        if let Some(n) = ed.world.node(id) {
+            node.icon = n.icon.clone(); // a failed load keeps the old icon
+        }
+    }
+    ed.update_open_node(node);
+    if import {
+        st.request(Command::ImportIcons, false);
+    }
+    if delete {
+        ed.delete_open_node();
+    } else if cancel {
+        ed.close_node(false);
+    } else if done || !open {
+        ed.close_node(true);
+    }
+}
+
 /// `1234567` -> `1,234,567`.
 fn grouped(n: i64) -> String {
     let digits = n.to_string();
@@ -899,7 +1335,10 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Left mouse", "Paint with the selected texture and color"),
                         ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
                         ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("Esc", "Cancel the shape being dragged"),
+                        ("Esc", "Cancel the shape being dragged / placing a node / close the node popup"),
+                        ("N", "Add a node: then click the map"),
+                        ("Click / drag a node", "Edit it / move it"),
+                        ("Delete", "Delete the node whose popup is open"),
                         ("Middle mouse / Space + drag", "Pan"),
                         ("Mouse wheel", "Zoom (deeper zoom = finer layer)"),
                         ("WASD / arrow keys", "Pan (physical key positions)"),

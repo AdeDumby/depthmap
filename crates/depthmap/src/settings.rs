@@ -12,6 +12,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Where imported node icons are kept: `Documents/Depthmap/Custom Icons`.
+pub fn custom_icons_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
+        .join("Depthmap")
+        .join("Custom Icons")
+}
+
+/// Where the "import PNG" dialog starts.
+pub fn icon_import_start_dir() -> Option<PathBuf> {
+    dirs::picture_dir().or_else(dirs::document_dir)
+}
+
 /// How many maps are remembered.
 pub const MAX_RECENT: usize = 10;
 

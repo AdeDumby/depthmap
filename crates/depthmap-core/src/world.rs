@@ -1,9 +1,14 @@
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::FxHashMap;
 
 use crate::chunk::{Cell, Chunk, ChunkPos, EMPTY, local_index, normalize};
 use crate::colors::ColorTable;
+use crate::icons;
+use crate::node::{Icon, Node, NodeId};
 use crate::spec::MapSpec;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
@@ -17,6 +22,23 @@ fn next_stamp() -> u64 {
     STAMP.fetch_add(1, Ordering::Relaxed)
 }
 
+/// An imported PNG kept inside the map, so a map file still shows its icons
+/// on a computer that does not have the original files.
+#[derive(Clone, Debug)]
+pub struct CustomIcon {
+    pub png: Arc<Vec<u8>>,
+    /// Identifies the contents (for caches), not a security hash.
+    pub hash: u64,
+}
+
+impl CustomIcon {
+    pub fn new(png: Vec<u8>) -> Self {
+        let mut h = rustc_hash::FxHasher::default();
+        png.hash(&mut h);
+        Self { hash: h.finish(), png: Arc::new(png) }
+    }
+}
+
 /// All depths of the map. One sparse chunk map per depth.
 pub struct World {
     /// The colour table cells index into.
@@ -25,6 +47,9 @@ pub struct World {
     /// Number of edits so far (see [`World::revision`]).
     clock: u64,
     spec: MapSpec,
+    nodes: Vec<Node>,
+    node_seq: NodeId,
+    custom_icons: BTreeMap<String, CustomIcon>,
 }
 
 impl Default for World {
@@ -46,7 +71,101 @@ impl World {
             layers: (0..=MAX_DEPTH).map(|_| FxHashMap::default()).collect(),
             clock: 0,
             spec,
+            nodes: Vec::new(),
+            node_seq: 1,
+            custom_icons: BTreeMap::new(),
         }
+    }
+
+    // ---- nodes ----------------------------------------------------------------
+
+    pub fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// A fresh node id, never used before in this map.
+    pub fn alloc_node_id(&mut self) -> NodeId {
+        let id = self.node_seq;
+        self.node_seq += 1;
+        id
+    }
+
+    /// Adds a node, or replaces the one with the same id (keeping its place
+    /// in the drawing order). Returns false, changing nothing, when the node
+    /// is outside the map. Only real changes count as edits.
+    pub fn put_node(&mut self, node: Node) -> bool {
+        let node = node.sanitized();
+        if !self.spec.contains(node.depth, node.x, node.y) {
+            return false;
+        }
+        self.node_seq = self.node_seq.max(node.id.saturating_add(1));
+        match self.nodes.iter_mut().find(|n| n.id == node.id) {
+            Some(slot) => {
+                if *slot != node {
+                    *slot = node;
+                    self.clock += 1;
+                }
+            }
+            None => {
+                self.nodes.push(node);
+                self.clock += 1;
+            }
+        }
+        true
+    }
+
+    pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
+        let at = self.nodes.iter().position(|n| n.id == id)?;
+        self.clock += 1;
+        Some(self.nodes.remove(at))
+    }
+
+    /// Makes node `id` exactly `state` (used by undo and redo).
+    pub fn set_node_state(&mut self, id: NodeId, state: Option<&Node>) {
+        match state {
+            Some(n) => {
+                self.put_node(n.clone());
+            }
+            None => {
+                self.remove_node(id);
+            }
+        }
+    }
+
+    // ---- imported icons ----------------------------------------------------------
+
+    /// Stores an imported PNG under `name` (replacing any with that name).
+    pub fn add_custom_icon(&mut self, name: &str, png: Vec<u8>) -> Result<(), String> {
+        if !icons::valid_icon_name(name) {
+            return Err(format!("\"{name}\" is not a usable icon file name"));
+        }
+        if png.len() > icons::MAX_PNG_BYTES {
+            return Err("the icon is larger than 8 MB".into());
+        }
+        self.custom_icons.insert(name.to_string(), CustomIcon::new(png));
+        Ok(())
+    }
+
+    pub fn custom_icon(&self, name: &str) -> Option<&CustomIcon> {
+        self.custom_icons.get(name)
+    }
+
+    pub fn custom_icons(&self) -> impl Iterator<Item = (&String, &CustomIcon)> {
+        self.custom_icons.iter()
+    }
+
+    /// Imported icons that some node actually uses (what gets saved).
+    pub fn used_custom_icons(&self) -> Vec<(&String, &CustomIcon)> {
+        self.custom_icons
+            .iter()
+            .filter(|(name, _)| {
+                self.nodes.iter().any(|n| matches!(&n.icon, Icon::Custom(c) if c == *name))
+            })
+            .collect()
     }
 
     pub fn spec(&self) -> MapSpec {
@@ -288,6 +407,53 @@ mod tests {
         let r = w.revision();
         w.set(0, 0, 0, 1);
         assert_eq!(w.revision(), r);
+    }
+
+    #[test]
+    fn nodes_can_be_added_replaced_and_removed() {
+        let mut w = World::with_spec(MapSpec::new(8, 8, 1));
+        let id = w.alloc_node_id();
+        assert!(w.put_node(Node::new(id, 1, 5, 5, Icon::Builtin(3))));
+        assert_eq!(w.revision(), 1);
+        let mut n = w.node(id).unwrap().clone();
+        assert!(w.put_node(n.clone()));
+        assert_eq!(w.revision(), 1, "an identical node is not an edit");
+        n.name = "Tavern".into();
+        assert!(w.put_node(n));
+        assert_eq!(w.revision(), 2);
+        assert_eq!(w.node(id).unwrap().name, "Tavern");
+        assert_eq!(w.nodes().len(), 1);
+        assert!(w.alloc_node_id() > id);
+        assert_eq!(w.remove_node(id).unwrap().name, "Tavern");
+        assert!(w.remove_node(id).is_none());
+        assert!(w.nodes().is_empty());
+    }
+
+    #[test]
+    fn nodes_outside_the_map_are_refused_and_ids_never_repeat() {
+        let mut w = World::with_spec(MapSpec::new(8, 8, 1));
+        assert!(!w.put_node(Node::new(1, 0, 8, 0, Icon::default())));
+        assert!(!w.put_node(Node::new(2, 2, 0, 0, Icon::default())), "depth 2 does not exist");
+        assert!(w.nodes().is_empty() && w.revision() == 0);
+        assert!(w.put_node(Node::new(40, 0, 1, 1, Icon::default())));
+        assert!(w.alloc_node_id() > 40, "ids stay ahead of loaded nodes");
+    }
+
+    #[test]
+    fn imported_icons_are_kept_and_only_used_ones_are_listed() {
+        let mut w = World::new();
+        w.add_custom_icon("a.png", vec![1, 2, 3]).unwrap();
+        w.add_custom_icon("b.png", vec![4]).unwrap();
+        assert!(w.add_custom_icon("../evil.png", vec![1]).is_err());
+        assert!(w.add_custom_icon("c.png", vec![0; crate::icons::MAX_PNG_BYTES + 1]).is_err());
+        assert_eq!(w.custom_icons().count(), 2);
+        assert!(w.used_custom_icons().is_empty());
+        w.put_node(Node::new(1, 0, 0, 0, Icon::Custom("b.png".into())));
+        let used: Vec<_> = w.used_custom_icons().iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(used, vec!["b.png"]);
+        let h = w.custom_icon("a.png").unwrap().hash;
+        w.add_custom_icon("a.png", vec![9, 9]).unwrap();
+        assert_ne!(w.custom_icon("a.png").unwrap().hash, h, "changed contents, new hash");
     }
 
     #[test]

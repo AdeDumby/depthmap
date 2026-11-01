@@ -680,3 +680,49 @@ fn checker_overlay_and_hover_readout_render() {
     let text = ed.hover_info().unwrap().text();
     assert!(text.starts_with("d3 cell") && text.contains("in d2 cell"), "{text}");
 }
+
+#[test]
+fn node_popup_edits_the_node_and_its_buttons_work() {
+    let mut h = Harness::new();
+    h.ed.icons_dir = std::env::temp_dir().join(format!("depthmap-ui-icons-{}", std::process::id()));
+    h.frame(vec![]);
+    h.click(h.st.layout.place_node.unwrap().center());
+    assert!(h.ed.placing_node);
+    h.ed.mouse_moved(500.0, 400.0);
+    let id = h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.node_icons.len(), depthmap_core::icons::BUILTIN_COUNT as usize);
+
+    // Pick the third icon.
+    h.click(h.st.layout.node_icons[2].center());
+    assert_eq!(h.ed.world.node(id).unwrap().icon, depthmap_core::Icon::Builtin(3));
+
+    h.click(h.st.layout.node_done.unwrap().center());
+    assert_eq!(h.ed.open_node_id(), None);
+    assert!(h.ed.world.node(id).is_some());
+
+    h.ed.open_node(id);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.node_delete.unwrap().center());
+    assert!(h.ed.world.node(id).is_none());
+
+    h.ed.start_placing_node();
+    h.ed.mouse_moved(300.0, 300.0);
+    let id = h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.node_cancel.unwrap().center());
+    assert!(h.ed.world.node(id).is_none(), "cancelling a new node discards it");
+
+    h.click(h.st.layout.node_import.map_or(Pos2::ZERO, |r| r.center()));
+    h.frame(vec![]);
+    h.ed.start_placing_node();
+    h.ed.mouse_moved(300.0, 300.0);
+    h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.node_import.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::ImportIcons]);
+}

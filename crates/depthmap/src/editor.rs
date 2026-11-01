@@ -8,8 +8,16 @@ use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::raster::{line_cells, square_cells};
 use depthmap_core::shape::{Clip, shape_cells};
 use depthmap_core::{
-    Camera, Cell, CellEdit, EMPTY, Fill, History, MapSpec, Shape, ShapeStyle, World, io, make_cell,
+    Camera, Cell, CellEdit, EMPTY, Fill, History, Icon, MapSpec, Node, NodeId, Shape, ShapeStyle,
+    World, icons, io, make_cell,
 };
+
+/// Nodes are hidden when a cell of their depth is smaller than this on screen.
+const MIN_NODE_CELL_PX: f64 = 2.0;
+/// Icons are drawn at least this big (so zoomed-out nodes stay recognisable)
+/// and never bigger than the maximum.
+pub const MIN_NODE_ICON_PX: f64 = 18.0;
+const MAX_NODE_ICON_PX: f64 = 1500.0;
 
 /// Fraction of the window the whole map fills when fully zoomed out.
 const FIT_MARGIN: f64 = 0.92;
@@ -41,6 +49,16 @@ pub struct Editor {
     pub border: bool,
     /// Draw with the eraser instead of the texture (brush and shapes).
     pub eraser: bool,
+    /// The next left click places a node.
+    pub placing_node: bool,
+    /// Icon given to new nodes (the last one picked or imported).
+    pub default_icon: Icon,
+    /// Draw nodes (and let clicks grab them).
+    pub show_nodes: bool,
+    /// Folder imported icons are copied to.
+    pub icons_dir: PathBuf,
+    /// Counts events that may change the list of available icons.
+    pub icons_revision: u64,
     pub viewport: (f64, f64),
     pub cursor_px: Option<(f64, f64)>,
     /// File the map is saved to; `None` for an untitled map.
@@ -56,6 +74,31 @@ pub struct Editor {
     panning: bool,
     shape_drag: Option<ShapeDrag>,
     shape_buf: Vec<(i64, i64)>,
+    node_session: Option<NodeSession>,
+    node_drag: Option<NodeDrag>,
+}
+
+/// The node whose popup is open. Edits go to the world live; closing the
+/// popup records them as one undo step.
+struct NodeSession {
+    id: NodeId,
+    /// The node as it was when the popup opened (`None` for a new node).
+    original: Option<Node>,
+    revision: u64,
+}
+
+struct NodeDrag {
+    id: NodeId,
+    original: Node,
+    moved: bool,
+}
+
+/// Where a node is drawn: its centre and the side of its (square) icon, in
+/// screen pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeScreen {
+    pub centre: (f64, f64),
+    pub size: f64,
 }
 
 /// The cell under the mouse, see [`Editor::hover_info`].
@@ -127,6 +170,11 @@ impl Editor {
             fill: Fill::Outline,
             border: false,
             eraser: false,
+            placing_node: false,
+            default_icon: Icon::default(),
+            show_nodes: true,
+            icons_dir: crate::settings::custom_icons_dir(),
+            icons_revision: 0,
             viewport: (1280.0, 720.0),
             cursor_px: None,
             path: None,
@@ -138,6 +186,8 @@ impl Editor {
             panning: false,
             shape_drag: None,
             shape_buf: Vec::new(),
+            node_session: None,
+            node_drag: None,
         }
     }
 
@@ -192,6 +242,7 @@ impl Editor {
             self.stroke_to_cursor();
         }
         self.update_shape();
+        self.update_node_drag();
     }
 
     pub fn mouse_left_window(&mut self) {
@@ -383,6 +434,262 @@ impl Editor {
         self.update_shape();
     }
 
+    // ---- nodes ------------------------------------------------------------
+
+    /// Where `node` is on screen, or `None` when it is hidden because the
+    /// view is zoomed out too far for its depth.
+    pub fn node_screen(&self, node: &Node) -> Option<NodeScreen> {
+        let view = self.camera.at_depth(node.depth);
+        if view.ppc < MIN_NODE_CELL_PX {
+            return None;
+        }
+        let (vw, vh) = self.viewport;
+        let (ox, oy) = view.cell_origin_px(node.x, node.y, vw, vh);
+        Some(NodeScreen {
+            centre: (ox + view.ppc * 0.5, oy + view.ppc * 0.5),
+            size: (node.scale as f64 * view.ppc).clamp(MIN_NODE_ICON_PX, MAX_NODE_ICON_PX),
+        })
+    }
+
+    /// The topmost node whose icon is under the screen point.
+    pub fn node_at(&self, x: f64, y: f64) -> Option<NodeId> {
+        if !self.show_nodes {
+            return None;
+        }
+        self.world.nodes().iter().rev().find_map(|n| {
+            let s = self.node_screen(n)?;
+            let half = s.size * 0.5;
+            ((x - s.centre.0).abs() <= half && (y - s.centre.1).abs() <= half).then_some(n.id)
+        })
+    }
+
+    /// The cell of depth `k` under a screen point.
+    fn cell_at_depth(&self, k: u8, sx: f64, sy: f64) -> (i64, i64) {
+        let v = self.camera.at_depth(k);
+        let (vw, vh) = self.viewport;
+        (
+            v.cell.0 + (v.frac.0 + (sx - vw * 0.5) / v.ppc).floor() as i64,
+            v.cell.1 + (v.frac.1 + (sy - vh * 0.5) / v.ppc).floor() as i64,
+        )
+    }
+
+    pub fn start_placing_node(&mut self) {
+        self.placing_node = true;
+        self.status = "Click the map to place a node (Esc cancels)".into();
+    }
+
+    pub fn cancel_placing_node(&mut self) {
+        if self.placing_node {
+            self.placing_node = false;
+            self.status.clear();
+        }
+    }
+
+    /// Places a node on the cell under the mouse (at the current depth) and
+    /// opens it for editing.
+    pub fn place_node_at_cursor(&mut self) -> Option<NodeId> {
+        let cell = self.cursor_cell()?;
+        let depth = self.camera.depth;
+        if !self.world.in_bounds(depth, cell.0, cell.1) {
+            self.status = "That spot is outside the map".into();
+            return None;
+        }
+        self.close_node(true);
+        let revision = self.world.revision();
+        let id = self.world.alloc_node_id();
+        self.world.put_node(Node::new(id, depth, cell.0, cell.1, self.default_icon.clone()));
+        self.node_session = Some(NodeSession { id, original: None, revision });
+        self.placing_node = false;
+        self.status.clear();
+        self.icons_revision += 1;
+        Some(id)
+    }
+
+    /// The node whose popup is open.
+    pub fn open_node_id(&self) -> Option<NodeId> {
+        self.node_session.as_ref().map(|s| s.id)
+    }
+
+    pub fn open_node(&mut self, id: NodeId) {
+        if self.open_node_id() == Some(id) {
+            return;
+        }
+        self.close_node(true);
+        if let Some(node) = self.world.node(id) {
+            self.node_session = Some(NodeSession {
+                id,
+                original: Some(node.clone()),
+                revision: self.world.revision(),
+            });
+            self.icons_revision += 1;
+        }
+    }
+
+    /// Replaces the open node with an edited copy (the popup's widgets).
+    pub fn update_open_node(&mut self, node: Node) {
+        if self.open_node_id() == Some(node.id) {
+            self.world.put_node(node);
+        }
+    }
+
+    /// Closes the popup. With `keep`, everything done since it opened is
+    /// one undo step; without, the node goes back to how it was (a new node
+    /// disappears).
+    pub fn close_node(&mut self, keep: bool) {
+        let Some(session) = self.node_session.take() else { return };
+        if keep {
+            if let Some(now) = self.world.node(session.id).cloned() {
+                self.history.record_node(session.original, Some(now));
+            }
+        } else {
+            match session.original {
+                Some(o) => {
+                    self.world.put_node(o);
+                }
+                None => {
+                    self.world.remove_node(session.id);
+                }
+            }
+            self.world.rewind_revision(session.revision);
+        }
+    }
+
+    /// Deletes the node whose popup is open.
+    pub fn delete_open_node(&mut self) {
+        let Some(session) = self.node_session.take() else { return };
+        if self.world.remove_node(session.id).is_some() {
+            match session.original {
+                Some(o) => self.history.record_node(Some(o), None),
+                // It never existed as far as undo is concerned.
+                None => self.world.rewind_revision(session.revision),
+            }
+        }
+    }
+
+    /// Left press: grab the node under the mouse, if any. Returns whether
+    /// there was one (so the press must not paint).
+    pub fn press_node(&mut self) -> bool {
+        let Some((x, y)) = self.cursor_px else { return false };
+        let Some(id) = self.node_at(x, y) else { return false };
+        if let Some(n) = self.world.node(id).cloned() {
+            self.node_drag = Some(NodeDrag { id, original: n, moved: false });
+            return true;
+        }
+        false
+    }
+
+    fn update_node_drag(&mut self) {
+        let (Some(id), Some((x, y))) = (self.node_drag.as_ref().map(|d| d.id), self.cursor_px) else { return };
+        let Some(node) = self.world.node(id).cloned() else { return };
+        let cell = self.cell_at_depth(node.depth, x, y);
+        if cell != (node.x, node.y) && self.world.in_bounds(node.depth, cell.0, cell.1) {
+            let mut moved = node;
+            (moved.x, moved.y) = cell;
+            self.world.put_node(moved);
+            if let Some(d) = self.node_drag.as_mut() {
+                d.moved = true;
+            }
+        }
+    }
+
+    /// Left release: a drag keeps the node where it ended (one undo step);
+    /// a plain click opens its popup.
+    pub fn end_node_drag(&mut self) {
+        let Some(drag) = self.node_drag.take() else { return };
+        if drag.moved {
+            // With the popup open the move is part of that session's undo step.
+            if self.open_node_id() != Some(drag.id) {
+                if let Some(now) = self.world.node(drag.id).cloned() {
+                    self.history.record_node(Some(drag.original), Some(now));
+                }
+            }
+        } else {
+            self.open_node(drag.id);
+        }
+    }
+
+    pub fn node_dragging(&self) -> bool {
+        self.node_drag.is_some()
+    }
+
+    /// Picks the icon for the open node and for new nodes. An imported icon
+    /// that is in the Custom Icons folder but not in this map yet is loaded.
+    pub fn choose_icon(&mut self, icon: Icon) {
+        if let Icon::Custom(name) = &icon {
+            if self.world.custom_icon(name).is_none() {
+                let path = self.icons_dir.join(name);
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        if let Err(e) = self.world.add_custom_icon(name, bytes) {
+                            self.status = format!("Icon not usable: {e}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("Cannot read {}: {e}", path.display());
+                        return;
+                    }
+                }
+            }
+        }
+        self.default_icon = icon.clone();
+        if let Some(id) = self.open_node_id() {
+            if let Some(mut n) = self.world.node(id).cloned() {
+                n.icon = icon;
+                self.world.put_node(n);
+            }
+        }
+    }
+
+    /// Imports a PNG as a node icon: it is checked, copied into the Custom
+    /// Icons folder (unless it already lives there) and stored in the map.
+    /// Returns the icon's file name.
+    pub fn import_icon(&mut self, src: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+        icons::decode_png(&bytes).map_err(|e| format!("{}: {e}", src.display()))?;
+        let file = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| icons::valid_icon_name(n))
+            .unwrap_or_else(|| "icon.png".to_string());
+        let already_there = src.parent().is_some_and(|p| {
+            p.canonicalize().ok().zip(self.icons_dir.canonicalize().ok()).is_some_and(|(a, b)| a == b)
+        });
+        let name = if already_there {
+            file
+        } else {
+            std::fs::create_dir_all(&self.icons_dir)
+                .map_err(|e| format!("cannot create {}: {e}", self.icons_dir.display()))?;
+            let name = icons::unique_name(&self.icons_dir, &file);
+            std::fs::write(self.icons_dir.join(&name), &bytes)
+                .map_err(|e| format!("cannot save the icon: {e}"))?;
+            name
+        };
+        self.world.add_custom_icon(&name, bytes)?;
+        self.icons_revision += 1;
+        self.choose_icon(Icon::Custom(name.clone()));
+        Ok(name)
+    }
+
+    /// Imports several PNGs; reports in the status line. Returns how many worked.
+    pub fn import_icons(&mut self, paths: &[PathBuf]) -> usize {
+        let mut ok = 0;
+        let mut last_err = None;
+        for p in paths {
+            match self.import_icon(p) {
+                Ok(_) => ok += 1,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        self.status = match (ok, last_err) {
+            (0, Some(e)) => format!("Import failed: {e}"),
+            (n, Some(e)) => format!("Imported {n} icon(s); one failed: {e}"),
+            (1, None) => format!("Icon saved to {}", self.icons_dir.display()),
+            (n, None) => format!("{n} icons saved to {}", self.icons_dir.display()),
+        };
+        ok
+    }
+
     // ---- shapes -----------------------------------------------------------
 
     /// Starts dragging a shape from the cell under the mouse. With `erase`
@@ -489,12 +796,14 @@ impl Editor {
     pub fn undo(&mut self) {
         self.end_stroke();
         self.end_shape();
+        self.close_node(true);
         self.history.undo(&mut self.world);
     }
 
     pub fn redo(&mut self) {
         self.end_stroke();
         self.end_shape();
+        self.close_node(true);
         self.history.redo(&mut self.world);
     }
 
@@ -510,10 +819,19 @@ impl Editor {
             .map_or_else(|| "Untitled".to_string(), |n| n.to_string_lossy().into_owned())
     }
 
+    /// Forgets everything tied to the map being replaced.
+    fn reset_transient(&mut self) {
+        self.shape_drag = None;
+        self.node_session = None;
+        self.node_drag = None;
+        self.placing_node = false;
+        self.icons_revision += 1;
+    }
+
     /// Starts an empty map of the given size and depth.
     pub fn new_map(&mut self, spec: MapSpec) {
         self.end_stroke();
-        self.shape_drag = None;
+        self.reset_transient();
         self.world = World::with_spec(spec);
         self.history.clear();
         self.path = None;
@@ -554,7 +872,7 @@ impl Editor {
         self.end_stroke();
         match io::load(path) {
             Ok(w) => {
-                self.shape_drag = None;
+                self.reset_transient();
                 self.world = w;
                 self.history.clear();
                 self.path = Some(path.to_path_buf());
@@ -1151,5 +1469,109 @@ mod tests {
         e.set_zoom_level(0.0);
         e.mouse_moved(0.0, 0.0);
         assert!(!e.hover_info().unwrap().inside, "off the map");
+    }
+
+    fn node_editor() -> Editor {
+        let mut e = editor();
+        e.icons_dir = std::env::temp_dir().join(format!("depthmap-icons-{}", std::process::id()));
+        e
+    }
+
+    #[test]
+    fn placing_a_node_opens_its_popup_and_undo_removes_it() {
+        let mut e = node_editor();
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        let id = e.place_node_at_cursor().expect("placed");
+        assert!(!e.placing_node);
+        assert_eq!(e.open_node_id(), Some(id));
+        let mut n = e.world.node(id).unwrap().clone();
+        n.name = "Inn".into();
+        n.description = "Cosy".into();
+        e.update_open_node(n);
+        e.close_node(true);
+        assert_eq!(e.world.node(id).unwrap().name, "Inn");
+        e.undo();
+        assert!(e.world.node(id).is_none());
+        e.redo();
+        assert_eq!(e.world.node(id).unwrap().name, "Inn");
+    }
+
+    #[test]
+    fn cancelling_a_new_node_removes_it_and_leaves_the_map_unmodified() {
+        let mut e = node_editor();
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        let id = e.place_node_at_cursor().unwrap();
+        e.close_node(false);
+        assert!(e.world.node(id).is_none());
+        assert!(!e.history.can_undo());
+    }
+
+    #[test]
+    fn clicking_opens_and_dragging_moves_a_node() {
+        let mut e = node_editor();
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        let id = e.place_node_at_cursor().unwrap();
+        e.close_node(true);
+        let before = e.world.node(id).unwrap().clone();
+        let (px, py) = centre_of(&e, (before.x, before.y));
+
+        e.mouse_moved(px, py);
+        assert_eq!(e.node_at(px, py), Some(id));
+        assert!(e.press_node());
+        e.end_node_drag();
+        assert_eq!(e.open_node_id(), Some(id), "a click opens it");
+        e.close_node(true);
+
+        e.mouse_moved(px, py);
+        assert!(e.press_node());
+        e.mouse_moved(px + 100.0, py + 50.0);
+        e.end_node_drag();
+        let after = e.world.node(id).unwrap();
+        assert_ne!((after.x, after.y), (before.x, before.y));
+        assert_eq!(e.open_node_id(), None);
+        e.undo();
+        assert_eq!((e.world.node(id).unwrap().x, e.world.node(id).unwrap().y), (before.x, before.y));
+    }
+
+    #[test]
+    fn hidden_nodes_cannot_be_hit_and_delete_works() {
+        let mut e = node_editor();
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        let id = e.place_node_at_cursor().unwrap();
+        let n = e.world.node(id).unwrap().clone();
+        let (px, py) = centre_of(&e, (n.x, n.y));
+        e.show_nodes = false;
+        assert_eq!(e.node_at(px, py), None);
+        e.show_nodes = true;
+        e.close_node(true);
+        e.open_node(id);
+        e.delete_open_node();
+        assert!(e.world.node(id).is_none());
+        e.undo();
+        assert!(e.world.node(id).is_some(), "deleting is undoable");
+    }
+
+    #[test]
+    fn importing_a_png_copies_it_to_the_icons_folder_and_embeds_it() {
+        let mut e = node_editor();
+        let src_dir = e.icons_dir.with_extension("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let img = depthmap_core::icons::builtin_image(3);
+        let png = depthmap_core::icons::encode_png(&img);
+        let src = src_dir.join("castle.png");
+        std::fs::write(&src, &png).unwrap();
+        let name = e.import_icon(&src).unwrap();
+        assert!(e.icons_dir.join(&name).exists());
+        assert!(e.world.custom_icon(&name).is_some());
+        assert_eq!(e.default_icon, Icon::Custom(name));
+        let bad = src_dir.join("bad.png");
+        std::fs::write(&bad, b"not a png").unwrap();
+        assert!(e.import_icon(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&e.icons_dir);
     }
 }

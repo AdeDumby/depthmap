@@ -7,3 +7,4 @@ description = "Renderer-independent data model for the multi-depth TTRPG map edi
 [dependencies]
 rustc-hash.workspace = true
 zstd = "0.13"
+png = "0.18"

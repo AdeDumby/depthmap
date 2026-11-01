@@ -3,6 +3,11 @@
 //! ```text
 //! "DMAP" | version u32 | raw_len u64 | zstd( payload )
 //! payload = width u32 | height u32 | max_depth u8          (version 3 only)
+//!         | icons u16 | { name_len u16 | name | len u32 | png bytes }*   (version 4)
+//!         | nodes u32 | { id u64 | depth u8 | x i64 | y i64 | scale f32
+//!                       | icon_kind u8 (0 built-in, 1 imported) | built-in id u8
+//!                         or name_len u16 + name | name_len u16 + name
+//!                       | desc_len u32 + desc }*                         (version 4)
 //!         | color_count u16 | { r g b }*color_count
 //!         | { depth u8 | count u32 | { x i64 | y i64 | cells[1024] u16 }* }*
 //! ```
@@ -17,16 +22,24 @@ use std::path::Path;
 
 use crate::chunk::{Cell, ChunkPos, EMPTY, cell_color, cell_texture, normalize};
 use crate::colors::{ColorTable, MAX_COLORS};
+use crate::icons;
+use crate::node::{Icon, Node};
 use crate::spec::MapSpec;
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn put_str16(out: &mut Vec<u8>, s: &str) {
+    let bytes = &s.as_bytes()[..s.len().min(u16::MAX as usize)];
+    out.extend((bytes.len() as u16).to_le_bytes());
+    out.extend(bytes);
 }
 
 pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
@@ -35,6 +48,34 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
     raw.extend(spec.width.to_le_bytes());
     raw.extend(spec.height.to_le_bytes());
     raw.push(spec.max_depth);
+    let used = world.used_custom_icons();
+    raw.extend((used.len() as u16).to_le_bytes());
+    for (name, icon) in used {
+        put_str16(&mut raw, name);
+        raw.extend((icon.png.len() as u32).to_le_bytes());
+        raw.extend(icon.png.iter());
+    }
+    raw.extend((world.nodes().len() as u32).to_le_bytes());
+    for n in world.nodes() {
+        raw.extend(n.id.to_le_bytes());
+        raw.push(n.depth);
+        raw.extend(n.x.to_le_bytes());
+        raw.extend(n.y.to_le_bytes());
+        raw.extend(n.scale.to_le_bytes());
+        match &n.icon {
+            Icon::Builtin(id) => {
+                raw.push(0);
+                raw.push(*id);
+            }
+            Icon::Custom(name) => {
+                raw.push(1);
+                put_str16(&mut raw, name);
+            }
+        }
+        put_str16(&mut raw, &n.name);
+        raw.extend((n.description.len() as u32).to_le_bytes());
+        raw.extend(n.description.as_bytes());
+    }
     let colors = world.colors.as_slice();
     raw.extend((colors.len() as u16).to_le_bytes());
     for c in colors {
@@ -94,6 +135,11 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             self.at = end;
             Ok(s)
         }
+
+        fn string16(&mut self) -> io::Result<String> {
+            let len = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
+            String::from_utf8(self.take(len)?.to_vec()).map_err(|_| invalid("text is not valid UTF-8"))
+        }
     }
     let mut cur = Cursor { data: &raw, at: 0 };
 
@@ -108,6 +154,46 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
     } else {
         MapSpec::UNBOUNDED
     };
+
+    // Imported icons and nodes (version 4).
+    let mut icon_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut node_list: Vec<Node> = Vec::new();
+    if version >= 4 {
+        let count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
+        for _ in 0..count {
+            let name = cur.string16()?;
+            let len = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
+            let bytes = cur.take(len)?.to_vec();
+            if !icons::valid_icon_name(&name) || bytes.len() > icons::MAX_PNG_BYTES {
+                return Err(invalid("bad embedded icon"));
+            }
+            icon_blobs.push((name, bytes));
+        }
+        let count = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
+        for _ in 0..count {
+            let id = u64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+            let depth = cur.take(1)?[0];
+            let x = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+            let y = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+            let scale = f32::from_le_bytes(cur.take(4)?.try_into().unwrap());
+            let icon = match cur.take(1)?[0] {
+                0 => Icon::Builtin(cur.take(1)?[0]),
+                1 => {
+                    let name = cur.string16()?;
+                    if !icons::valid_icon_name(&name) {
+                        return Err(invalid("bad icon name"));
+                    }
+                    Icon::Custom(name)
+                }
+                _ => return Err(invalid("unknown icon kind")),
+            };
+            let name = cur.string16()?;
+            let len = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
+            let description = String::from_utf8(cur.take(len)?.to_vec())
+                .map_err(|_| invalid("text is not valid UTF-8"))?;
+            node_list.push(Node { id, depth, x, y, name, description, icon, scale });
+        }
+    }
 
     let color_count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
     if color_count == 0 || color_count > MAX_COLORS {
@@ -165,6 +251,15 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
                 };
             }
             world.insert_chunk(depth, ChunkPos { x, y }, &cells);
+        }
+    }
+    for (name, bytes) in icon_blobs {
+        world.add_custom_icon(&name, bytes).map_err(|e| invalid(&e))?;
+    }
+    // Nodes outside the map or with a repeated id are dropped.
+    for node in node_list {
+        if world.node(node.id).is_none() {
+            world.put_node(node);
         }
     }
     Ok(world)
@@ -272,6 +367,99 @@ mod tests {
         file.extend((raw.len() as u64).to_le_bytes());
         file.extend(packed);
         file
+    }
+
+    #[test]
+    fn nodes_and_their_imported_icons_round_trip() {
+        let mut w = World::with_spec(MapSpec::new(64, 64, 3));
+        w.add_custom_icon("dragon.png", vec![7, 7, 7, 7]).unwrap();
+        w.add_custom_icon("unused.png", vec![1]).unwrap();
+        let a = w.alloc_node_id();
+        let mut n = Node::new(a, 2, 700, 33, Icon::Custom("dragon.png".into()));
+        n.name = "Wyrm's lair \u{1F409}".into();
+        n.description = "Line one\nLine two with ünïcode".into();
+        n.scale = 2.5;
+        w.put_node(n.clone());
+        let b = w.alloc_node_id();
+        w.put_node(Node::new(b, 0, 3, 4, Icon::Builtin(9)));
+
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let r = read_world(&bytes[..]).unwrap();
+        assert_eq!(r.nodes(), w.nodes());
+        assert_eq!(r.node(a).unwrap(), &n);
+        assert_eq!(&**r.custom_icon("dragon.png").unwrap().png, &[7, 7, 7, 7]);
+        assert!(r.custom_icon("unused.png").is_none(), "only used icons are embedded");
+        let mut r = r;
+        assert!(r.alloc_node_id() > b);
+    }
+
+    #[test]
+    fn hostile_node_data_is_sanitised_or_rejected() {
+        // Out-of-map nodes are dropped, scales clamped, long text cut.
+        let mut w = World::with_spec(MapSpec::new(8, 8, 1));
+        let mut ok = Node::new(1, 0, 2, 2, Icon::Builtin(1));
+        ok.scale = 3.0;
+        w.put_node(ok);
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let r = read_world(&bytes[..]).unwrap();
+        assert_eq!(r.nodes().len(), 1);
+
+        // Hand-built payload with an out-of-range node and a NaN scale.
+        let mut raw = Vec::new();
+        raw.extend(8u32.to_le_bytes());
+        raw.extend(8u32.to_le_bytes());
+        raw.push(1);
+        raw.extend(0u16.to_le_bytes()); // icons
+        raw.extend(3u32.to_le_bytes()); // nodes
+        for (id, depth, x, scale) in [(1u64, 0u8, 99i64, 1.0f32), (2, 0, 1, f32::NAN), (2, 0, 3, 1.0)] {
+            raw.extend(id.to_le_bytes());
+            raw.push(depth);
+            raw.extend(x.to_le_bytes());
+            raw.extend(1i64.to_le_bytes());
+            raw.extend(scale.to_le_bytes());
+            raw.extend([0, 5]); // built-in 5
+            raw.extend(0u16.to_le_bytes()); // name
+            raw.extend(0u32.to_le_bytes()); // description
+        }
+        raw.extend(1u16.to_le_bytes());
+        raw.extend([9, 9, 9]);
+        let packed = zstd::encode_all(&raw[..], 1).unwrap();
+        let mut file = Vec::new();
+        file.extend(MAGIC);
+        file.extend(4u32.to_le_bytes());
+        file.extend((raw.len() as u64).to_le_bytes());
+        file.extend(packed);
+        let r = read_world(&file[..]).unwrap();
+        assert_eq!(r.nodes().len(), 1, "x=99 is off the map, the repeated id is dropped");
+        assert_eq!(r.nodes()[0].x, 1);
+        assert_eq!(r.nodes()[0].scale, 1.0, "NaN scale replaced");
+
+        // Truncating anywhere in the node block is an error, not a panic.
+        let mut bytes = Vec::new();
+        write_world(&sample_with_nodes(), &mut bytes).unwrap();
+        for cut in [bytes.len() - 5, bytes.len() / 2, 20] {
+            assert!(read_world(&bytes[..cut]).is_err());
+        }
+    }
+
+    fn sample_with_nodes() -> World {
+        let mut w = sample();
+        for i in 0..5 {
+            let id = w.alloc_node_id();
+            let mut n = Node::new(id, 0, i, i, Icon::Builtin(2));
+            n.name = format!("node {i}");
+            w.put_node(n);
+        }
+        w
+    }
+
+    #[test]
+    fn version_3_files_open_without_nodes() {
+        let file = hand_built(3, Some((8, 8, 1)), &[]);
+        let w = read_world(&file[..]).unwrap();
+        assert!(w.nodes().is_empty());
     }
 
     #[test]

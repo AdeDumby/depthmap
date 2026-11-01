@@ -19,7 +19,8 @@ const HELP: &str = "\
 depthmap [FILE] [--stress N]
 
   LMB paint            RMB drag shape       MMB / Space+LMB pan
-  Shift+mouse erase    E eraser toggle      Esc cancel shape
+  Shift+mouse erase    E eraser toggle      Esc cancel shape / node
+  N add node, click map   click node edit, drag moves   Del delete open node
   wheel zoom           WASD / arrows pan    1-9, 0 texture
   [ ] brush size       Ctrl+Z / Ctrl+Y undo / redo
   Ctrl+N/O/S new / open / save   Ctrl+Shift+S save as   F1 help
@@ -244,6 +245,17 @@ impl App {
                     self.editor.save_to(&path);
                 }
             }
+            Command::ImportIcons => {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Import PNG icons")
+                    .add_filter("PNG image", &["png"]);
+                if let Some(dir) = depthmap::settings::icon_import_start_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(paths) = dialog.pick_files() {
+                    self.editor.import_icons(&paths);
+                }
+            }
             Command::Quit => event_loop.exit(),
         }
     }
@@ -366,7 +378,17 @@ impl App {
             return;
         }
         if let Key::Named(NamedKey::Escape) = event.logical_key {
-            self.editor.cancel_shape();
+            if self.editor.placing_node {
+                self.editor.cancel_placing_node();
+            } else if self.editor.open_node_id().is_some() {
+                self.editor.close_node(true);
+            } else {
+                self.editor.cancel_shape();
+            }
+            return;
+        }
+        if let Key::Named(NamedKey::Delete) = event.logical_key {
+            self.editor.delete_open_node();
             return;
         }
         if let Key::Named(NamedKey::F1) = event.logical_key {
@@ -394,6 +416,13 @@ impl App {
         if let Key::Character(c) = &event.logical_key {
             match c.as_str() {
                 "e" | "E" => self.editor.eraser = !self.editor.eraser,
+                "n" | "N" => {
+                    if self.editor.placing_node {
+                        self.editor.cancel_placing_node();
+                    } else {
+                        self.editor.start_placing_node();
+                    }
+                }
                 "[" => self.editor.change_brush(-1),
                 "]" => self.editor.change_brush(1),
                 _ => {}
@@ -486,11 +515,24 @@ impl ApplicationHandler for App {
                     (_, true) if over_ui || consumed => {}
                     (MouseButton::Left, true) if self.space => self.editor.set_panning(true),
                     (MouseButton::Left, true) if self.mods.shift_key() => self.editor.begin_erase(),
-                    (MouseButton::Left, true) => self.editor.begin_paint(),
+                    (MouseButton::Left, true) if self.editor.placing_node => {
+                        self.editor.place_node_at_cursor();
+                    }
+                    // A node under the mouse is grabbed instead of painted over.
+                    (MouseButton::Left, true) => {
+                        if !self.editor.press_node() {
+                            self.editor.begin_paint();
+                        }
+                    }
                     // Right button: drag out a shape (Shift erases with it).
                     (MouseButton::Right, true) => self.editor.begin_shape(self.mods.shift_key()),
                     (MouseButton::Middle, true) => self.editor.set_panning(true),
                     (MouseButton::Right, false) => self.editor.end_shape(),
+                    (MouseButton::Left, false) => {
+                        self.editor.end_stroke();
+                        self.editor.end_node_drag();
+                        self.editor.set_panning(false);
+                    }
                     // Other releases end the brush stroke and panning.
                     (_, false) => {
                         self.editor.end_stroke();

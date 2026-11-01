@@ -86,6 +86,20 @@ cargo test                             # core + editor + UI + headless GPU rende
 | Ctrl+N / O / S, Ctrl+Shift+S | new / open / save, save as |
 | F1 | controls |
 
+## Nodes
+
+Nodes are points of interest. Press **N** (or *Add node* in the tools panel / Edit
+menu) and click the map: a popup opens where you set the **name** (drawn under the
+node), a **description**, an **icon** (15 built-in ones, plus your own) and the
+**size** (0.25x-4x of one cell of the node's depth). *Done* keeps it, *Cancel*
+discards the popup's changes (a new node is removed), *Delete* removes it.
+Click a node to edit it again, drag it to move it, **Delete** deletes the open node.
+Everything is undoable. *View > Show nodes* hides them.
+
+**Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies
+PNGs into `Documents/Depthmap/Custom Icons`. They scale to the node size. Icons a map
+uses are also stored inside the `.dmap` file (format v4), so shared maps keep them.
+
 ## Layout
 
 * `crates/depthmap-core`: no GPU, no window. Sparse chunked grids per depth

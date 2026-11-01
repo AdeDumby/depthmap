@@ -1,3 +1,4 @@
+use crate::node::Node;
 use crate::{Cell, World};
 
 /// One changed cell. Undo history stores these deltas, never snapshots, so
@@ -11,13 +12,31 @@ pub struct CellEdit {
     pub new: Cell,
 }
 
+/// A change to one node: its state before and after (`None` = absent).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeEdit {
+    pub before: Option<Node>,
+    pub after: Option<Node>,
+}
+
+impl NodeEdit {
+    fn id(&self) -> Option<crate::NodeId> {
+        self.after.as_ref().or(self.before.as_ref()).map(|n| n.id)
+    }
+}
+
+enum Entry {
+    Cells(Vec<CellEdit>),
+    Node(NodeEdit),
+}
+
 const MAX_STROKES: usize = 2000;
 
-/// Stroke-grouped undo/redo log.
+/// Stroke-grouped undo/redo log (cell strokes and node edits share it).
 #[derive(Default)]
 pub struct History {
-    undo: Vec<Vec<CellEdit>>,
-    redo: Vec<Vec<CellEdit>>,
+    undo: Vec<Entry>,
+    redo: Vec<Entry>,
     current: Vec<CellEdit>,
 }
 
@@ -47,32 +66,65 @@ impl History {
             return;
         }
         self.redo.clear();
-        self.undo.push(std::mem::take(&mut self.current));
+        let stroke = std::mem::take(&mut self.current);
+        self.push_undo(Entry::Cells(stroke));
+    }
+
+    fn push_undo(&mut self, entry: Entry) {
+        self.undo.push(entry);
         if self.undo.len() > MAX_STROKES {
             self.undo.remove(0);
         }
     }
 
+    /// Records a node change that was already applied to the world.
+    pub fn record_node(&mut self, before: Option<Node>, after: Option<Node>) {
+        if before == after {
+            return;
+        }
+        self.end_stroke();
+        self.redo.clear();
+        self.push_undo(Entry::Node(NodeEdit { before, after }));
+    }
+
     pub fn undo(&mut self, world: &mut World) -> bool {
         self.end_stroke();
-        let Some(stroke) = self.undo.pop() else {
+        let Some(entry) = self.undo.pop() else {
             return false;
         };
-        for e in stroke.iter().rev() {
-            world.set(e.depth, e.x, e.y, e.old);
+        match &entry {
+            Entry::Cells(stroke) => {
+                for e in stroke.iter().rev() {
+                    world.set(e.depth, e.x, e.y, e.old);
+                }
+            }
+            Entry::Node(e) => {
+                if let Some(id) = e.id() {
+                    world.set_node_state(id, e.before.as_ref());
+                }
+            }
         }
-        self.redo.push(stroke);
+        self.redo.push(entry);
         true
     }
 
     pub fn redo(&mut self, world: &mut World) -> bool {
-        let Some(stroke) = self.redo.pop() else {
+        let Some(entry) = self.redo.pop() else {
             return false;
         };
-        for e in &stroke {
-            world.set(e.depth, e.x, e.y, e.new);
+        match &entry {
+            Entry::Cells(stroke) => {
+                for e in stroke {
+                    world.set(e.depth, e.x, e.y, e.new);
+                }
+            }
+            Entry::Node(e) => {
+                if let Some(id) = e.id() {
+                    world.set_node_state(id, e.after.as_ref());
+                }
+            }
         }
-        self.undo.push(stroke);
+        self.undo.push(entry);
         true
     }
 
@@ -121,6 +173,40 @@ mod tests {
         assert!(h.redo(&mut w));
         assert_eq!((w.get(0, 2, 0), w.get(0, 3, 0), w.get(1, 40, -3)), (2, EMPTY, 5));
         assert!(!h.redo(&mut w));
+    }
+
+    #[test]
+    fn node_edits_undo_and_redo_in_order_with_cell_strokes() {
+        use crate::node::Icon;
+        let mut w = World::new();
+        let mut h = History::new();
+        h.paint(&mut w, 0, 1, 1, 3);
+        // Adding a node closes the pending stroke first.
+        let mut n = Node::new(w.alloc_node_id(), 0, 4, 4, Icon::Builtin(2));
+        w.put_node(n.clone());
+        h.record_node(None, Some(n.clone()));
+        let before = n.clone();
+        n.name = "Keep".into();
+        w.put_node(n.clone());
+        h.record_node(Some(before), Some(n.clone()));
+        h.record_node(Some(n.clone()), Some(n.clone())); // no change: not recorded
+
+        assert!(h.undo(&mut w));
+        assert_eq!(w.node(n.id).unwrap().name, "");
+        assert!(h.undo(&mut w));
+        assert!(w.node(n.id).is_none());
+        assert_eq!(w.get(0, 1, 1), 3, "the cell stroke is still there");
+        assert!(h.undo(&mut w));
+        assert_eq!(w.get(0, 1, 1), EMPTY);
+        assert!(!h.undo(&mut w));
+        assert!(h.redo(&mut w) && h.redo(&mut w) && h.redo(&mut w));
+        assert_eq!(w.node(n.id).unwrap().name, "Keep");
+        // Deleting a node is undoable too.
+        w.remove_node(n.id);
+        h.record_node(Some(n.clone()), None);
+        assert!(!h.can_redo());
+        h.undo(&mut w);
+        assert!(w.node(n.id).is_some());
     }
 
     #[test]
