@@ -644,3 +644,39 @@ fn new_map_dialog_renders_over_the_welcome_screen() {
     let i = (((r.center().y as u32) * PW + (r.min.x as u32 + 6)) * 4) as usize;
     assert_ne!([img[i], img[i + 1], img[i + 2]], [230, 222, 204]);
 }
+
+#[test]
+fn checker_overlay_and_hover_readout_render() {
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = depthmap::renderer::Renderer::new(gpu.device.clone(), gpu.queue.clone(), format);
+    let mut gui = Gui::new(&gpu.device, format);
+    let mut ed = Editor::with_spec(depthmap_core::MapSpec::new(64, 40, 3));
+    ed.resize(PW as f64, PH as f64);
+    ed.set_zoom_level(5.0); // depth 2
+    ed.mouse_moved(600.0, 400.0);
+    gui.state.show_checker = true;
+    let view = gpu.target.create_view(&Default::default());
+    for i in 0..3 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+            time: Some(i as f64 * 0.1),
+            ..Default::default()
+        };
+        let out = gui.run(input, &mut ed);
+        renderer.render(
+            &view,
+            (PW, PH),
+            &ed.world,
+            &ed.camera,
+            &depthmap::renderer::RenderOptions { checker: true, cursor: ed.cursor_cell(), ..Default::default() },
+        );
+        gui.paint(&gpu.device, &gpu.queue, &view, [PW, PH], out);
+    }
+    save_png("ui_checker_hover", &read_back(&gpu));
+    let text = ed.hover_info().unwrap().text();
+    assert!(text.starts_with("d3 cell") && text.contains("in d2 cell"), "{text}");
+}

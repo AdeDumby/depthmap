@@ -51,6 +51,12 @@ cargo test                             # core + editor + UI + headless GPU rende
   every line's strength depends only on its on-screen spacing, nothing jumps
   when the camera switches depth. The zoom panel shows the cell size strokes
   snap to ("snap: 1/16 cell").
+* **Checker overlay** (View menu or zoom panel): darkens every other cell of the
+  depth you are drawing on, so single cells stand out. It fades away when cells
+  get too small to tell apart, and is overlay-only like the grid.
+* **Hover readout** (menu bar): the cell under the mouse at the current depth
+  and the parent cell ("superpixel", one depth up) it belongs to, e.g.
+  `d3 cell 2045,1280  in d2 cell 511,320`; greyed when the mouse is off the map.
 * **Backdrop**: zooming past a layer's cells fades it to a light backdrop
   behind the layer you are drawing on (opacity set by the *Parent layer*
   slider), again smoothly.

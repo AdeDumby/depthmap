@@ -21,7 +21,7 @@ struct Overlay {
     grid: f32,           // 1.0 = draw grid lines
     max_depth: f32,      // deepest depth of the map
     bounded: f32,        // 1.0 = the map has edges
-    pad: f32,
+    checker: f32,        // 1.0 = darken every other cell
     map_min: vec2<f32>,  // map corners in cells relative to the view cell
     map_max: vec2<f32>,
 };
@@ -104,10 +104,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         grid = grid * (1.0 - outside);
     }
 
+    // Every other cell of the active depth, darkened. Fades out when cells
+    // get too small to tell apart (it would only shimmer).
+    var shade = 0.0;
+    if (o.checker > 0.5) {
+        let c = floor(pa);
+        let odd = (i32(c.x) + i32(c.y)) & 1;
+        shade = f32(odd) * 0.18 * smoothstep(3.0, 8.0, o.ppc) * (1.0 - outside);
+    }
+
     // Layers composited back to front onto premultiplied alpha:
     // dimmed surroundings, brush cursor, map border, grid lines.
     var acc = vec4<f32>(0.0);
     acc = over(acc, vec3<f32>(0.0), 0.55 * outside);
+    acc = over(acc, vec3<f32>(0.0), shade);
     acc = over(acc, vec3<f32>(1.0), cur);
     acc = over(acc, vec3<f32>(0.98, 0.66, 0.16), 0.9 * edge);
     acc = over(acc, vec3<f32>(0.0), grid);

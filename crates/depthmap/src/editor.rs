@@ -58,6 +58,28 @@ pub struct Editor {
     shape_buf: Vec<(i64, i64)>,
 }
 
+/// The cell under the mouse, see [`Editor::hover_info`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoverInfo {
+    pub depth: u8,
+    pub cell: (i64, i64),
+    /// The cell one depth up that contains it (none at depth 0).
+    pub parent: Option<(i64, i64)>,
+    /// False when the mouse is outside the map.
+    pub inside: bool,
+}
+
+impl HoverInfo {
+    /// e.g. `d2 cell 13,7 in d1 3,1`
+    pub fn text(&self) -> String {
+        let mut t = format!("d{} cell {},{}", self.depth, self.cell.0, self.cell.1);
+        if let Some((px, py)) = self.parent {
+            t.push_str(&format!("  in d{} cell {},{}", self.depth - 1, px, py));
+        }
+        t
+    }
+}
+
 /// A shape being dragged out with the right mouse button. It is applied to
 /// the map live (so you see the real texture and pattern) and rewound and
 /// redrawn whenever the mouse moves; releasing keeps it as one undo step.
@@ -143,6 +165,20 @@ impl Editor {
     pub fn cursor_cell(&self) -> Option<(i64, i64)> {
         let (x, y) = self.cursor_px?;
         Some(self.camera.screen_to_cell(x, y, self.viewport.0, self.viewport.1))
+    }
+
+    /// What is under the mouse: the cell at the active depth and the parent
+    /// cell (the "superpixel", one depth up) it belongs to.
+    pub fn hover_info(&self) -> Option<HoverInfo> {
+        let cell = self.cursor_cell()?;
+        let depth = self.camera.depth;
+        let s = depthmap_core::SUBDIV;
+        Some(HoverInfo {
+            depth,
+            cell,
+            parent: (depth > 0).then(|| (cell.0.div_euclid(s), cell.1.div_euclid(s))),
+            inside: self.world.in_bounds(depth, cell.0, cell.1),
+        })
     }
 
     pub fn mouse_moved(&mut self, x: f64, y: f64) {
@@ -1085,5 +1121,35 @@ mod tests {
         let fine = convert_cell((3, -2), 1, 3);
         assert_eq!(convert_cell(fine, 3, 1), (3, -2));
         assert_eq!(convert_cell((-1, 5), 2, 2), (-1 * 1 + 0, 5));
+    }
+
+    #[test]
+    fn hover_info_names_the_cell_and_its_parent() {
+        let mut e = bounded(16, 16, 3);
+        assert_eq!(e.hover_info(), None);
+        e.set_zoom_level(0.0);
+        e.mouse_moved(500.0, 400.0);
+        let h = e.hover_info().unwrap();
+        assert_eq!((h.depth, h.parent, h.inside), (0, None, true));
+        assert_eq!(h.text(), format!("d0 cell {},{}", h.cell.0, h.cell.1));
+
+        e.set_zoom_level(4.0); // depth 2
+        e.mouse_moved(500.0, 400.0);
+        let h = e.hover_info().unwrap();
+        assert_eq!(h.depth, 2);
+        let p = h.parent.unwrap();
+        assert_eq!(p, (h.cell.0.div_euclid(4), h.cell.1.div_euclid(4)));
+        assert!(h.text().contains("in d1 cell"));
+        // The parent really contains the cell: it is the cell under the mouse one depth up.
+        let up = e.camera.at_depth(1);
+        let (vw, vh) = e.viewport;
+        let px = up.frac.0 + (500.0 - vw * 0.5) / up.ppc;
+        let py = up.frac.1 + (400.0 - vh * 0.5) / up.ppc;
+        assert_eq!(p, (up.cell.0 + px.floor() as i64, up.cell.1 + py.floor() as i64));
+
+        e.mouse_moved(1.0, 1.0);
+        e.set_zoom_level(0.0);
+        e.mouse_moved(0.0, 0.0);
+        assert!(!e.hover_info().unwrap().inside, "off the map");
     }
 }

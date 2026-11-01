@@ -96,6 +96,8 @@ impl NewMapForm {
 pub struct UiState {
     pub layout: UiLayout,
     pub show_grid: bool,
+    /// Darken every other cell so single cells are easier to see.
+    pub show_checker: bool,
     /// Opacity of the parent layer shown behind the layer being drawn.
     pub ghost_opacity: f32,
     pub show_tools: bool,
@@ -125,6 +127,7 @@ impl UiState {
         Self {
             layout: UiLayout::default(),
             show_grid: true,
+            show_checker: false,
             ghost_opacity: 0.35,
             show_tools: true,
             show_zoom: true,
@@ -330,6 +333,7 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut st.show_grid, "Show grid");
+                ui.checkbox(&mut st.show_checker, "Checker overlay (darken every other cell)");
                 ui.checkbox(&mut st.show_tools, "Textures & colors panel");
                 ui.checkbox(&mut st.show_zoom, "Zoom panel");
                 ui.separator();
@@ -354,6 +358,16 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     st.show_about = true;
                 }
             });
+            if let Some(info) = ed.hover_info() {
+                ui.separator();
+                let mut text = RichText::new(info.text()).monospace();
+                if !info.inside {
+                    text = text.weak();
+                }
+                ui.label(text).on_hover_text(
+                    "Cell under the mouse at the depth you are drawing on,\nand the parent cell (one depth up) it belongs to",
+                );
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let name = format!("{}{}", ed.file_name(), if ed.modified() { " *" } else { "" });
                 ui.label(RichText::new(name).strong());
@@ -390,6 +404,7 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let max_height = (ctx.content_rect().height() - 70.0).max(240.0);
     egui::Window::new("Textures")
         .anchor(Align2::LEFT_TOP, [10.0, 40.0])
+        .max_width(260.0)
         .resizable(false)
         .collapsible(true)
         .show(ctx, |ui| {
@@ -444,7 +459,7 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 .max_height(116.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    egui::Grid::new("swatches").spacing([4.0, 4.0]).show(ui, |ui| {
+                    egui::Grid::new("swatches").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
                         for (i, rgb) in colors.iter().enumerate() {
                             let (rect, resp) =
                                 ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
@@ -532,6 +547,7 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     egui::Window::new("Zoom")
         .anchor(Align2::RIGHT_TOP, [-10.0, 40.0])
+        .max_width(210.0)
         .resizable(false)
         .collapsible(true)
         .show(ctx, |ui| {
@@ -615,6 +631,8 @@ fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             )
             .on_hover_text("Opacity of the layer behind the one you are drawing on");
             ui.checkbox(&mut st.show_grid, "Show grid");
+            ui.checkbox(&mut st.show_checker, "Checker overlay")
+                .on_hover_text("Darkens every other cell of the depth you draw on, so single cells are easier to see");
             if ui.button("Show whole map").clicked() {
                 ed.reset_view();
             }

@@ -61,7 +61,8 @@ struct OverlayUniform {
     max_depth: f32,
     /// 1.0 when the map has edges (and everything outside is dimmed).
     bounded: f32,
-    _pad: f32,
+    /// 1.0 = darken every other cell.
+    checker: f32,
     /// The map's corners in cells relative to the view cell.
     map_min: [f32; 2],
     map_max: [f32; 2],
@@ -75,6 +76,9 @@ pub struct RenderOptions {
     /// Brush radius in cells.
     pub brush_half: i64,
     pub show_grid: bool,
+    /// Darken every other cell of the active depth (a checkerboard) so
+    /// individual cells stand out.
+    pub checker: bool,
     /// Opacity of the layer just above the active one (`0` hides all
     /// ancestors): the "ghost of the original map".
     pub ghost_opacity: f32,
@@ -86,6 +90,7 @@ impl Default for RenderOptions {
             cursor: None,
             brush_half: 0,
             show_grid: true,
+            checker: false,
             ghost_opacity: 0.35,
         }
     }
@@ -639,7 +644,7 @@ impl Renderer {
             grid: if opts.show_grid { 1.0 } else { 0.0 },
             max_depth: world.spec().max_depth as f32,
             bounded: if map_extent.is_some() { 1.0 } else { 0.0 },
-            _pad: 0.0,
+            checker: if opts.checker { 1.0 } else { 0.0 },
             map_min: [
                 (-view.cell.0 as f64) as f32,
                 (-view.cell.1 as f64) as f32,

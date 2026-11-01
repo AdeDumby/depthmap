@@ -118,6 +118,7 @@ const NO_GRID: RenderOptions = RenderOptions {
     cursor: None,
     brush_half: 0,
     show_grid: false,
+    checker: false,
     ghost_opacity: 0.35,
 };
 
@@ -465,4 +466,33 @@ fn grid_stops_at_the_maps_deepest_level_and_outside_the_map() {
     let (g, _) = gpu.render(&map, &cam, &grid, "grid_bounded");
     let (n, _) = gpu.render(&map, &cam, &NO_GRID, "grid_bounded_off");
     assert_eq!(px(&g, 224, 100), px(&n, 224, 100));
+}
+
+#[test]
+fn checker_overlay_darkens_every_other_cell_only() {
+    let Some(mut gpu) = gpu() else { return eprintln!("no GPU adapter; skipping") };
+    let mut world = World::new();
+    for y in -6..6 {
+        for x in -8..8 {
+            world.set(0, x, y, make_cell(1, 0)); // flat white
+        }
+    }
+    let cam = Camera::new(); // 32 px/cell, cell (0,0) starts at the screen centre
+    let on = RenderOptions { checker: true, ..NO_GRID };
+    let (a, _) = gpu.render(&world, &cam, &NO_GRID, "checker_off");
+    let (b, _) = gpu.render(&world, &cam, &on, "checker_on");
+    let c = |x: u32, y: u32| px(&b, 256 + 16 + 32 * x, 192 + 16 + 32 * y);
+    // Cells (0,0) and (1,1) are even, (1,0) and (0,1) odd.
+    assert_eq!(c(0, 0), px(&a, 272, 208));
+    assert_eq!(c(1, 1), px(&a, 304, 240));
+    assert!(c(1, 0)[0] < c(0, 0)[0] - 15, "{:?} vs {:?}", c(1, 0), c(0, 0));
+    assert_eq!(c(1, 0), c(0, 1));
+    // Left of the origin the pattern continues: (-1, 0) is odd, (-1,-1) even.
+    assert!(px(&b, 256 - 16, 192 + 16)[0] < px(&b, 256 - 16, 192 - 16)[0] - 15);
+    // Zoomed far out the shimmer is faded away.
+    let mut far = Camera::new();
+    far.ppc = 2.0;
+    let (f, _) = gpu.render(&world, &far, &on, "checker_far");
+    let (g, _) = gpu.render(&world, &far, &NO_GRID, "checker_far_off");
+    assert_eq!(f, g);
 }

@@ -303,6 +303,7 @@ impl App {
                 cursor: if over_ui { None } else { self.editor.cursor_cell() },
                 brush_half: self.editor.brush_half,
                 show_grid: gfx.gui.state.show_grid,
+                checker: gfx.gui.state.show_checker,
                 ghost_opacity: gfx.gui.state.ghost_opacity,
             },
         );
