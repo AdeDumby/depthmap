@@ -5,6 +5,7 @@
 //! payload = width u32 | height u32 | max_depth u8          (version 3 only)
 //!         | icons u16 | { name_len u16 | name | len u32 | png bytes }*   (version 4)
 //!         | nodes u32 | { id u64 | depth u8 | x i64 | y i64 | scale f32
+//!                       | snap u8 | edge u8                              (version 5)
 //!                       | icon_kind u8 (0 built-in, 1 imported) | built-in id u8
 //!                         or name_len u16 + name | name_len u16 + name
 //!                       | desc_len u32 + desc }*                         (version 4)
@@ -23,12 +24,12 @@ use std::path::Path;
 use crate::chunk::{Cell, ChunkPos, EMPTY, cell_color, cell_texture, normalize};
 use crate::colors::{ColorTable, MAX_COLORS};
 use crate::icons;
-use crate::node::{Icon, Node};
+use crate::node::{Icon, Node, Snap};
 use crate::spec::MapSpec;
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -62,6 +63,8 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         raw.extend(n.x.to_le_bytes());
         raw.extend(n.y.to_le_bytes());
         raw.extend(n.scale.to_le_bytes());
+        raw.push(n.snap.to_byte());
+        raw.push(n.edge as u8);
         match &n.icon {
             Icon::Builtin(id) => {
                 raw.push(0);
@@ -176,6 +179,13 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             let x = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
             let y = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
             let scale = f32::from_le_bytes(cur.take(4)?.try_into().unwrap());
+            // Older files had every icon centred on its cell.
+            let (snap, edge) = if version >= 5 {
+                let snap = Snap::from_byte(cur.take(1)?[0]).ok_or_else(|| invalid("bad snap mode"))?;
+                (snap, cur.take(1)?[0] != 0)
+            } else {
+                (Snap::Centre, false)
+            };
             let icon = match cur.take(1)?[0] {
                 0 => Icon::Builtin(cur.take(1)?[0]),
                 1 => {
@@ -191,7 +201,7 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             let len = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
             let description = String::from_utf8(cur.take(len)?.to_vec())
                 .map_err(|_| invalid("text is not valid UTF-8"))?;
-            node_list.push(Node { id, depth, x, y, name, description, icon, scale });
+            node_list.push(Node { id, depth, x, y, name, description, icon, scale, snap, edge });
         }
     }
 
@@ -379,6 +389,8 @@ mod tests {
         n.name = "Wyrm's lair \u{1F409}".into();
         n.description = "Line one\nLine two with ünïcode".into();
         n.scale = 2.5;
+        n.snap = Snap::Edge;
+        n.edge = true;
         w.put_node(n.clone());
         let b = w.alloc_node_id();
         w.put_node(Node::new(b, 0, 3, 4, Icon::Builtin(9)));
@@ -497,7 +509,7 @@ mod tests {
             let file = hand_built(3, Some(bad), &[]);
             assert!(read_world(&file[..]).is_err(), "{bad:?}");
         }
-        let file = hand_built(4, Some((8, 8, 1)), &[]);
+        let file = hand_built(VERSION + 1, Some((8, 8, 1)), &[]);
         assert!(read_world(&file[..]).is_err(), "future versions are refused");
     }
 

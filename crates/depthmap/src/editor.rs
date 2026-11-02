@@ -15,6 +15,7 @@ use depthmap_core::{
     Camera, Cell, CellEdit, EMPTY, Fill, History, Icon, MapSpec, Node, NodeId, Shape, ShapeStyle,
     World, icons, io, make_cell,
 };
+use depthmap_core::node::Snap;
 
 /// Nodes are hidden when a cell of their depth is smaller than this on screen.
 const MIN_NODE_CELL_PX: f64 = 2.0;
@@ -109,6 +110,8 @@ pub struct Editor {
     pub default_icon: Icon,
     /// Draw nodes (and let clicks grab them).
     pub show_nodes: bool,
+    /// Snapping given to new nodes.
+    pub node_snap: Snap,
     /// Folder imported icons are copied to.
     pub icons_dir: PathBuf,
     /// Counts events that may change the list of available icons.
@@ -232,6 +235,7 @@ impl Editor {
             placing_node: false,
             default_icon: Icon::default(),
             show_nodes: true,
+            node_snap: Snap::Auto,
             icons_dir: crate::settings::custom_icons_dir(),
             icons_revision: 0,
             viewport: (1280.0, 720.0),
@@ -511,9 +515,11 @@ impl Editor {
             return None;
         }
         let (vw, vh) = self.viewport;
-        let (ox, oy) = view.cell_origin_px(node.x, node.y, vw, vh);
+        let (px, py) = node.position();
+        let (cx, cy) = view.cell_origin_px(node.x, node.y, vw, vh);
+        let (dx, dy) = (px - node.x as f64, py - node.y as f64);
         Some(NodeScreen {
-            centre: (ox + view.ppc * 0.5, oy + view.ppc * 0.5),
+            centre: (cx + view.ppc * dx, cy + view.ppc * dy),
             size: (node.scale as f64 * view.ppc).clamp(MIN_NODE_ICON_PX, MAX_NODE_ICON_PX),
         })
     }
@@ -530,13 +536,14 @@ impl Editor {
         })
     }
 
-    /// The cell of depth `k` under a screen point.
-    fn cell_at_depth(&self, k: u8, sx: f64, sy: f64) -> (i64, i64) {
+    /// The point of a screen position in cells of depth `k`, fractions
+    /// included (`3.5, 2.5` is the middle of cell `3, 2`).
+    fn point_at_depth(&self, k: u8, sx: f64, sy: f64) -> (f64, f64) {
         let v = self.camera.at_depth(k);
         let (vw, vh) = self.viewport;
         (
-            v.cell.0 + (v.frac.0 + (sx - vw * 0.5) / v.ppc).floor() as i64,
-            v.cell.1 + (v.frac.1 + (sy - vh * 0.5) / v.ppc).floor() as i64,
+            v.cell.0 as f64 + v.frac.0 + (sx - vw * 0.5) / v.ppc,
+            v.cell.1 as f64 + v.frac.1 + (sy - vh * 0.5) / v.ppc,
         )
     }
 
@@ -555,16 +562,21 @@ impl Editor {
     /// Places a node on the cell under the mouse (at the current depth) and
     /// opens it for editing.
     pub fn place_node_at_cursor(&mut self) -> Option<NodeId> {
-        let cell = self.cursor_cell()?;
+        let (sx, sy) = self.cursor_px?;
         let depth = self.camera.depth;
-        if !self.world.in_bounds(depth, cell.0, cell.1) {
+        let (fx, fy) = self.point_at_depth(depth, sx, sy);
+        let mut node = Node::new(0, depth, 0, 0, self.default_icon.clone());
+        node.snap = self.node_snap;
+        node.place_at(fx, fy);
+        if !self.world.in_bounds(depth, node.x, node.y) {
             self.status = "That spot is outside the map".into();
             return None;
         }
         self.close_node(true);
         let revision = self.world.revision();
-        let id = self.world.alloc_node_id();
-        self.world.put_node(Node::new(id, depth, cell.0, cell.1, self.default_icon.clone()));
+        node.id = self.world.alloc_node_id();
+        let id = node.id;
+        self.world.put_node(node);
         self.node_session = Some(NodeSession { id, original: None, revision });
         self.placing_node = false;
         self.status.clear();
@@ -648,10 +660,10 @@ impl Editor {
     fn update_node_drag(&mut self) {
         let (Some(id), Some((x, y))) = (self.node_drag.as_ref().map(|d| d.id), self.cursor_px) else { return };
         let Some(node) = self.world.node(id).cloned() else { return };
-        let cell = self.cell_at_depth(node.depth, x, y);
-        if cell != (node.x, node.y) && self.world.in_bounds(node.depth, cell.0, cell.1) {
-            let mut moved = node;
-            (moved.x, moved.y) = cell;
+        let (fx, fy) = self.point_at_depth(node.depth, x, y);
+        let mut moved = node.clone();
+        moved.place_at(fx, fy);
+        if (moved.x, moved.y) != (node.x, node.y) && self.world.in_bounds(node.depth, moved.x, moved.y) {
             self.world.put_node(moved);
             if let Some(d) = self.node_drag.as_mut() {
                 d.moved = true;
@@ -1117,6 +1129,36 @@ impl Editor {
         self.selection = None;
         self.select_drag = None;
         self.icons_revision += 1;
+    }
+
+    /// Changes how many times the map can be zoomed into. Deepening keeps
+    /// everything (and the undo history); making it shallower deletes the
+    /// finer layers and their nodes for good, so the history is cleared.
+    /// Returns what was deleted: `(chunks, nodes)`.
+    pub fn set_map_depth(&mut self, max_depth: u8) -> (usize, usize) {
+        let before = self.spec().max_depth;
+        let max_depth = max_depth.min(depthmap_core::MAX_DEPTH);
+        if max_depth == before {
+            return (0, 0);
+        }
+        self.end_stroke();
+        self.cancel_shape();
+        self.close_node(true);
+        self.node_drag = None;
+        self.select_drag = None;
+        let lost = self.world.set_max_depth(max_depth);
+        if max_depth < before {
+            self.history.clear();
+            self.selection = None;
+        }
+        self.constrain();
+        self.last_cell = None;
+        self.status = if max_depth < before && lost != (0, 0) {
+            format!("Depth lowered to {max_depth}: removed {} chunks of detail and {} nodes", lost.0, lost.1)
+        } else {
+            format!("Map depth is now {max_depth}")
+        };
+        lost
     }
 
     /// Starts an empty map of the given size and depth.
@@ -2135,5 +2177,87 @@ mod tests {
         assert_eq!(e.selection_summary(), None);
         e.select_all();
         assert!(e.selection_summary().unwrap().contains("Everything"));
+    }
+
+    #[test]
+    fn a_2x_icon_on_a_corner_covers_exactly_the_2x2_cells_around_it() {
+        let mut e = bounded(16, 16, 1);
+        e.icons_dir = std::env::temp_dir().join(format!("depthmap-corner-{}", std::process::id()));
+        e.node_snap = Snap::Auto;
+        e.start_placing_node();
+        // Aim at the grid corner between cells 7|8 and 7|8.
+        let (cx, cy) = e.camera.view().cell_origin_px(8, 8, 1000.0, 800.0);
+        e.mouse_moved(cx + 1.0, cy + 1.0);
+        let id = e.place_node_at_cursor().unwrap();
+        let mut n = e.world.node(id).unwrap().clone();
+        assert!(!n.edge, "a new 1x icon is centred on a cell");
+        n.scale = 2.0;
+        n.resnap();
+        e.update_open_node(n);
+        e.close_node(true);
+        // Drag it onto the corner by moving the mouse there.
+        e.mouse_moved(cx + 1.0, cy + 1.0);
+        let at = e.node_screen(e.world.node(id).unwrap()).unwrap();
+        e.mouse_moved(at.centre.0, at.centre.1);
+        assert!(e.press_node());
+        e.mouse_moved(cx + 2.0, cy + 2.0);
+        e.end_node_drag();
+        e.close_node(true);
+        let n = e.world.node(id).unwrap().clone();
+        assert!(n.edge);
+        assert_eq!(n.position(), (8.0, 8.0), "centred on the corner of cells 7|8");
+        let s = e.node_screen(&n).unwrap();
+        let ppc = e.camera.view().ppc;
+        assert!((s.centre.0 - cx).abs() < 1e-6 && (s.centre.1 - cy).abs() < 1e-6, "{s:?} vs {cx},{cy}");
+        assert!((s.size - 2.0 * ppc).abs() < 1e-6, "twice the cell size");
+        // Its edges are on the cell grid: left edge at cell 7's left side.
+        let left = e.camera.view().cell_origin_px(7, 7, 1000.0, 800.0);
+        assert!((s.centre.0 - s.size / 2.0 - left.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn centre_snapping_keeps_even_icons_on_cell_centres_and_scale_range_is_01_to_10() {
+        use depthmap_core::node::{MAX_SCALE, MIN_SCALE};
+        assert_eq!((MIN_SCALE, MAX_SCALE), (0.1, 10.0));
+        let mut e = bounded(16, 16, 1);
+        e.node_snap = Snap::Centre;
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        let id = e.place_node_at_cursor().unwrap();
+        let mut n = e.world.node(id).unwrap().clone();
+        n.scale = 4.0;
+        n.resnap();
+        e.update_open_node(n);
+        assert!(!e.world.node(id).unwrap().edge);
+        let mut n = e.world.node(id).unwrap().clone();
+        n.scale = 50.0;
+        e.update_open_node(n);
+        assert_eq!(e.world.node(id).unwrap().scale, MAX_SCALE);
+    }
+
+    #[test]
+    fn lowering_the_map_depth_clears_history_and_keeps_the_camera_valid() {
+        let mut e = bounded(16, 16, 3);
+        e.set_zoom_level(6.0); // depth 3
+        assert_eq!(e.camera.depth, 3);
+        e.world.set(3, 1, 1, make_cell(2, 1));
+        e.begin_paint();
+        e.end_stroke();
+        let lost = e.set_map_depth(1);
+        assert_eq!(lost.0, 1);
+        assert!(!e.history.can_undo());
+        assert!(e.camera.depth <= 1, "the camera climbs back up: {}", e.camera.depth);
+        assert!(e.status.contains("Depth lowered"));
+        // Deepening keeps the history.
+        e.start_placing_node();
+        e.mouse_moved(500.0, 400.0);
+        e.place_node_at_cursor().unwrap();
+        e.close_node(true);
+        assert!(e.history.can_undo());
+        e.set_map_depth(5);
+        assert!(e.history.can_undo());
+        assert_eq!(e.spec().max_depth, 5);
+        e.set_zoom_level(10.0);
+        assert!(e.camera.depth >= 4, "the new levels can be zoomed into");
     }
 }

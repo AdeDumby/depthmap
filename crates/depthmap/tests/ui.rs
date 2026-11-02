@@ -770,32 +770,62 @@ fn tool_buttons_switch_tools_and_select_controls_work() {
 }
 
 #[test]
-fn colour_wheel_and_brightness_bar_set_the_brush_colour() {
+fn gradient_square_hue_bar_and_rgb_fields_set_the_brush_colour() {
     let mut h = Harness::new();
-    let wheel = h.st.layout.wheel.unwrap();
-    // The wheel keeps the brightness; start from full.
-    let bar = h.st.layout.value_bar.unwrap();
-    h.click(egui::pos2(bar.right() - 1.0, bar.center().y));
-    assert!(h.ed.brush_rgb.iter().copied().max().unwrap() > 250);
-    // The right edge of the wheel is fully saturated red; the centre is white.
-    h.click(wheel.center() + vec2(wheel.width() * 0.5 - 2.0, 0.0));
-    let [r, g, b] = h.ed.brush_rgb;
-    assert!(r > 240 && g < 20 && b < 20, "{:?}", h.ed.brush_rgb);
-    h.click(wheel.center());
-    assert!(h.ed.brush_rgb.iter().all(|&c| c > 240), "{:?}", h.ed.brush_rgb);
-    // Straight down is 90 degrees: hue 0.25, a yellow-green.
-    h.click(wheel.center() + vec2(0.0, wheel.height() * 0.5 - 2.0));
-    let [r, g, b] = h.ed.brush_rgb;
-    assert!(g > 240 && b < 20 && r > 100 && r < 140, "{:?}", h.ed.brush_rgb);
+    let square = h.st.layout.sv_square.unwrap();
+    let hue = h.st.layout.hue_bar.unwrap();
 
-    // Half brightness halves every channel.
-    h.click(egui::pos2(bar.center().x, bar.center().y));
-    let [r2, g2, _] = h.ed.brush_rgb;
-    assert!((g2 as i32 - 128).abs() < 8 && r2 < r, "{:?}", h.ed.brush_rgb);
-    h.click(egui::pos2(bar.left() + 1.0, bar.center().y));
-    assert!(h.ed.brush_rgb.iter().all(|&c| c < 8), "black at the left end");
-    // Wheel clicks on black do not lose the colour entirely: brightness is separate.
-    assert_eq!(h.ed.world.colors.len(), DEFAULT_COLORS.len(), "picking never grows the colour table");
+    // Hue: the left end is red, a third of the way is green, two thirds blue.
+    h.click(egui::pos2(hue.left() + 1.0, hue.center().y));
+    h.click(egui::pos2(square.right() - 1.0, square.top() + 1.0)); // full saturation and brightness
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(r > 245 && g < 12 && b < 12, "{:?}", h.ed.brush_rgb);
+    h.click(egui::pos2(hue.left() + hue.width() / 3.0, hue.center().y));
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(g > 245 && r < 12 && b < 12, "pure green: {:?}", h.ed.brush_rgb);
+    h.click(egui::pos2(hue.left() + hue.width() * 2.0 / 3.0, hue.center().y));
+    assert!(h.ed.brush_rgb[2] > 245 && h.ed.brush_rgb[0] < 12, "{:?}", h.ed.brush_rgb);
+
+    // The square: top-left is white, the bottom is black, the middle top is half-saturated.
+    h.click(egui::pos2(square.left() + 1.0, square.top() + 1.0));
+    assert!(h.ed.brush_rgb.iter().all(|&c| c > 245), "{:?}", h.ed.brush_rgb);
+    h.click(egui::pos2(square.center().x, square.bottom() - 1.0));
+    assert!(h.ed.brush_rgb.iter().all(|&c| c < 8), "{:?}", h.ed.brush_rgb);
+    h.click(egui::pos2(square.center().x, square.top() + 1.0));
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(b > 245 && r > 100 && r < 150 && g > 100 && g < 150, "half-saturated blue: {:?}", h.ed.brush_rgb);
+    // Picking never grows the colour table.
+    assert_eq!(h.ed.world.colors.len(), DEFAULT_COLORS.len());
+}
+
+#[test]
+fn rgb_numbers_can_be_dragged_and_the_picker_follows() {
+    let mut h = Harness::new();
+    h.ed.set_brush_rgb([100, 100, 100]);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.rgb_fields.len(), 3);
+    // Drag the red field to the right: red goes up, the others stay.
+    let at = h.st.layout.rgb_fields[0].center();
+    let button = |pressed, pos| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    h.frame(vec![Event::PointerMoved(at)]);
+    h.frame(vec![button(true, at)]);
+    for step in 1..=10 {
+        h.frame(vec![Event::PointerMoved(at + vec2(step as f32 * 10.0, 0.0))]);
+    }
+    h.frame(vec![button(false, at + vec2(100.0, 0.0))]);
+    h.frame(vec![]);
+    let [r, g, b] = h.ed.brush_rgb;
+    assert!(r > 130 && g == 100 && b == 100, "{:?}", h.ed.brush_rgb);
+    // The saturation/brightness marker moved with it: still the same hue family.
+    let [hue, s, v] = h.st.hsv();
+    assert!(hue < 0.01 || hue > 0.99, "red hue, got {hue}");
+    assert!(s > 0.2 && v > 0.5);
 }
 
 #[test]
@@ -925,12 +955,12 @@ fn palette_entries_can_be_removed_from_their_context_menu() {
 fn the_colors_window_can_be_hidden_and_does_not_block_the_canvas_elsewhere() {
     let mut h = Harness::new();
     assert!(h.st.show_colors);
-    h.hover(h.st.layout.wheel.unwrap().center());
+    h.hover(h.st.layout.sv_square.unwrap().center());
     assert!(h.ctx.is_pointer_over_egui());
     h.st.show_colors = false;
     h.frame(vec![]);
     h.frame(vec![]);
-    assert!(h.st.layout.wheel.is_none() || h.st.layout.swatches.is_empty() == h.st.layout.swatches.is_empty());
+    assert!(h.st.layout.sv_square.is_none(), "hidden window draws nothing");
     h.hover(egui::pos2(640.0, 400.0));
     assert!(!h.ctx.is_pointer_over_egui());
 }
@@ -994,7 +1024,84 @@ fn selection_colors_and_palettes_render() {
     let find_blue = img.chunks(4).filter(|p| p[2] > 200 && p[1] > 150 && p[0] < 140).count();
     assert!(find_blue > 200, "selection outline visible: {find_blue}");
     // The wheel is on screen.
-    let w = gui.state.layout.wheel.unwrap();
-    let i = (((w.center().y + 40.0) as u32 * PW + (w.center().x + 40.0) as u32) * 4) as usize;
+    let w = gui.state.layout.sv_square.unwrap();
+    let i = (((w.center().y + 20.0) as u32 * PW + (w.center().x + 20.0) as u32) * 4) as usize;
     assert_ne!(&img[i..i + 3], &[230, 222, 204]);
+}
+
+#[test]
+fn map_depth_dialog_deepens_and_asks_before_deleting() {
+    let mut h = Harness::new();
+    h.ed = Editor::with_spec(depthmap_core::MapSpec::new(16, 16, 2));
+    h.ed.resize(W as f64, H as f64);
+    h.ed.world.set(2, 5, 5, make_cell(2, 1));
+    h.frame(vec![]);
+    h.st.open_depth_dialog(2);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.depth_dialog(), Some(2));
+    assert!(h.ed.history.can_undo() == false);
+
+    // Deeper: + twice, apply. Nothing lost, nothing asks.
+    h.click(h.st.layout.depth_plus.unwrap().center());
+    h.click(h.st.layout.depth_plus.unwrap().center());
+    assert_eq!(h.st.depth_dialog(), Some(4));
+    h.click(h.st.layout.depth_apply.unwrap().center());
+    assert_eq!(h.ed.spec().max_depth, 4);
+    assert_eq!(h.st.depth_dialog(), None);
+    assert_ne!(h.ed.world.get(2, 5, 5), EMPTY);
+
+    // Shallower than a layer holding drawing: the button changes, and it is applied for real.
+    h.st.open_depth_dialog(4);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    for _ in 0..3 {
+        h.click(h.st.layout.depth_minus.unwrap().center());
+    }
+    assert_eq!(h.st.depth_dialog(), Some(1));
+    h.click(h.st.layout.depth_apply.unwrap().center());
+    assert_eq!(h.ed.spec().max_depth, 1);
+    assert_eq!(h.ed.world.get(2, 5, 5), EMPTY, "the deleted level is gone");
+    assert!(h.ed.status.contains("removed 1 chunks"), "{}", h.ed.status);
+
+    // Cancel leaves everything alone; apply is disabled when nothing changed.
+    h.st.open_depth_dialog(1);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.depth_cancel.unwrap().center());
+    assert_eq!(h.st.depth_dialog(), None);
+    assert_eq!(h.ed.spec().max_depth, 1);
+}
+
+#[test]
+fn node_popup_can_snap_icons_to_centres_or_corners() {
+    use depthmap_core::node::Snap;
+    let mut h = Harness::new();
+    h.ed.icons_dir = std::env::temp_dir().join(format!("depthmap-ui-snap-{}", std::process::id()));
+    h.ed.start_placing_node();
+    h.ed.mouse_moved(500.0, 400.0);
+    let id = h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.node_snaps.len(), 3);
+    assert!(!h.ed.world.node(id).unwrap().edge, "1x icons sit on a cell centre by default");
+
+    // Edge: onto the grid corner.
+    h.click(h.st.layout.node_snaps[2].center());
+    let n = h.ed.world.node(id).unwrap();
+    assert_eq!((n.snap, n.edge), (Snap::Edge, true));
+    assert_eq!(h.ed.node_snap, Snap::Edge, "remembered for the next node");
+    // Auto with a 2x icon is on a corner, with a 3x icon on a centre again.
+    h.click(h.st.layout.node_snaps[0].center());
+    let mut n = h.ed.world.node(id).unwrap().clone();
+    assert!(!n.edge, "Auto at 1x is a centre");
+    n.scale = 2.0;
+    h.ed.update_open_node(n.clone());
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.ed.world.node(id).unwrap().edge, "Auto at 2x is a corner (resnapped by the popup)");
+    n.scale = 3.0;
+    h.ed.update_open_node(n);
+    h.frame(vec![]);
+    assert!(!h.ed.world.node(id).unwrap().edge);
 }

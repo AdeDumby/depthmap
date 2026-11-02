@@ -89,8 +89,15 @@ pub struct UiLayout {
     pub select_all: Option<egui::Rect>,
     pub select_invert: Option<egui::Rect>,
     pub select_clear: Option<egui::Rect>,
-    pub wheel: Option<egui::Rect>,
-    pub value_bar: Option<egui::Rect>,
+    pub sv_square: Option<egui::Rect>,
+    pub hue_bar: Option<egui::Rect>,
+    pub rgb_fields: Vec<egui::Rect>,
+    pub node_snaps: Vec<egui::Rect>,
+    pub depth_minus: Option<egui::Rect>,
+    pub depth_plus: Option<egui::Rect>,
+    pub depth_field: Option<egui::Rect>,
+    pub depth_apply: Option<egui::Rect>,
+    pub depth_cancel: Option<egui::Rect>,
     pub hex_field: Option<egui::Rect>,
     pub palette_new: Option<egui::Rect>,
     pub palette_rename: Option<egui::Rect>,
@@ -175,12 +182,13 @@ pub struct UiState {
     /// Node whose name field should grab the keyboard when its popup opens.
     focus_node: Option<depthmap_core::NodeId>,
     palettes: Palettes,
+    /// The Map depth dialog: the depth being typed.
+    depth_dialog: Option<u8>,
     /// Hue, saturation, brightness of the brush colour (kept so that greys
     /// do not lose their hue while you drag the brightness around).
     hsv: [f32; 3],
     hsv_rgb: [u8; 3],
     hex_text: String,
-    wheel_tex: Option<egui::TextureHandle>,
     tile_cache: std::collections::HashMap<(u8, [u8; 3]), egui::TextureHandle>,
     /// The palette name being edited.
     renaming: Option<String>,
@@ -217,14 +225,23 @@ impl UiState {
             seen_icons_rev: u64::MAX,
             focus_node: None,
             palettes: Palettes::in_memory(),
+            depth_dialog: None,
             hsv: [0.0, 0.0, 1.0],
             hsv_rgb: [255, 255, 255],
             hex_text: String::new(),
-            wheel_tex: None,
             tile_cache: Default::default(),
             renaming: None,
             palette_note: String::new(),
         }
+    }
+
+    /// Opens the Map depth dialog on the map's current depth.
+    pub fn open_depth_dialog(&mut self, current: u8) {
+        self.depth_dialog = Some(current);
+    }
+
+    pub fn depth_dialog(&self) -> Option<u8> {
+        self.depth_dialog
     }
 
     pub fn palettes(&self) -> &Palettes {
@@ -260,19 +277,6 @@ impl UiState {
         self.hsv_rgb = rgb;
         let [h, s, v] = wheel::rgb_to_hsv(rgb);
         self.hsv = [if s < 0.001 || v < 0.001 { self.hsv[0] } else { h }, s, v];
-    }
-
-    fn wheel_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
-        self.wheel_tex
-            .get_or_insert_with(|| {
-                const N: usize = 192;
-                ctx.load_texture(
-                    "colour-wheel",
-                    egui::ColorImage::from_rgba_unmultiplied([N, N], &wheel::wheel_rgba(N)),
-                    TextureOptions::LINEAR,
-                )
-            })
-            .id()
     }
 
     /// A texture tile in a colour, for palette entries.
@@ -507,6 +511,15 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     }
     if st.show_colors {
         colors_window(ctx, ed, st);
+    } else {
+        // Nothing is drawn, so nothing can be clicked.
+        let l = &mut st.layout;
+        (l.sv_square, l.hue_bar, l.hex_field, l.palette_new) = (None, None, None, None);
+        (l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None);
+        (l.palette_name_field, l.palette_rename_ok) = (None, None);
+        l.rgb_fields.clear();
+        l.swatches.clear();
+        l.palette_entries.clear();
     }
     selection_layer(ctx, ed);
     nodes_layer(ctx, ed, st);
@@ -514,6 +527,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     node_popup(ctx, ed, st);
     startup_window(ctx, st, modal);
     new_map_window(ctx, st);
+    depth_window(ctx, ed, st);
 }
 
 fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -569,6 +583,10 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         ed.redo();
                     }
                 });
+                ui.separator();
+                if item(ui, "Map depth...", "") {
+                    st.open_depth_dialog(ed.spec().max_depth);
+                }
                 ui.separator();
                 if item(ui, "Select all", "Ctrl+A") {
                     ed.select_all();
@@ -1132,7 +1150,8 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let l = &mut st.layout;
     l.swatches.clear();
     l.palette_entries.clear();
-    (l.wheel, l.value_bar, l.hex_field) = (None, None, None);
+    (l.sv_square, l.hue_bar, l.hex_field) = (None, None, None);
+    l.rgb_fields.clear();
     (l.palette_new, l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None, None);
     (l.palette_name_field, l.palette_rename_ok) = (None, None);
     st.follow_brush(ed.brush_rgb);
@@ -1156,7 +1175,7 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(250.0);
-                    wheel_section(ui, ctx, ed, st);
+                    picker_section(ui, ed, st);
                     ui.separator();
                     ui.label(RichText::new("Map colors").strong());
                     let colors: Vec<[u8; 3]> = ed.world.colors.as_slice().to_vec();
@@ -1250,57 +1269,99 @@ enum PaletteAct {
     Remove(usize),
 }
 
-fn wheel_section(ui: &mut egui::Ui, ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
-    const SIZE: f32 = 150.0;
-    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+/// A rectangle filled with a gradient through `stops` (left to right, or
+/// top to bottom when `vertical`).
+fn gradient(painter: &egui::Painter, rect: egui::Rect, stops: &[Color32], vertical: bool) {
+    let mut mesh = egui::Mesh::default();
+    let n = stops.len();
+    for (i, &c) in stops.iter().enumerate() {
+        let t = i as f32 / (n - 1) as f32;
+        let (a, b) = if vertical {
+            let y = rect.top() + rect.height() * t;
+            (egui::pos2(rect.left(), y), egui::pos2(rect.right(), y))
+        } else {
+            let x = rect.left() + rect.width() * t;
+            (egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom()))
+        };
+        mesh.colored_vertex(a, c);
+        mesh.colored_vertex(b, c);
+        if i > 0 {
+            let k = 2 * i as u32;
+            mesh.add_triangle(k - 2, k - 1, k);
+            mesh.add_triangle(k - 1, k, k + 1);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// A marker ring that stays visible on any colour.
+fn ring(painter: &egui::Painter, at: egui::Pos2) {
+    painter.circle_stroke(at, 6.0, Stroke::new(2.5, Color32::BLACK));
+    painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+}
+
+fn rgb32(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Saturation/brightness square, hue bar, RGB numbers and hex code.
+fn picker_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    const W: f32 = 220.0;
     let mut picked = false;
     ui.vertical_centered(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(vec2(SIZE, SIZE), Sense::click_and_drag());
-        st.layout.wheel = Some(rect);
-        let tex = st.wheel_texture(ctx);
-        let dim = (st.hsv[2] * 255.0).round() as u8;
-        ui.painter().image(tex, rect, uv, Color32::from_gray(dim));
-        let radius = SIZE * 0.5;
+        // Saturation (left to right) and brightness (bottom to top) of the current hue.
+        let (rect, resp) = ui.allocate_exact_size(vec2(W, 140.0), Sense::click_and_drag());
+        st.layout.sv_square = Some(rect);
+        let pure = rgb32(wheel::hsv_to_rgb(st.hsv[0], 1.0, 1.0));
+        gradient(ui.painter(), rect, &[Color32::WHITE, pure], false);
+        gradient(ui.painter(), rect, &[Color32::TRANSPARENT, Color32::BLACK], true);
+        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
         if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let c = rect.center();
-                let (h, s) = wheel::wheel_to_hs((p.x - c.x) / radius, (p.y - c.y) / radius);
-                st.hsv[0] = h;
-                st.hsv[1] = s;
+                st.hsv[1] = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                st.hsv[2] = 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
                 picked = true;
             }
         }
-        let (mx, my) = wheel::hs_to_wheel(st.hsv[0], st.hsv[1]);
-        let at = rect.center() + vec2(mx, my) * radius;
-        ui.painter().circle_stroke(at, 6.0, Stroke::new(2.5, Color32::BLACK));
-        ui.painter().circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
+        let at = egui::pos2(rect.left() + rect.width() * st.hsv[1], rect.top() + rect.height() * (1.0 - st.hsv[2]));
+        ring(&ui.painter().with_clip_rect(rect.expand(8.0)), at);
 
-        // Brightness: a bar from black to the full colour.
-        let (bar, bresp) = ui.allocate_exact_size(vec2(SIZE, 16.0), Sense::click_and_drag());
-        st.layout.value_bar = Some(bar);
-        let full = wheel::hsv_to_rgb(st.hsv[0], st.hsv[1], 1.0);
-        let right = Color32::from_rgb(full[0], full[1], full[2]);
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(bar.left_top(), Color32::BLACK);
-        mesh.colored_vertex(bar.right_top(), right);
-        mesh.colored_vertex(bar.right_bottom(), right);
-        mesh.colored_vertex(bar.left_bottom(), Color32::BLACK);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
-        ui.painter().add(egui::Shape::mesh(mesh));
+        // Hue.
+        let (bar, bresp) = ui.allocate_exact_size(vec2(W, 16.0), Sense::click_and_drag());
+        st.layout.hue_bar = Some(bar);
+        let stops: Vec<Color32> = (0..=6).map(|i| rgb32(wheel::hsv_to_rgb(i as f32 / 6.0, 1.0, 1.0))).collect();
+        gradient(ui.painter(), bar, &stops, false);
         ui.painter().rect_stroke(bar, 2.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
         if bresp.is_pointer_button_down_on() || bresp.dragged() || bresp.clicked() {
             if let Some(p) = bresp.interact_pointer_pos() {
-                st.hsv[2] = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+                st.hsv[0] = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
                 picked = true;
             }
         }
-        let x = bar.left() + bar.width() * st.hsv[2];
-        ui.painter().line_segment([egui::pos2(x, bar.top() - 1.0), egui::pos2(x, bar.bottom() + 1.0)], Stroke::new(3.0, Color32::BLACK));
-        ui.painter().line_segment([egui::pos2(x, bar.top() - 1.0), egui::pos2(x, bar.bottom() + 1.0)], Stroke::new(1.5, Color32::WHITE));
+        let x = bar.left() + bar.width() * st.hsv[0];
+        let (top, bottom) = (egui::pos2(x, bar.top() - 1.0), egui::pos2(x, bar.bottom() + 1.0));
+        ui.painter().line_segment([top, bottom], Stroke::new(3.0, Color32::BLACK));
+        ui.painter().line_segment([top, bottom], Stroke::new(1.5, Color32::WHITE));
     });
     if picked {
         let rgb = wheel::hsv_to_rgb(st.hsv[0], st.hsv[1], st.hsv[2]);
+        st.hsv_rgb = rgb;
+        ed.set_brush_rgb(rgb);
+    }
+
+    // Numbers.
+    let mut rgb = ed.brush_rgb;
+    let mut typed = false;
+    ui.horizontal(|ui| {
+        for (i, name) in ["R", "G", "B"].into_iter().enumerate() {
+            ui.label(RichText::new(name).strong());
+            let field = ui.add(egui::DragValue::new(&mut rgb[i]).range(0..=255).speed(0.7));
+            st.layout.rgb_fields.push(field.rect);
+            typed |= field.changed();
+        }
+    });
+    if typed {
+        st.follow_brush(rgb);
         st.hsv_rgb = rgb;
         ed.set_brush_rgb(rgb);
     }
@@ -1314,8 +1375,7 @@ fn wheel_section(ui: &mut egui::Ui, ctx: &egui::Context, ed: &mut Editor, st: &m
     }
     ui.horizontal(|ui| {
         let (sw, _) = ui.allocate_exact_size(vec2(30.0, 22.0), Sense::hover());
-        let c = ed.brush_rgb;
-        ui.painter().rect_filled(sw, 3.0, Color32::from_rgb(c[0], c[1], c[2]));
+        ui.painter().rect_filled(sw, 3.0, rgb32(ed.brush_rgb));
         ui.painter().rect_stroke(sw, 3.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
         let edit = ui.add(
             egui::TextEdit::singleline(&mut st.hex_text)
@@ -1332,7 +1392,7 @@ fn wheel_section(ui: &mut egui::Ui, ctx: &egui::Context, ed: &mut Editor, st: &m
                 ed.set_brush_rgb(rgb);
             }
         }
-        ui.label(RichText::new(format!("rgb {} {} {}", c[0], c[1], c[2])).weak().small());
+        ui.label(RichText::new("hex").weak().small());
     });
 }
 
@@ -1544,6 +1604,7 @@ fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.node_delete = None;
     st.layout.node_cancel = None;
     st.layout.node_import = None;
+    st.layout.node_snaps.clear();
     let Some(id) = ed.open_node_id() else {
         st.focus_node = None;
         return;
@@ -1675,8 +1736,20 @@ fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     node.scale = 1.0;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Sits on").strong());
+                for snap in depthmap_core::node::Snap::ALL {
+                    let r = ui.selectable_label(node.snap == snap, snap.name()).on_hover_text(snap.hint());
+                    st.layout.node_snaps.push(r.rect);
+                    if r.clicked() {
+                        node.snap = snap;
+                        ed.node_snap = snap;
+                    }
+                }
+            });
+            let place = if node.edge { "grid corner after" } else { "centre of" };
             ui.label(
-                RichText::new(format!("depth {}  ·  cell {}, {}", node.depth, node.x, node.y)).weak(),
+                RichText::new(format!("depth {}  ·  {place} cell {}, {}", node.depth, node.x, node.y)).weak(),
             );
 
             ui.separator();
@@ -1707,6 +1780,7 @@ fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             node.icon = n.icon.clone(); // a failed load keeps the old icon
         }
     }
+    node.resnap(); // a new size or snapping may move it from a centre to a corner
     ed.update_open_node(node);
     if import {
         st.request(Command::ImportIcons, false);
@@ -1731,6 +1805,100 @@ pub fn grouped(n: i64) -> String {
         out.push(c);
     }
     out
+}
+
+/// The Map depth dialog: add or remove zoom levels of the open map.
+fn depth_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    st.layout.depth_minus = None;
+    st.layout.depth_plus = None;
+    st.layout.depth_field = None;
+    st.layout.depth_apply = None;
+    st.layout.depth_cancel = None;
+    let Some(mut depth) = st.depth_dialog else { return };
+    let current = ed.spec().max_depth;
+    let (chunks, nodes) = ed.world.depth_loss(depth);
+    let loses = depth < current && (chunks > 0 || nodes > 0);
+    let (mut apply, mut cancel) = (false, ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+    let (mut minus, mut plus, mut field, mut ok, mut no) = (None, None, None, None, None);
+
+    egui::Window::new("Map depth")
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label("How many times the map can be zoomed into. Each level has 4 × 4 cells for every cell of the one above.");
+            ui.horizontal(|ui| {
+                let m = ui.add_enabled(depth > 0, egui::Button::new("−"));
+                minus = Some(m.rect);
+                if m.clicked() {
+                    depth -= 1;
+                }
+                let f = ui.add(egui::DragValue::new(&mut depth).range(0..=MAX_DEPTH).speed(0.1));
+                field = Some(f.rect);
+                let p = ui.add_enabled(depth < MAX_DEPTH, egui::Button::new("+"));
+                plus = Some(p.rect);
+                if p.clicked() {
+                    depth += 1;
+                }
+                ui.label(RichText::new(format!("(now {current})")).weak());
+            });
+            match ed.spec().extent(depth) {
+                Some((w, h)) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Finest layer: {} × {} cells ({})",
+                            grouped(w),
+                            grouped(h),
+                            snap_label(depth)
+                        ))
+                        .weak(),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new(format!("Finest layer: {}", snap_label(depth))).weak());
+                }
+            }
+            if loses {
+                ui.colored_label(
+                    Color32::from_rgb(240, 120, 90),
+                    format!(
+                        "This deletes the finest {} level(s): {} chunks of drawing and {} nodes. \
+                         It cannot be undone and clears the undo history.",
+                        current - depth,
+                        chunks,
+                        nodes
+                    ),
+                );
+            } else if depth < current {
+                ui.label(RichText::new("Those levels are empty; nothing is lost.").weak());
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let label = if loses { "Delete and apply" } else { "Apply" };
+                let a = ui.add_enabled(depth != current, egui::Button::new(RichText::new(label).strong()));
+                ok = Some(a.rect);
+                apply = a.clicked();
+                let c = ui.button("Cancel");
+                no = Some(c.rect);
+                cancel |= c.clicked();
+            });
+        });
+    st.layout.depth_minus = minus;
+    st.layout.depth_plus = plus;
+    st.layout.depth_field = field;
+    st.layout.depth_apply = ok;
+    st.layout.depth_cancel = no;
+
+    if apply {
+        ed.set_map_depth(depth);
+        st.depth_dialog = None;
+    } else if cancel {
+        st.depth_dialog = None;
+    } else {
+        st.depth_dialog = Some(depth);
+    }
 }
 
 fn new_map_window(ctx: &egui::Context, st: &mut UiState) {

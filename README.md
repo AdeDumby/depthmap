@@ -99,25 +99,31 @@ cargo test                             # core + editor + UI + headless GPU rende
   Ctrl+A selects all, Ctrl+I inverts. While something is selected, the brush, eraser,
   shapes and fill cannot change cells outside it, which makes it easy to paint one area.
   Selections work across zoom levels and are not part of the saved map or the undo history.
-* **Colors window** (View menu, or C): a hue/saturation wheel with a brightness bar, a hex
-  field, the map's colours, and **palettes**. *Save current* stores the colour **and** the
+* **Colors window** (View menu, or C): a saturation/brightness gradient with a hue bar, R/G/B number
+  fields, a hex field, the map's colours, and **palettes**. *Save current* stores the colour **and** the
   selected texture as an entry, so a palette works as a small tileset; click an entry to use
   both, right click to remove it. Palettes can be created, renamed and deleted, and are kept
   per user in the config folder (`palettes.txt`), not inside a map.
+
+## Map depth
+
+*Edit > Map depth...* adds or removes zoom levels of the open map. Adding levels keeps
+everything. Removing levels deletes the finest layers and their nodes (the dialog says
+how much first); that cannot be undone, so the undo history is cleared.
 
 ## Nodes
 
 Nodes are points of interest. Press **N** (or *Add node* in the tools panel / Edit
 menu) and click the map: a popup opens where you set the **name** (drawn under the
 node), a **description**, an **icon** (15 built-in ones, plus your own) and the
-**size** (0.25x-4x of one cell of the node's depth). *Done* keeps it, *Cancel*
+**size** (0.1x-10x of one cell of the node's depth) and **Sits on** (Auto / Centre / Edge: Auto puts odd sizes on a cell centre and even sizes on a grid corner, so a 2x icon covers exactly 2x2 cells). *Done* keeps it, *Cancel*
 discards the popup's changes (a new node is removed), *Delete* removes it.
 Click a node to edit it again, drag it to move it, **Delete** deletes the open node.
 Everything is undoable. *View > Show nodes* hides them.
 
 **Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies
 PNGs into `Documents/Depthmap/Custom Icons`. They scale to the node size. Icons a map
-uses are also stored inside the `.dmap` file (format v4), so shared maps keep them.
+uses are also stored inside the `.dmap` file (format v5), so shared maps keep them.
 
 ## Layout
 

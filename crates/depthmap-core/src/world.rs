@@ -172,6 +172,39 @@ impl World {
         self.spec
     }
 
+    /// What lowering the map's depth to `max_depth` would throw away:
+    /// `(chunks of detail, nodes)`.
+    pub fn depth_loss(&self, max_depth: u8) -> (usize, usize) {
+        let chunks = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(d, _)| *d > max_depth as usize)
+            .map(|(_, l)| l.len())
+            .sum();
+        let nodes = self.nodes.iter().filter(|n| n.depth > max_depth).count();
+        (chunks, nodes)
+    }
+
+    /// Changes how many times the map can be zoomed into. Making it deeper
+    /// adds empty layers; making it shallower deletes the layers (and the
+    /// nodes) below the new depth. Returns what was deleted, like
+    /// [`World::depth_loss`].
+    pub fn set_max_depth(&mut self, max_depth: u8) -> (usize, usize) {
+        let max_depth = max_depth.min(MAX_DEPTH);
+        if max_depth == self.spec.max_depth {
+            return (0, 0);
+        }
+        let lost = self.depth_loss(max_depth);
+        for layer in self.layers.iter_mut().skip(max_depth as usize + 1) {
+            layer.clear();
+        }
+        self.nodes.retain(|n| n.depth <= max_depth);
+        self.spec.max_depth = max_depth;
+        self.clock += 1;
+        lost
+    }
+
     /// True if the cell lies inside the map.
     #[inline]
     pub fn in_bounds(&self, depth: u8, x: i64, y: i64) -> bool {
@@ -310,6 +343,35 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_the_depth_adds_layers_or_deletes_the_deeper_ones() {
+        let mut w = World::with_spec(MapSpec::new(8, 8, 2));
+        w.set(0, 1, 1, 0x0102);
+        w.set(2, 5, 5, 0x0102);
+        w.set(2, 6, 5, 0x0102);
+        assert!(w.put_node(Node::new(1, 2, 3, 3, Icon::default())));
+        assert!(w.put_node(Node::new(2, 0, 3, 3, Icon::default())));
+        let rev = w.revision();
+
+        assert_eq!(w.set_max_depth(2), (0, 0), "same depth: nothing happens");
+        assert_eq!(w.revision(), rev);
+
+        assert_eq!(w.set_max_depth(4), (0, 0), "deeper loses nothing");
+        assert_eq!(w.spec().max_depth, 4);
+        w.set(4, 100, 100, 0x0102);
+        assert_ne!(w.get(4, 100, 100), 0);
+        assert!(w.revision() > rev);
+
+        assert_eq!(w.depth_loss(1), (2, 1));
+        assert_eq!(w.set_max_depth(1), (2, 1));
+        assert_eq!(w.get(2, 5, 5), 0);
+        assert!(w.node(1).is_none() && w.node(2).is_some());
+        assert_ne!(w.get(0, 1, 1), 0, "shallower layers stay");
+        assert!(!w.in_bounds(2, 0, 0));
+        w.set(2, 5, 5, 0x0102);
+        assert_eq!(w.get(2, 5, 5), 0, "the deleted depth no longer exists");
+    }
 
     #[test]
     fn set_get_roundtrip_including_negative_cells() {
