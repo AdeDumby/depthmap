@@ -1,3 +1,14 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Every table and every change gets a number no other table ever had, so a
+/// renderer that remembers "version N" can never mistake a different map's
+/// table for the one it already uploaded.
+static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+fn next_version() -> u64 {
+    NEXT_VERSION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Maximum number of distinct colours in one map.
 pub const MAX_COLORS: usize = 256;
 
@@ -43,7 +54,7 @@ impl ColorTable {
     pub fn new() -> Self {
         Self {
             colors: DEFAULT_COLORS.to_vec(),
-            version: 1,
+            version: next_version(),
         }
     }
 
@@ -54,7 +65,7 @@ impl ColorTable {
         if colors.is_empty() {
             return Self::new();
         }
-        Self { colors, version: 1 }
+        Self { colors, version: next_version() }
     }
 
     pub fn len(&self) -> usize {
@@ -88,7 +99,7 @@ impl ColorTable {
         }
         if self.colors.len() < MAX_COLORS {
             self.colors.push(rgb);
-            self.version += 1;
+            self.version = next_version();
             return (self.colors.len() - 1) as u8;
         }
         self.nearest(rgb)
@@ -123,6 +134,19 @@ mod tests {
         assert_eq!(t.get(i), [1, 2, 3]);
         assert_eq!(t.index_of([1, 2, 3]), i);
         assert!(t.version() > v);
+    }
+
+    #[test]
+    fn versions_are_unique_across_tables_and_changes() {
+        let a = ColorTable::new();
+        let b = ColorTable::new();
+        let c = ColorTable::from_vec(vec![[1, 2, 3]]);
+        assert!(a.version() != b.version() && b.version() != c.version() && a.version() != c.version());
+        let mut d = a.clone();
+        assert_eq!(d.version(), a.version(), "a clone is the same table");
+        d.index_of([9, 9, 9]);
+        assert_ne!(d.version(), a.version());
+        assert_ne!(d.version(), b.version());
     }
 
     #[test]

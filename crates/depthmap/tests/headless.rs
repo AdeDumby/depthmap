@@ -496,3 +496,32 @@ fn checker_overlay_darkens_every_other_cell_only() {
     let (g, _) = gpu.render(&world, &far, &NO_GRID, "checker_far_off");
     assert_eq!(f, g);
 }
+
+/// Opening a map must show *its* colours even when the previously shown map
+/// had a different colour table (both tables used to be "version 1").
+#[test]
+fn a_newly_opened_map_shows_its_own_colour_table() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let cam = Camera::new();
+    let mut first = World::new();
+    first.set(0, 0, 0, make_cell(1, 5));
+    let (img, _) = gpu.render(&first, &cam, &NO_GRID, "colours_first");
+    let (x, y) = cell_centre(&cam, (0, 0));
+    assert!(near(px(&img, x + 3, y + 3), color(5), 2));
+
+    // A map with a longer, different table, as loaded from a file.
+    let mut table: Vec<[u8; 3]> = DEFAULT_COLORS.to_vec();
+    table[5] = [200, 30, 30]; // index 5 means something else in this map
+    table.extend([[12, 34, 200], [250, 250, 10]]); // indices 16 and 17
+    let mut second = World::new();
+    second.colors = depthmap_core::ColorTable::from_vec(table);
+    second.set(0, 0, 0, make_cell(1, 5));
+    second.set(0, 1, 0, make_cell(1, 17));
+    let (img, _) = gpu.render(&second, &cam, &NO_GRID, "colours_second");
+    assert!(near(px(&img, x + 3, y + 3), [200, 30, 30], 2), "index 5 follows the new table");
+    let (x1, y1) = cell_centre(&cam, (1, 0));
+    assert!(near(px(&img, x1 + 3, y1 + 3), [250, 250, 10], 2), "index 17 exists only in the new table");
+}
