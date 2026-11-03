@@ -1105,3 +1105,30 @@ fn node_popup_can_snap_icons_to_centres_or_corners() {
     h.frame(vec![]);
     assert!(!h.ed.world.node(id).unwrap().edge);
 }
+
+#[test]
+fn drawing_a_tile_and_saving_it_adds_it_to_the_map_and_selects_it() {
+    let mut h = Harness::new();
+    h.ed.tiles_dir = std::env::temp_dir().join(format!("depthmap-tiles-{}", std::process::id()));
+    let new = h.st.layout.tile_new.expect("New tile button");
+    h.click(new.center());
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let canvas = h.st.tile_ed.as_ref().expect("editor opened").canvas.expect("canvas drawn");
+    // Erase a pixel of the starting solid tile by clicking with the Erase tool.
+    h.st.tile_ed.as_mut().unwrap().tool = depthmap::tile_editor::Tool::Erase;
+    h.click(canvas.min + egui::vec2(18.0, 18.0)); // pixel (1,1)
+    assert_eq!(h.st.tile_ed.as_ref().unwrap().art.get(1, 1).1, 0);
+    assert_eq!(h.st.tile_ed.as_ref().unwrap().art.get(5, 5).1, 255);
+    let save = h.st.tile_ed.as_ref().unwrap().save_button.unwrap();
+    h.click(save.center());
+    assert!(h.st.tile_ed.is_none(), "editor closes after saving");
+    let id = h.ed.world.tile_id("Tile 1").expect("tile stored in the map");
+    assert_eq!(h.ed.texture, id);
+    assert_eq!(h.ed.world.tile(id).unwrap().art.get(1, 1).1, 0);
+    assert!(h.ed.tiles_dir.join("Tile 1.png").exists(), "also saved to the library");
+    let _ = std::fs::remove_dir_all(&h.ed.tiles_dir);
+    // It now appears in the texture grid after the built-ins.
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.textures.len(), TEXTURE_COUNT as usize + 1);
+}

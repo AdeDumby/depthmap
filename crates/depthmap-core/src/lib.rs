@@ -27,6 +27,7 @@ pub mod selection;
 pub mod shape;
 pub mod spec;
 pub mod texture;
+pub mod tile;
 pub mod world;
 
 pub use camera::{Camera, LayerView};

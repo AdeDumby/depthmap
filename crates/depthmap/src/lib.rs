@@ -3,6 +3,7 @@ pub mod gui;
 pub mod palette;
 pub mod renderer;
 pub mod settings;
+pub mod tile_editor;
 pub mod wheel;
 
 /// Fills a `n`×`n` cell area at depth 0 with a noisy pattern, plus a scatter

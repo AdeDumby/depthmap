@@ -214,6 +214,12 @@ pub fn tile(id: u8) -> Vec<u8> {
     out
 }
 
+/// Two-channel (shade, alpha) mip chain of a built-in texture; alpha is opaque.
+pub fn la_mips(id: u8) -> Vec<Vec<u8>> {
+    let la: Vec<u8> = tile(id).into_iter().flat_map(|s| [s, 255]).collect();
+    crate::tile::la_mips(&la)
+}
+
 /// Full mip chain (`MIP_LEVELS` images, 32², 16², … 1²) built by box filtering.
 pub fn mips(id: u8) -> Vec<Vec<u8>> {
     let mut chain = vec![tile(id)];

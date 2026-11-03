@@ -63,6 +63,6 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     // instead of shimmering; Repeat addressing makes the tile seamless.
     let f = fract(v.cell);
     let lod = clamp(log2(32.0 / max(v.ppc, 0.001)), 0.0, 5.0);
-    let shade = textureSampleLevel(patterns, pattern_sampler, f, min(c.x, 31u), lod).r;
-    return vec4<f32>(rgb * shade, v.opacity);
+    let t = textureSampleLevel(patterns, pattern_sampler, f, min(c.x, 31u), lod).rg;
+    return vec4<f32>(rgb * t.x, v.opacity * t.y);
 }

@@ -10,6 +10,8 @@ use crate::colors::ColorTable;
 use crate::icons;
 use crate::node::{Icon, Node, NodeId};
 use crate::spec::MapSpec;
+use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
+use crate::tile::CustomTile;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
 /// Source of chunk version stamps. Global rather than per-world on purpose:
@@ -50,6 +52,9 @@ pub struct World {
     nodes: Vec<Node>,
     node_seq: NodeId,
     custom_icons: BTreeMap<String, CustomIcon>,
+    /// User-drawn tiles, indexed by texture id (`TEXTURE_COUNT + 1..=MAX_TEXTURES`).
+    tiles: Vec<Option<CustomTile>>,
+    tiles_version: u64,
 }
 
 impl Default for World {
@@ -74,6 +79,83 @@ impl World {
             nodes: Vec::new(),
             node_seq: 1,
             custom_icons: BTreeMap::new(),
+            tiles: vec![None; MAX_TEXTURES as usize + 1],
+            tiles_version: crate::colors::next_version(),
+        }
+    }
+
+    // ---- custom tiles -------------------------------------------------------------
+
+    /// Free texture ids for custom tiles.
+    pub const TILE_SLOTS: usize = (MAX_TEXTURES - TEXTURE_COUNT) as usize;
+
+    pub fn tile(&self, id: u8) -> Option<&CustomTile> {
+        self.tiles.get(id as usize).and_then(|t| t.as_ref())
+    }
+
+    /// Custom tiles with their texture ids.
+    pub fn tiles(&self) -> impl Iterator<Item = (u8, &CustomTile)> {
+        self.tiles.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|t| (i as u8, t)))
+    }
+
+    pub fn tile_id(&self, name: &str) -> Option<u8> {
+        self.tiles().find(|(_, t)| t.name == name).map(|(i, _)| i)
+    }
+
+    /// Changes whenever a tile is added, changed or removed (never repeats
+    /// across maps), so a renderer knows when to re-upload them.
+    pub fn tiles_version(&self) -> u64 {
+        self.tiles_version
+    }
+
+    /// Whether texture `id` draws overhang art next to it.
+    pub fn has_overhang(&self, id: u8) -> bool {
+        self.tile(id).is_some_and(|t| t.overhang.is_some())
+    }
+
+    pub fn any_overhang(&self) -> bool {
+        self.tiles().any(|(_, t)| t.overhang.is_some())
+    }
+
+    /// Adds a tile, or replaces the tile of the same name. Returns its
+    /// texture id, or an error when all slots are taken.
+    pub fn add_tile(&mut self, tile: CustomTile) -> Result<u8, String> {
+        if !crate::tile::valid_tile_name(&tile.name) {
+            return Err(format!("\"{}\" is not a usable tile name", tile.name));
+        }
+        let id = match self.tile_id(&tile.name) {
+            Some(id) => id,
+            None => (TEXTURE_COUNT + 1..=MAX_TEXTURES)
+                .find(|&i| self.tiles[i as usize].is_none())
+                .ok_or_else(|| format!("This map already has {} custom tiles", Self::TILE_SLOTS))?,
+        };
+        if self.tiles[id as usize].as_ref() != Some(&tile) {
+            self.tiles[id as usize] = Some(tile);
+            self.tiles_version = crate::colors::next_version();
+            self.clock += 1;
+        }
+        Ok(id)
+    }
+
+    /// How many cells (over every depth) use texture `id`.
+    pub fn cells_using(&self, id: u8) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|l| l.values())
+            .map(|c| c.cells().iter().filter(|&&m| crate::chunk::cell_texture(m) == id).count())
+            .sum()
+    }
+
+    /// Removes a custom tile. The cells that used it stay, drawn as nothing.
+    pub fn remove_tile(&mut self, id: u8) -> bool {
+        match self.tiles.get_mut(id as usize) {
+            Some(slot) if id > TEXTURE_COUNT && slot.is_some() => {
+                *slot = None;
+                self.tiles_version = crate::colors::next_version();
+                self.clock += 1;
+                true
+            }
+            _ => false,
         }
     }
 

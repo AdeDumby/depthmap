@@ -9,7 +9,9 @@
 
 use bytemuck::{Pod, Zeroable};
 use depthmap_core::camera::{Camera, ZOOM_HI};
+use depthmap_core::chunk::{cell_color, cell_texture};
 use depthmap_core::colors::MAX_COLORS;
+use depthmap_core::tile::{Side, TILE_PIXELS};
 use depthmap_core::texture::{self, MAX_TEXTURES, MIP_LEVELS, TILE};
 use depthmap_core::{CHUNK_SHIFT, CHUNK_SIZE, ChunkPos, MAX_DEPTH, SUBDIV, World};
 use rustc_hash::FxHashMap;
@@ -25,6 +27,16 @@ const GRID_PERIOD: i64 = 1024;
 /// Layers whose cells would be thinner than this are not drawn.
 const MIN_CELL_PX: f64 = 0.5;
 /// Page background (sRGB).
+/// Pattern layers: ids `0..=MAX_TEXTURES`, then the same range again for
+/// overhang art (layer `OVERHANG_BASE + id`).
+const OVERHANG_BASE: u32 = MAX_TEXTURES as u32 + 1;
+const PATTERN_LAYERS: u32 = 2 * OVERHANG_BASE;
+
+fn blank_mips() -> Vec<Vec<u8>> {
+    depthmap_core::tile::la_mips(&vec![0u8; TILE_PIXELS * 2])
+}
+
+/// Page background (sRGB) -- see below.
 const BACKGROUND: [f64; 4] = [0.90, 0.87, 0.80, 1.0];
 
 #[repr(C)]
@@ -33,6 +45,18 @@ struct Instance {
     origin: [f32; 2],
     size: f32,
     slot: u32,
+    opacity: f32,
+}
+
+/// One overhang sprite: a cell that receives a protrusion.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Sprite {
+    origin: [f32; 2],
+    size: f32,
+    layer: u32,
+    side: u32,
+    color: u32,
     opacity: f32,
 }
 
@@ -130,6 +154,13 @@ pub struct Renderer {
     instance_cap: usize,
     instances: Vec<Instance>,
 
+    sprite_pipeline: wgpu::RenderPipeline,
+    sprite_buf: wgpu::Buffer,
+    sprite_cap: usize,
+    sprites: Vec<Sprite>,
+    pattern_tex: wgpu::Texture,
+    tiles_version: u64,
+
     cache: FxHashMap<(u8, ChunkPos), Slot>,
     free: Vec<u32>,
     next_unused: u32,
@@ -163,34 +194,19 @@ impl Renderer {
             size: wgpu::Extent3d {
                 width: TILE as u32,
                 height: TILE as u32,
-                depth_or_array_layers: MAX_TEXTURES as u32 + 1,
+                depth_or_array_layers: PATTERN_LAYERS,
             },
             mip_level_count: MIP_LEVELS as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rg8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         for layer in 0..=MAX_TEXTURES {
-            for (level, data) in texture::mips(layer).iter().enumerate() {
-                let size = (TILE >> level) as u32;
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &pattern_tex,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(size),
-                        rows_per_image: Some(size),
-                    },
-                    wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                );
-            }
+            Self::write_pattern(&queue, &pattern_tex, layer as u32, &texture::la_mips(layer));
+            // Overhang layers start fully transparent.
+            Self::write_pattern(&queue, &pattern_tex, OVERHANG_BASE + layer as u32, &blank_mips());
         }
         let pattern_view = pattern_tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -388,6 +404,58 @@ impl Renderer {
             cache: None,
         });
 
+        // --- sprite pipeline (overhangs), same bind group as the chunks
+        let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sprites.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sprites.wgsl").into()),
+        });
+        let sprite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sprites"),
+            layout: Some(&chunk_layout),
+            vertex: wgpu::VertexState {
+                module: &sprite_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Sprite>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32,
+                        2 => Uint32,
+                        3 => Uint32,
+                        4 => Uint32,
+                        5 => Float32,
+                    ],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sprite_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sprite_cap = 1024;
+        let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sprites"),
+            size: (sprite_cap * std::mem::size_of::<Sprite>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let instance_cap = 4096;
         let instance_buf = Self::make_instance_buffer(&device, instance_cap);
 
@@ -407,10 +475,98 @@ impl Renderer {
             instance_buf,
             instance_cap,
             instances: Vec::with_capacity(instance_cap),
+            sprite_pipeline,
+            sprite_buf,
+            sprite_cap,
+            sprites: Vec::new(),
+            pattern_tex,
+            tiles_version: 0,
             cache: FxHashMap::default(),
             free: Vec::new(),
             next_unused: 0,
             frame: 0,
+        }
+    }
+
+    fn write_pattern(queue: &wgpu::Queue, tex: &wgpu::Texture, layer: u32, mips: &[Vec<u8>]) {
+        for (level, data) in mips.iter().enumerate() {
+            let size = (TILE >> level) as u32;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 2),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// Re-uploads every custom tile (and clears removed ones).
+    fn upload_tiles(&mut self, world: &World) {
+        for id in texture::TEXTURE_COUNT + 1..=MAX_TEXTURES {
+            let (main, over) = match world.tile(id) {
+                Some(t) => (
+                    t.art.mips(),
+                    t.overhang.as_ref().map_or_else(blank_mips, |o| o.mips()),
+                ),
+                None => (blank_mips(), blank_mips()),
+            };
+            Self::write_pattern(&self.queue, &self.pattern_tex, id as u32, &main);
+            Self::write_pattern(&self.queue, &self.pattern_tex, OVERHANG_BASE + id as u32, &over);
+        }
+    }
+
+    /// Overhang sprites for one depth: every cell next to a forest-like tile
+    /// that is not itself that tile gets the edge art, rotated per side.
+    fn gather_sprites(
+        &mut self,
+        world: &World,
+        k: u8,
+        view: &depthmap_core::camera::LayerView,
+        (vw, vh): (f64, f64),
+        opacity: f32,
+        min: ChunkPos,
+        max: ChunkPos,
+    ) {
+        let ppc = view.ppc as f32;
+        let mut found: Vec<(i64, i64, u16)> = Vec::new();
+        let lo = ChunkPos { x: min.x - 1, y: min.y - 1 };
+        let hi = ChunkPos { x: max.x + 1, y: max.y + 1 };
+        world.visit_chunks(k, lo, hi, |pos, chunk| {
+            let (ox, oy) = chunk_origin(pos);
+            for (i, &c) in chunk.cells().iter().enumerate() {
+                let id = cell_texture(c);
+                if id > texture::TEXTURE_COUNT && world.has_overhang(id) {
+                    found.push((ox + (i % CHUNK_SIZE as usize) as i64, oy + (i / CHUNK_SIZE as usize) as i64, c));
+                }
+            }
+        });
+        for (x, y, c) in found {
+            let id = cell_texture(c);
+            for side in Side::ALL {
+                let (dx, dy) = side.towards();
+                let (rx, ry) = (x + dx, y + dy);
+                if cell_texture(world.get(k, rx, ry)) == id {
+                    continue;
+                }
+                let (px, py) = view.cell_origin_px(rx, ry, vw, vh);
+                self.sprites.push(Sprite {
+                    origin: [px as f32, py as f32],
+                    size: ppc,
+                    layer: OVERHANG_BASE + id as u32,
+                    side: side as u32,
+                    color: cell_color(c) as u32,
+                    opacity,
+                });
+            }
         }
     }
 
@@ -521,6 +677,12 @@ impl Renderer {
         let mut stats = FrameStats::default();
         let (vw, vh) = (size.0 as f64, size.1 as f64);
         self.instances.clear();
+        self.sprites.clear();
+        if self.tiles_version != world.tiles_version() {
+            self.tiles_version = world.tiles_version();
+            self.upload_tiles(world);
+        }
+        let sprites_wanted = world.any_overhang();
 
         // ---- gather visible chunks of every drawable depth, coarse to fine
         for k in 0..=world.spec().max_depth.min(MAX_DEPTH) {
@@ -582,6 +744,9 @@ impl Renderer {
                     None => stats.chunks_skipped += 1,
                 }
             });
+            if sprites_wanted && view.ppc >= 2.0 {
+                self.gather_sprites(world, k, &view, (vw, vh), opacity, min, max);
+            }
             for (pos, idx) in pending {
                 if let Some(chunk) = world.chunk(k, pos) {
                     self.upload(idx, bytemuck::cast_slice(chunk.cells()));
@@ -598,6 +763,18 @@ impl Renderer {
         if !self.instances.is_empty() {
             self.queue
                 .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
+        }
+        if self.sprites.len() > self.sprite_cap {
+            self.sprite_cap = self.sprites.len().next_power_of_two();
+            self.sprite_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sprites"),
+                size: (self.sprite_cap * std::mem::size_of::<Sprite>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !self.sprites.is_empty() {
+            self.queue.write_buffer(&self.sprite_buf, 0, bytemuck::cast_slice(&self.sprites));
         }
         if self.colors_version != world.colors.version() {
             self.colors_version = world.colors.version();
@@ -688,6 +865,13 @@ impl Renderer {
                 let bytes = (self.instances.len() * std::mem::size_of::<Instance>()) as u64;
                 pass.set_vertex_buffer(0, self.instance_buf.slice(..bytes));
                 pass.draw(0..4, 0..self.instances.len() as u32);
+            }
+            if !self.sprites.is_empty() {
+                pass.set_pipeline(&self.sprite_pipeline);
+                pass.set_bind_group(0, &self.chunk_bind_group, &[]);
+                let bytes = (self.sprites.len() * std::mem::size_of::<Sprite>()) as u64;
+                pass.set_vertex_buffer(0, self.sprite_buf.slice(..bytes));
+                pass.draw(0..4, 0..self.sprites.len() as u32);
             }
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_bind_group(0, &self.overlay_bind_group, &[]);

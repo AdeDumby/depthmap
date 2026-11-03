@@ -21,6 +21,15 @@ pub fn custom_icons_dir() -> PathBuf {
         .join("Custom Icons")
 }
 
+/// Where drawn tiles are kept: `Documents/Depthmap/Custom Tiles`.
+pub fn custom_tiles_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
+        .join("Depthmap")
+        .join("Custom Tiles")
+}
+
 /// Where the "import PNG" dialog starts.
 pub fn icon_import_start_dir() -> Option<PathBuf> {
     dirs::picture_dir().or_else(dirs::document_dir)

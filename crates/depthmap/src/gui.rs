@@ -60,6 +60,8 @@ impl RecentEntry {
 #[derive(Default, Clone, Debug)]
 pub struct UiLayout {
     pub textures: Vec<egui::Rect>,
+    pub tile_new: Option<egui::Rect>,
+    pub tile_edit: Option<egui::Rect>,
     pub swatches: Vec<egui::Rect>,
     pub zoom_out: Option<egui::Rect>,
     pub zoom_in: Option<egui::Rect>,
@@ -179,6 +181,12 @@ pub struct UiState {
     /// Icon files available in the Custom Icons folder or the map.
     icon_names: Vec<String>,
     seen_icons_rev: u64,
+    /// The tile editor window, when open.
+    pub tile_ed: Option<crate::tile_editor::TileEditor>,
+    custom_thumbs: Vec<(u8, egui::TextureHandle)>,
+    custom_thumbs_key: Option<(u64, [u8; 3])>,
+    tile_lib: Vec<String>,
+    seen_tiles_rev: u64,
     /// Node whose name field should grab the keyboard when its popup opens.
     focus_node: Option<depthmap_core::NodeId>,
     palettes: Palettes,
@@ -223,6 +231,11 @@ impl UiState {
             icon_cache: Default::default(),
             icon_names: Vec::new(),
             seen_icons_rev: u64::MAX,
+            tile_ed: None,
+            custom_thumbs: Vec::new(),
+            custom_thumbs_key: None,
+            tile_lib: Vec::new(),
+            seen_tiles_rev: u64::MAX,
             focus_node: None,
             palettes: Palettes::in_memory(),
             depth_dialog: None,
@@ -461,6 +474,39 @@ impl UiState {
         self.show_help = !self.show_help;
     }
 
+    /// Thumbnails of the map's custom tiles (tinted, over a checker so
+    /// transparency shows) and the tile library listing.
+    fn refresh_custom_thumbs(&mut self, ctx: &egui::Context, ed: &Editor) {
+        if self.seen_tiles_rev != ed.tiles_revision {
+            self.seen_tiles_rev = ed.tiles_revision;
+            self.tile_lib = depthmap_core::tile::list_library(&ed.tiles_dir);
+        }
+        let key = (ed.world.tiles_version(), ed.brush_rgb);
+        if self.custom_thumbs_key == Some(key) {
+            return;
+        }
+        self.custom_thumbs_key = Some(key);
+        self.custom_thumbs = ed
+            .world
+            .tiles()
+            .map(|(id, t)| {
+                let mut px = t.art.tinted_over(ed.brush_rgb, [200, 196, 186]);
+                if let Some(o) = &t.overhang {
+                    // Hint that this tile has edge art: a tree-ish corner.
+                    let e = o.tinted_over(ed.brush_rgb, [200, 196, 186]);
+                    for y in 0..TILE / 3 {
+                        for x in 0..TILE / 3 {
+                            let i = (y * TILE + x) * 4;
+                            px[i..i + 4].copy_from_slice(&e[(y * TILE + x + TILE * (TILE * 2 / 3)) * 4..][..4]);
+                        }
+                    }
+                }
+                let img = egui::ColorImage::from_rgba_unmultiplied([TILE, TILE], &px);
+                (id, ctx.load_texture(format!("custom-tile-{id}"), img, TextureOptions::LINEAR))
+            })
+            .collect();
+    }
+
     fn refresh_thumbs(&mut self, ctx: &egui::Context, rgb: [u8; 3]) {
         if self.thumbs_rgb == Some(rgb) && self.thumbs.len() == TEXTURE_COUNT as usize {
             return;
@@ -528,6 +574,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     startup_window(ctx, st, modal);
     new_map_window(ctx, st);
     depth_window(ctx, ed, st);
+    crate::tile_editor::window(ctx, ed, &mut st.tile_ed);
 }
 
 fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -668,9 +715,52 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
     clicked
 }
 
+fn tex_name(ed: &Editor, id: u8) -> String {
+    match ed.world.tile(id) {
+        Some(t) => t.name.clone(),
+        None => texture::name(id).to_string(),
+    }
+}
+
+/// "New tile", "Edit", and the library of tiles saved on this computer.
+fn tiles_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    ui.horizontal(|ui| {
+        let new = ui.button("+ New tile").on_hover_text("Draw your own tile (and forests with tree edges)");
+        st.layout.tile_new = Some(new.rect);
+        if new.clicked() {
+            st.tile_ed = Some(crate::tile_editor::TileEditor::new_tile(ed));
+        }
+        st.layout.tile_edit = None;
+        if let Some(t) = ed.world.tile(ed.texture).cloned() {
+            let edit = ui.button("Edit");
+            st.layout.tile_edit = Some(edit.rect);
+            if edit.clicked() {
+                st.tile_ed = Some(crate::tile_editor::TileEditor::from_tile(t, Some(ed.texture)));
+            }
+            if ui.button("Remove").on_hover_text("Removes the tile from this map (cells using it turn invisible)").clicked() {
+                ed.remove_tile(ed.texture);
+            }
+        }
+    });
+    if !st.tile_lib.is_empty() {
+        egui::CollapsingHeader::new("Tile library").show(ui, |ui| {
+            let names = st.tile_lib.clone();
+            for n in names {
+                if ui.small_button(&n).on_hover_text("Add to this map").clicked() {
+                    if let Err(e) = ed.use_library_tile(&n) {
+                        ed.status = e;
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.refresh_thumbs(ctx, ed.brush_rgb);
+    st.refresh_custom_thumbs(ctx, ed);
     st.layout.textures.clear();
+    st.layout.tile_new = None;
     st.layout.shapes.clear();
     st.layout.tool_buttons.clear();
     st.layout.select_kinds.clear();
@@ -705,17 +795,27 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
                 .show(ui, |ui| {
-                    for id in 1..=TEXTURE_COUNT {
+                    let ids: Vec<u8> = (1..=TEXTURE_COUNT)
+                        .chain(ed.world.tiles().map(|(i, _)| i))
+                        .collect();
+                    for (n, &id) in ids.iter().enumerate() {
                         let (rect, resp) =
                             ui.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
                         let selected = ed.texture == id;
                         st.layout.textures.push(rect);
-                        ui.painter().image(
-                            st.thumbs[id as usize - 1].id(),
+                        let thumb = if id <= TEXTURE_COUNT {
+                            Some(st.thumbs[id as usize - 1].id())
+                        } else {
+                            st.custom_thumbs.iter().find(|(i, _)| *i == id).map(|(_, h)| h.id())
+                        };
+                        if let Some(thumb) = thumb {
+                          ui.painter().image(
+                            thumb,
                             rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             Color32::WHITE,
-                        );
+                          );
+                        }
                         let stroke = if selected {
                             Stroke::new(2.5, ui.visuals().selection.stroke.color)
                         } else if resp.hovered() {
@@ -725,15 +825,16 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         };
                         ui.painter()
                             .rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-                        if resp.on_hover_text(texture::name(id)).clicked() {
+                        if resp.on_hover_text(tex_name(ed, id)).clicked() {
                             ed.set_texture(id);
                         }
-                        if id as usize % COLUMNS == 0 {
+                        if (n + 1) % COLUMNS == 0 {
                             ui.end_row();
                         }
                     }
                 });
-            ui.label(RichText::new(texture::name(ed.texture)).strong());
+            ui.label(RichText::new(tex_name(ed, ed.texture)).strong());
+            tiles_section(ui, ed, st);
 
             ui.separator();
             let mut half = ed.brush_half;

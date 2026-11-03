@@ -525,3 +525,63 @@ fn a_newly_opened_map_shows_its_own_colour_table() {
     let (x1, y1) = cell_centre(&cam, (1, 0));
     assert!(near(px(&img, x1 + 3, y1 + 3), [250, 250, 10], 2), "index 17 exists only in the new table");
 }
+
+/// A forest tile whose edge art spills into neighbouring cells, always
+/// touching the forest, whichever side the forest is on.
+#[test]
+fn overhang_spills_outside_and_rotates_to_face_the_forest() {
+    use depthmap_core::tile::{CustomTile, TileArt};
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let mut art = TileArt::solid(255);
+    let mut over = TileArt::blank();
+    for y in 24..32 {
+        for x in 0..32 {
+            over.set(x, y, 255, 255); // bottom quarter opaque
+        }
+    }
+    let mut tile = CustomTile::new("Forest", {
+        art.set(0, 0, 255, 255);
+        art
+    });
+    tile.overhang = Some(over);
+    let mut world = World::new();
+    let id = world.add_tile(tile).unwrap();
+    world.set(0, 0, 0, make_cell(id, 8)); // one forest cell, deep water tint
+    let cam = Camera::new();
+    let (img, _) = gpu.render(&world, &cam, &NO_GRID, "overhang");
+    let water = color(8);
+    let bg = [230, 222, 204];
+    let corner = |cell: (i64, i64)| {
+        let v = cam.view();
+        let (x, y) = v.cell_origin_px(cell.0, cell.1, W as f64, H as f64);
+        (x as u32, y as u32)
+    };
+    // Forest cell itself is solid.
+    let (cx, cy) = cell_centre(&cam, (0, 0));
+    assert!(near(px(&img, cx, cy), water, 3));
+    // North of the forest: art touches the forest = bottom of that cell.
+    let (x, y) = corner((0, -1));
+    assert!(near(px(&img, x + 16, y + 29), water, 3), "bottom of north cell");
+    assert!(near(px(&img, x + 16, y + 10), bg, 4), "rest of north cell is empty");
+    // South: top of the cell. West: right edge. East: left edge.
+    let (x, y) = corner((0, 1));
+    assert!(near(px(&img, x + 16, y + 3), water, 3), "top of south cell");
+    assert!(near(px(&img, x + 16, y + 22), bg, 4));
+    let (x, y) = corner((-1, 0));
+    assert!(near(px(&img, x + 29, y + 16), water, 3), "right edge of west cell");
+    assert!(near(px(&img, x + 10, y + 16), bg, 4));
+    let (x, y) = corner((1, 0));
+    assert!(near(px(&img, x + 3, y + 16), water, 3), "left edge of east cell");
+    assert!(near(px(&img, x + 22, y + 16), bg, 4));
+
+    // Forest cells next to each other make no protrusion between them.
+    world.set(0, 1, 0, make_cell(id, 8));
+    let (img, _) = gpu.render(&world, &cam, &NO_GRID, "overhang2");
+    let (x, y) = corner((1, 0));
+    assert!(near(px(&img, x + 22, y + 16), water, 3), "second forest cell is solid");
+    let (x, y) = corner((1, -1));
+    assert!(near(px(&img, x + 16, y + 29), water, 3), "its own north edge");
+}

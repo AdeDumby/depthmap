@@ -123,7 +123,24 @@ Everything is undoable. *View > Show nodes* hides them.
 
 **Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies
 PNGs into `Documents/Depthmap/Custom Icons`. They scale to the node size. Icons a map
-uses are also stored inside the `.dmap` file (format v5), so shared maps keep them.
+uses are also stored inside the `.dmap` file (format v6), so shared maps keep them.
+
+## Custom tiles and forests
+
+Tools panel → **+ New tile** opens the tile editor: a 32×32 canvas where each pixel has a
+shade (0–255) and may be transparent. Tiles are greyscale and tinted by the brush colour when
+painted, like the built-in textures. Pencil, Erase, Fill, Solid, Clear and PNG import
+(luminance + alpha, resampled to 32×32) are available, with a live tinted preview.
+
+**Edge art (trees):** tick "Edge art" and draw a second picture with the forest tile *below*
+it (the bottom of the picture touches the tile, marked by a red line). On the map this picture
+is drawn in every neighbouring cell outside the forest, automatically rotated for each side, so
+the forest block is solid while its border gets light protrusions. Cells of the same tile never
+get edge art between them.
+
+Tiles are saved to `Documents/Depthmap/Custom Tiles` (`Name.png`, `Name.edge.png`) and listed under
+"Tile library" to reuse them in other maps; the tiles a map uses are also stored in the `.dmap`
+(format v6, up to 17 custom tiles per map). Palettes do not yet remember custom tiles.
 
 ## Layout
 

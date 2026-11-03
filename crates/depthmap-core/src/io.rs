@@ -9,6 +9,8 @@
 //!                       | icon_kind u8 (0 built-in, 1 imported) | built-in id u8
 //!                         or name_len u16 + name | name_len u16 + name
 //!                       | desc_len u32 + desc }*                         (version 4)
+//!         | tiles u8 | { id u8 | name_len u16 + name | flags u8 (1 = overhang)
+//!                      | art[2048] | overhang art[2048] if flagged }*   (version 6)
 //!         | color_count u16 | { r g b }*color_count
 //!         | { depth u8 | count u32 | { x i64 | y i64 | cells[1024] u16 }* }*
 //! ```
@@ -26,10 +28,12 @@ use crate::colors::{ColorTable, MAX_COLORS};
 use crate::icons;
 use crate::node::{Icon, Node, Snap};
 use crate::spec::MapSpec;
+use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
+use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -78,6 +82,17 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         put_str16(&mut raw, &n.name);
         raw.extend((n.description.len() as u32).to_le_bytes());
         raw.extend(n.description.as_bytes());
+    }
+    let tiles: Vec<_> = world.tiles().collect();
+    raw.push(tiles.len() as u8);
+    for (id, t) in tiles {
+        raw.push(id);
+        put_str16(&mut raw, &t.name);
+        raw.push(t.overhang.is_some() as u8);
+        raw.extend(&t.art.la);
+        if let Some(o) = &t.overhang {
+            raw.extend(&o.la);
+        }
     }
     let colors = world.colors.as_slice();
     raw.extend((colors.len() as u16).to_le_bytes());
@@ -205,6 +220,30 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
         }
     }
 
+    // Custom tiles (version 6). Ids outside the free range or repeated are refused.
+    let mut tile_list: Vec<(u8, CustomTile)> = Vec::new();
+    if version >= 6 {
+        let count = cur.take(1)?[0] as usize;
+        for _ in 0..count {
+            let id = cur.take(1)?[0];
+            if !(TEXTURE_COUNT + 1..=MAX_TEXTURES).contains(&id) || tile_list.iter().any(|t| t.0 == id) {
+                return Err(invalid("bad tile id"));
+            }
+            let name = cur.string16()?;
+            if !crate::tile::valid_tile_name(&name) {
+                return Err(invalid("bad tile name"));
+            }
+            let flags = cur.take(1)?[0];
+            let art = TileArt::from_bytes(cur.take(TILE_PIXELS * 2)?).ok_or_else(|| invalid("bad tile"))?;
+            let overhang = if flags & 1 != 0 {
+                Some(TileArt::from_bytes(cur.take(TILE_PIXELS * 2)?).ok_or_else(|| invalid("bad tile"))?)
+            } else {
+                None
+            };
+            tile_list.push((id, CustomTile { name, art, overhang }));
+        }
+    }
+
     let color_count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
     if color_count == 0 || color_count > MAX_COLORS {
         return Err(invalid("bad colour table size"));
@@ -262,6 +301,10 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             }
             world.insert_chunk(depth, ChunkPos { x, y }, &cells);
         }
+    }
+    for (_, tile) in tile_list {
+        // Saved ids are kept by adding in id order into the same free slots.
+        world.add_tile(tile).map_err(|e| invalid(&e))?;
     }
     for (name, bytes) in icon_blobs {
         world.add_custom_icon(&name, bytes).map_err(|e| invalid(&e))?;
@@ -582,5 +625,40 @@ mod tests {
         assert_eq!(r.get(0, 0, 0), w.get(0, 0, 0));
         assert_eq!(r.get(16, 1, 1), make_cell(9, 4));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_tiles_round_trip_with_their_ids() {
+        use crate::tile::{CustomTile, TileArt};
+        let mut w = World::new();
+        let mut art = TileArt::solid(120);
+        art.set(3, 4, 200, 17);
+        let mut t = CustomTile::new("Forest", art);
+        t.overhang = Some(TileArt::solid(60));
+        let a = w.add_tile(t.clone()).unwrap();
+        let b = w.add_tile(CustomTile::new("Rug", TileArt::solid(90))).unwrap();
+        assert_eq!((a, b), (15, 16));
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let r = read_world(&bytes[..]).unwrap();
+        assert_eq!(r.tile(a), Some(&t));
+        assert_eq!(r.tile_id("Rug"), Some(b));
+        assert!(r.has_overhang(a) && !r.has_overhang(b));
+    }
+
+    #[test]
+    fn tiles_replace_by_name_and_run_out_of_slots() {
+        use crate::tile::{CustomTile, TileArt};
+        let mut w = World::new();
+        let v = w.tiles_version();
+        let id = w.add_tile(CustomTile::new("A", TileArt::solid(1))).unwrap();
+        assert_ne!(w.tiles_version(), v);
+        assert_eq!(w.add_tile(CustomTile::new("A", TileArt::solid(2))).unwrap(), id);
+        for i in 1..World::TILE_SLOTS {
+            w.add_tile(CustomTile::new(&format!("T{i}"), TileArt::solid(5))).unwrap();
+        }
+        assert!(w.add_tile(CustomTile::new("Extra", TileArt::solid(5))).is_err());
+        assert!(w.remove_tile(id));
+        assert!(w.add_tile(CustomTile::new("Extra", TileArt::solid(5))).is_ok());
     }
 }

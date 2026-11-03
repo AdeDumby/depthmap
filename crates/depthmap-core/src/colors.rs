@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// table for the one it already uploaded.
 static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 
-fn next_version() -> u64 {
+pub(crate) fn next_version() -> u64 {
     NEXT_VERSION.fetch_add(1, Ordering::Relaxed)
 }
 

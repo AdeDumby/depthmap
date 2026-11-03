@@ -116,6 +116,10 @@ pub struct Editor {
     pub icons_dir: PathBuf,
     /// Counts events that may change the list of available icons.
     pub icons_revision: u64,
+    /// Folder drawn tiles are saved to, so they can be reused in other maps.
+    pub tiles_dir: PathBuf,
+    /// Counts events that may change the tile library folder.
+    pub tiles_revision: u64,
     pub viewport: (f64, f64),
     pub cursor_px: Option<(f64, f64)>,
     /// File the map is saved to; `None` for an untitled map.
@@ -238,6 +242,8 @@ impl Editor {
             node_snap: Snap::Auto,
             icons_dir: crate::settings::custom_icons_dir(),
             icons_revision: 0,
+            tiles_dir: crate::settings::custom_tiles_dir(),
+            tiles_revision: 0,
             viewport: (1280.0, 720.0),
             cursor_px: None,
             path: None,
@@ -767,6 +773,42 @@ impl Editor {
             (n, None) => format!("{n} icons saved to {}", self.icons_dir.display()),
         };
         ok
+    }
+
+    // ---- custom tiles -------------------------------------------------------
+
+    /// Stores a drawn tile in the map (replacing one of the same name), saves
+    /// it to the tile library and selects it for painting.
+    pub fn save_tile(&mut self, tile: depthmap_core::tile::CustomTile) -> Result<u8, String> {
+        let id = self.world.add_tile(tile.clone())?;
+        self.tiles_revision += 1;
+        self.set_texture(id);
+        self.eraser = false;
+        self.status = match depthmap_core::tile::save_library(&self.tiles_dir, &tile) {
+            Ok(()) => format!("Tile \"{}\" saved to {}", tile.name, self.tiles_dir.display()),
+            Err(e) => format!("Tile \"{}\" is in this map, but could not be saved to the library: {e}", tile.name),
+        };
+        Ok(id)
+    }
+
+    /// Brings a tile from the library into this map and selects it.
+    pub fn use_library_tile(&mut self, name: &str) -> Result<u8, String> {
+        let tile = depthmap_core::tile::load_library(&self.tiles_dir, name)?;
+        let id = self.world.add_tile(tile)?;
+        self.tiles_revision += 1;
+        self.set_texture(id);
+        self.eraser = false;
+        Ok(id)
+    }
+
+    /// Removes a custom tile from this map (cells using it draw as nothing).
+    pub fn remove_tile(&mut self, id: u8) {
+        if self.world.remove_tile(id) {
+            self.tiles_revision += 1;
+            if self.texture == id {
+                self.set_texture(1);
+            }
+        }
     }
 
     // ---- fill and selection -------------------------------------------------
