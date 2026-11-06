@@ -735,7 +735,7 @@ fn key(k: egui::Key, pressed: bool) -> Event {
 fn tool_buttons_switch_tools_and_select_controls_work() {
     use depthmap::editor::{SelectKind, ToolMode};
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.tool_buttons.len(), 3);
+    assert_eq!(h.st.layout.tool_buttons.len(), 4);
     assert_eq!(h.ed.tool, ToolMode::Paint);
     assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
 

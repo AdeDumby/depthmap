@@ -350,7 +350,7 @@ impl App {
             // Physical positions, so WASD means the same place on AZERTY (ZQSD).
             match code {
                 KeyCode::KeyW | KeyCode::ArrowUp => self.held.up = pressed,
-                KeyCode::KeyS | KeyCode::ArrowDown if !ctrl => self.held.down = pressed,
+                // S is the Select tool, so only the arrow key pans down.
                 KeyCode::ArrowDown => self.held.down = pressed,
                 KeyCode::KeyA | KeyCode::ArrowLeft if !(ctrl && pressed) => self.held.left = pressed,
                 KeyCode::KeyD | KeyCode::ArrowRight if !(ctrl && pressed) => self.held.right = pressed,
@@ -415,14 +415,15 @@ impl App {
         if let Key::Character(c) = &event.logical_key {
             match c.as_str() {
                 "e" | "E" => self.editor.eraser = !self.editor.eraser,
-                "c" | "C" => {
+                "p" | "P" => {
                     if let Some(g) = self.gfx.as_mut() {
                         g.gui.state.show_colors = !g.gui.state.show_colors;
                     }
                 }
                 "b" | "B" => self.editor.tool = ToolMode::Paint,
-                "g" | "G" => self.editor.tool = ToolMode::Fill,
-                "m" | "M" => self.editor.tool = ToolMode::Select,
+                "f" | "F" => self.editor.tool = ToolMode::Fill,
+                "s" | "S" => self.editor.tool = ToolMode::Select,
+                "c" | "C" => self.editor.tool = ToolMode::Pick,
                 "n" | "N" => {
                     if self.editor.placing_node {
                         self.editor.cancel_placing_node();

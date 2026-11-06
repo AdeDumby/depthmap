@@ -1113,8 +1113,9 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     ui.horizontal_wrapped(|ui| {
         for (mode, label, tip) in [
             (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
-            (ToolMode::Fill, "Fill", "Bucket (G): click to fill the connected area of identical cells. Shift erases it."),
-            (ToolMode::Select, "Select", "Selection (M): painting is limited to the selected cells"),
+            (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
+            (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
+            (ToolMode::Pick, "Pick", "Pick (C): click a cell to copy its tile and colour, then go back to the brush"),
         ] {
             let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
             st.layout.tool_buttons.push(r.rect);
@@ -1155,6 +1156,9 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     ed.clear_selection();
                 }
             });
+        }
+        ToolMode::Pick => {
+            ui.label(RichText::new("Click a cell: copies its tile and colour, then switches to the brush").weak().small());
         }
         ToolMode::Paint => {}
     }
@@ -2151,19 +2155,20 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Left mouse", "Paint with the selected texture and color"),
                         ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
                         ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("B / G / M", "Brush / Fill / Select tool"),
+                        ("B / F / S / C", "Brush / Fill / Select / Pick tool"),
+                        ("Pick tool (click)", "Copy the tile and colour of the clicked cell, then switch to the brush"),
                         ("Fill tool (click)", "Fill the connected area of identical cells (Shift erases it)"),
                         ("Select tool", "Drag a rectangle, or click to pick connected / same tiles; each new selection adds"),
                         ("Right mouse (Select)", "Invert the selection"),
                         ("Ctrl+A / Ctrl+D / Ctrl+I", "Select all / deselect / invert selection"),
-                        ("C", "Show or hide the Colors window"),
+                        ("P", "Show or hide the Colors window"),
                         ("Esc", "Cancel the shape / node placing / node popup, then clear the selection"),
                         ("N", "Add a node: then click the map"),
                         ("Click / drag a node", "Edit it / move it"),
                         ("Delete", "Delete the node whose popup is open"),
                         ("Middle mouse / Space + drag", "Pan"),
                         ("Mouse wheel", "Zoom (deeper zoom = finer layer)"),
-                        ("WASD / arrow keys", "Pan (physical key positions)"),
+                        ("W A D / arrow keys", "Pan (physical key positions; S is the Select tool)"),
                         ("1 - 9, 0", "Pick texture"),
                         ("[  ]", "Brush size"),
                         ("Ctrl+Z / Ctrl+Y", "Undo / redo"),

@@ -79,7 +79,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 | Esc | cancel the shape being dragged |
 | MMB, or Space + LMB | pan |
 | wheel | zoom around cursor (changes depth automatically) |
-| WASD / arrows (physical keys) | pan |
+| W A D / arrows (physical keys) | pan (S is the Select tool) |
 | 1–9, 0 | pick texture |
 | `[` `]` | brush size |
 | Ctrl+Z, Ctrl+Y | undo, redo |
@@ -88,7 +88,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 
 ## Fill, selection and colours
 
-**Tools** (top of the Tools panel): *Brush* (B), *Fill* (G), *Select* (M).
+**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors window is toggled with P.
 
 * **Fill** - click to replace the whole connected area of identical cells (same
   texture and colour) with the current texture and colour; Shift erases it. One undo

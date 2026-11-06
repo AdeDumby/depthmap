@@ -44,6 +44,8 @@ pub enum ToolMode {
     Fill,
     /// Choose the area that painting is limited to.
     Select,
+    /// Eyedropper: click a cell to copy its tile and colour, then go back to the brush.
+    Pick,
 }
 
 /// How Select picks cells.
@@ -811,6 +813,34 @@ impl Editor {
         }
     }
 
+    // ---- pick -----------------------------------------------------------------
+
+    /// Copies the tile and colour of the cell under the mouse (at the active
+    /// depth) into the brush and switches to the brush. An empty cell, or one
+    /// off the map, picks nothing and leaves the Pick tool active.
+    pub fn pick_at_cursor(&mut self) -> bool {
+        let Some((x, y)) = self.cursor_cell() else { return false };
+        let depth = self.camera.depth;
+        if !self.world.in_bounds(depth, x, y) {
+            return false;
+        }
+        let cell = self.world.get(depth, x, y);
+        let texture = depthmap_core::chunk::cell_texture(cell);
+        if texture == 0 {
+            self.status = "Nothing to pick: that cell is empty".into();
+            return false;
+        }
+        self.set_texture(texture);
+        self.set_brush_rgb(self.world.colors.get(depthmap_core::chunk::cell_color(cell)));
+        self.eraser = false;
+        self.tool = ToolMode::Paint;
+        self.status = match self.world.tile(texture) {
+            Some(t) => format!("Picked \"{}\"", t.name),
+            None => format!("Picked {}", depthmap_core::texture::name(texture)),
+        };
+        true
+    }
+
     // ---- fill and selection -------------------------------------------------
 
     /// Left button pressed on the map (not on a panel or node).
@@ -822,6 +852,9 @@ impl Editor {
                 self.fill_at_cursor(shift);
             }
             ToolMode::Select => self.begin_select(),
+            ToolMode::Pick => {
+                self.pick_at_cursor();
+            }
         }
     }
 
@@ -1975,6 +2008,38 @@ mod tests {
             }
         }
         e
+    }
+
+    #[test]
+    fn pick_copies_tile_and_colour_and_switches_to_the_brush() {
+        let mut e = walled();
+        e.texture = 5;
+        e.eraser = true;
+        e.set_brush_rgb([1, 2, 3]);
+        e.tool = ToolMode::Pick;
+        let (x, y) = px(&e, 4, 4); // a wall: texture 2, colour index 1
+        e.mouse_moved(x, y);
+        e.primary_press(false);
+        e.primary_release();
+        assert_eq!(e.tool, ToolMode::Paint);
+        assert_eq!(e.texture, 2);
+        assert_eq!(e.brush_rgb, e.world.colors.get(1));
+        assert!(!e.eraser, "picking turns the eraser off");
+        assert_eq!(e.world.get(0, 4, 4), make_cell(2, 1), "picking changes nothing on the map");
+        assert!(!e.history.can_undo());
+    }
+
+    #[test]
+    fn picking_an_empty_cell_does_nothing_and_stays_in_pick() {
+        let mut e = walled();
+        e.texture = 5;
+        e.tool = ToolMode::Pick;
+        let (x, y) = px(&e, 2, 2); // empty, outside the ring
+        e.mouse_moved(x, y);
+        e.primary_press(false);
+        assert_eq!(e.tool, ToolMode::Pick);
+        assert_eq!(e.texture, 5);
+        assert!(e.status.contains("empty"), "{}", e.status);
     }
 
     #[test]
