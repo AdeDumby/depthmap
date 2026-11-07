@@ -13,6 +13,8 @@
 //!                      | art[2048] | overhang art[2048] if flagged }*   (version 6)
 //!         | zones u16 | { name_len u16 + name | rgb[3] | visible u8 | depth u8
 //!                     | rows u32 | { y i64 | spans u32 | { x0 i64, x1 i64 }* }* }*   (version 7)
+//!         | routes u16 | { name_len u16 + name | rgb[3] | width u8 | style u8 | visible u8 | depth u8
+//!                      | from u64 | to u64 | via u16 | { x f64, y f64 }* }*   (version 8)
 //!         | color_count u16 | { r g b }*color_count
 //!         | { depth u8 | count u32 | { x i64 | y i64 | cells[1024] u16 }* }*
 //! ```
@@ -32,12 +34,13 @@ use crate::node::{Icon, Node, Snap};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
 use crate::selection::{MAX_SELECTION_ROWS, Rows, Selection};
+use crate::route::{MAX_ROUTES, MAX_VIA, MAX_WIDTH, MIN_WIDTH, Route, RouteStyle};
 use crate::zone::Zone;
 use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -112,6 +115,22 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
                 raw.extend(a.to_le_bytes());
                 raw.extend(b.to_le_bytes());
             }
+        }
+    }
+    raw.extend((world.routes().len() as u16).to_le_bytes());
+    for r in world.routes() {
+        put_str16(&mut raw, &r.name);
+        raw.extend(r.color);
+        raw.push(r.width);
+        raw.push(r.style.to_byte());
+        raw.push(r.visible as u8);
+        raw.push(r.depth);
+        raw.extend(r.from.to_le_bytes());
+        raw.extend(r.to.to_le_bytes());
+        raw.extend((r.via.len() as u16).to_le_bytes());
+        for &(x, y) in &r.via {
+            raw.extend(x.to_le_bytes());
+            raw.extend(y.to_le_bytes());
         }
     }
     let colors = world.colors.as_slice();
@@ -304,6 +323,44 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
         }
     }
 
+    // Routes (version 8).
+    let mut route_list: Vec<Route> = Vec::new();
+    if version >= 8 {
+        let count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
+        if count > MAX_ROUTES {
+            return Err(invalid("too many routes"));
+        }
+        for _ in 0..count {
+            let name = cur.string16()?;
+            let color: [u8; 3] = cur.take(3)?.try_into().unwrap();
+            let width = cur.take(1)?[0];
+            let style = RouteStyle::from_byte(cur.take(1)?[0]).ok_or_else(|| invalid("bad route style"))?;
+            let visible = cur.take(1)?[0] != 0;
+            let depth = cur.take(1)?[0];
+            if !(MIN_WIDTH..=MAX_WIDTH).contains(&width) || depth > spec.max_depth {
+                return Err(invalid("bad route"));
+            }
+            let from = u64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+            let to = u64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+            let n = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
+            if n > MAX_VIA {
+                return Err(invalid("too many route points"));
+            }
+            let mut via = Vec::with_capacity(n);
+            for _ in 0..n {
+                let x = f64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+                let y = f64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(invalid("bad route point"));
+                }
+                via.push((x, y));
+            }
+            let mut r = Route::new(&name, color, depth, from, to);
+            (r.width, r.style, r.visible, r.via) = (width, style, visible, via);
+            route_list.push(r);
+        }
+    }
+
     let color_count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
     if color_count == 0 || color_count > MAX_COLORS {
         return Err(invalid("bad colour table size"));
@@ -361,6 +418,9 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             }
             world.insert_chunk(depth, ChunkPos { x, y }, &cells);
         }
+    }
+    for r in route_list {
+        world.add_route(r).ok_or_else(|| invalid("too many routes"))?;
     }
     for z in zone_list {
         world.add_zone(z).ok_or_else(|| invalid("too many zones"))?;
@@ -742,5 +802,21 @@ mod tests {
         assert_eq!(r.zones().len(), 2);
         assert_eq!(r.zones()[0], z);
         assert_eq!(r.zones()[1].name, "Empty");
+    }
+
+    #[test]
+    fn routes_round_trip() {
+        use crate::route::{Route, RouteStyle};
+        let mut w = World::new();
+        let mut r = Route::new("King's Road", [1, 2, 3], 1, 4, 9);
+        r.via = vec![(10.5, 20.25), (-3.0, 7.0)];
+        r.width = 7;
+        r.style = RouteStyle::Dashed;
+        r.visible = false;
+        w.add_route(r.clone());
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let back = read_world(&bytes[..]).unwrap();
+        assert_eq!(back.routes(), &[r]);
     }
 }

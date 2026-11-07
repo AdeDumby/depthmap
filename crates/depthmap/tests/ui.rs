@@ -432,7 +432,20 @@ fn full_window_renders_map_and_interface() {
         pond.add(&Selection::rect(0, (3, 1), (7, 4)));
         ed.world.add_zone(pond);
         ed.zone_active = Some(0);
-        ed.tool = ToolMode::Zone;
+        {
+            use depthmap_core::node::{Icon, Node};
+            let (a, b) = (ed.world.alloc_node_id(), ed.world.alloc_node_id());
+            let mut na = Node::new(a, 0, -12, 8, Icon::Builtin(2));
+            na.name = "Harbour".into();
+            let mut nb = Node::new(b, 0, 14, -8, Icon::Builtin(3));
+            nb.name = "Keep".into();
+            ed.world.put_node(na);
+            ed.world.put_node(nb);
+            ed.new_route(a, b);
+            ed.world.edit_route(0, |r| r.via = vec![(-4.0, 10.0), (2.0, 6.5), (8.0, 9.0)]);
+            ed.world.edit_route(0, |r| r.style = depthmap_core::route::RouteStyle::Dashed);
+        }
+        ed.tool = ToolMode::Route;
     }
     let screen = Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32));
     let view = gpu.target.create_view(&Default::default());
@@ -774,7 +787,7 @@ fn key(k: egui::Key, pressed: bool) -> Event {
 fn tool_buttons_switch_tools_and_select_controls_work() {
     use depthmap::editor::{SelectKind, ToolMode};
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.tool_buttons.len(), 5);
+    assert_eq!(h.st.layout.tool_buttons.len(), 6);
     assert_eq!(h.ed.tool, ToolMode::Paint);
     assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
 
@@ -1171,6 +1184,37 @@ fn drawing_a_tile_and_saving_it_adds_it_to_the_map_and_selects_it() {
     // It now appears in the texture grid after the built-ins.
     h.frame(vec![]);
     assert_eq!(h.st.layout.textures.len(), TEXTURE_COUNT as usize + 1);
+}
+
+#[test]
+fn clicking_a_map_colour_highlights_where_it_is_used() {
+    let mut h = Harness::new();
+    paint_colours(&mut h, 1..=3);
+    assert_eq!(h.st.highlighted_color(), None);
+    h.click(h.st.layout.swatches[1].center());
+    assert_eq!(h.st.highlighted_color(), Some(2), "the second used colour is table index 2");
+    assert_eq!(h.ed.brush_rgb, DEFAULT_COLORS[2]);
+}
+
+#[test]
+fn routes_window_lists_selects_and_deletes_routes() {
+    use depthmap_core::node::{Icon, Node};
+    let mut h = Harness::new();
+    let (a, b) = (h.ed.world.alloc_node_id(), h.ed.world.alloc_node_id());
+    h.ed.world.put_node(Node::new(a, 0, 1, 1, Icon::Builtin(1)));
+    h.ed.world.put_node(Node::new(b, 0, 5, 1, Icon::Builtin(1)));
+    h.ed.new_route(a, b);
+    h.ed.new_route(b, a);
+    h.ed.tool = ToolMode::Route;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.show_routes, "choosing the Route tool opens its window");
+    assert_eq!(h.st.layout.route_names.len(), 2);
+    h.click(h.st.layout.route_names[0].center());
+    assert_eq!(h.ed.active_route(), Some(0));
+    h.click(h.st.layout.route_deletes[0].center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.routes().len(), 1);
 }
 
 #[test]

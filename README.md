@@ -88,7 +88,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 
 ## Fill, selection and colours
 
-**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors window is toggled with P.
+**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C), *Region* (R), *Route* (T). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors window is toggled with P.
 
 * **Fill** - click to replace the whole connected area of identical cells (same
   texture and colour) with the current texture and colour; Shift erases it. One undo
@@ -123,7 +123,7 @@ Everything is undoable. *View > Show nodes* hides them.
 
 **Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies
 PNGs into `Documents/Depthmap/Custom Icons`. They scale to the node size. Icons a map
-uses are also stored inside the `.dmap` file (format v7), so shared maps keep them.
+uses are also stored inside the `.dmap` file (format v8), so shared maps keep them.
 
 ## Custom tiles and forests
 
@@ -140,7 +140,7 @@ get edge art between them.
 
 Tiles are saved to `Documents/Depthmap/Custom Tiles` (`Name.png`, `Name.edge.png`) and listed under
 "Tile library" to reuse them in other maps; the tiles a map uses are also stored in the `.dmap`
-(format v7, up to 17 custom tiles per map). Palettes do not yet remember custom tiles.
+(format v8, up to 17 custom tiles per map). Palettes do not yet remember custom tiles.
 
 ## Regions
 
@@ -156,7 +156,22 @@ Ways to mark cells (on the active region; if there is none, a new one is created
 - **Selection to region**: turns the current Select-tool selection into region cells.
 
 *Add* / *Remove* chooses what marking does; hold Shift to flip it. Regions are stored as cells at the
-depth they were drawn on (format v7). They are not part of undo/redo.
+depth they were drawn on (format v8). They are not part of undo/redo.
+
+## Routes
+
+The **Route** tool (T) draws a route between two nodes. Click the start node, then the end node; the route is
+created on the depth you are viewing. Then click the map to add points: the route is a smooth curve that
+passes through every point, in order (a new point goes into the stretch of the route nearest to the click).
+Drag a point to move it, right click it to remove it. The Routes window (Pages menu, opens with the tool)
+lists routes and sets name, colour, width, solid / dashed / dotted, and can swap the ends or clear the points.
+
+A route is shown on the depth it was drawn on and every deeper depth, never on shallower ones. It follows its
+nodes when they move; if a node is deleted the route is hidden (it comes back if the node does). Routes are
+saved in the map (format v8) and are not part of undo/redo.
+
+Clicking a colour in **Colors > Map colors** now also flashes every cell drawn with that colour on the current
+layer (while hovered, and for a few seconds after the click).
 
 ## Layout
 

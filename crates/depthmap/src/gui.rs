@@ -92,6 +92,8 @@ pub struct UiLayout {
     pub zone_from_selection: Option<egui::Rect>,
     pub zone_names: Vec<egui::Rect>,
     pub zone_deletes: Vec<egui::Rect>,
+    pub route_names: Vec<egui::Rect>,
+    pub route_deletes: Vec<egui::Rect>,
     pub select_kinds: Vec<egui::Rect>,
     pub select_all: Option<egui::Rect>,
     pub select_invert: Option<egui::Rect>,
@@ -174,10 +176,17 @@ pub struct UiState {
     pub show_regions: bool,
     /// Draw the regions over the map.
     pub show_zones: bool,
+    /// The Routes window.
+    pub show_routes: bool,
+    /// Draw the routes over the map.
+    pub show_route_lines: bool,
     last_tool: ToolMode,
     /// Colours the map's cells use, refreshed when the map changes.
     used_colors: Vec<u8>,
     used_colors_key: Option<(u64, u64)>,
+    /// Colour index being highlighted on the map: hovered, or clicked a moment ago.
+    hl_hover: Option<u8>,
+    hl_click: Option<(u8, f64)>,
     show_help: bool,
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
@@ -234,9 +243,13 @@ impl UiState {
             show_colors: true,
             show_regions: false,
             show_zones: true,
+            show_routes: false,
+            show_route_lines: true,
             last_tool: ToolMode::Paint,
             used_colors: Vec::new(),
             used_colors_key: None,
+            hl_hover: None,
+            hl_click: None,
             show_help: false,
             show_about: false,
             confirm: None,
@@ -494,6 +507,11 @@ impl UiState {
 
     /// Thumbnails of the map's custom tiles (tinted, over a checker so
     /// transparency shows) and the tile library listing.
+    /// The colour index currently flashed on the map, if any.
+    pub fn highlighted_color(&self) -> Option<u8> {
+        self.hl_hover.or(self.hl_click.map(|(c, _)| c))
+    }
+
     fn refresh_custom_thumbs(&mut self, ctx: &egui::Context, ed: &Editor) {
         if self.seen_tiles_rev != ed.tiles_revision {
             self.seen_tiles_rev = ed.tiles_revision;
@@ -590,8 +608,13 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         if ed.tool == ToolMode::Zone {
             st.show_regions = true;
         }
+        if ed.tool == ToolMode::Route {
+            st.show_routes = true;
+        }
     }
     zones_layer(ctx, ed, st);
+    routes_layer(ctx, ed, st);
+    highlight_layer(ctx, ed, st);
     selection_layer(ctx, ed);
     if st.show_regions {
         regions_window(ctx, ed, st);
@@ -601,6 +624,12 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         l.zone_kinds.clear();
         l.zone_names.clear();
         l.zone_deletes.clear();
+    }
+    if st.show_routes {
+        routes_window(ctx, ed, st);
+    } else {
+        st.layout.route_names.clear();
+        st.layout.route_deletes.clear();
     }
     nodes_layer(ctx, ed, st);
     dialogs(ctx, ed, st);
@@ -686,6 +715,7 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.checkbox(&mut st.show_checker, "Checker overlay (darken every other cell)");
                 ui.checkbox(&mut ed.show_nodes, "Show nodes");
                 ui.checkbox(&mut st.show_zones, "Show regions on the map");
+                ui.checkbox(&mut st.show_route_lines, "Show routes on the map");
                 ui.separator();
                 if item(ui, "Zoom in", "") {
                     ed.zoom_centre(2.0);
@@ -705,6 +735,7 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.checkbox(&mut st.show_zoom, "Zoom");
                 ui.checkbox(&mut st.show_colors, "Colors");
                 ui.checkbox(&mut st.show_regions, "Regions");
+                ui.checkbox(&mut st.show_routes, "Routes");
             });
             ui.menu_button("Help", |ui| {
                 if item(ui, "Controls", "F1") {
@@ -1150,6 +1181,7 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
             (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
             (ToolMode::Zone, "Region", "Region (R): mark out named places with a lasso or by clicking tiles"),
+            (ToolMode::Route, "Route", "Route (T): click two nodes to connect them, then click the map to bend the route"),
             (ToolMode::Pick, "Pick", "Pick (C): click a cell to copy its tile and colour, then go back to the brush"),
         ] {
             let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
@@ -1194,6 +1226,14 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         }
         ToolMode::Zone => {
             ui.label(RichText::new(format!("{}. Shift flips add / remove. See the Regions window.", ed.zone_kind.hint())).weak().small());
+        }
+        ToolMode::Route => {
+            let hint = if ed.route_start.is_some() {
+                "Click the node the route ends at (Esc cancels)"
+            } else {
+                "Click a node, then another node: a route. Then click the map to add points it passes through; drag a point to move it, right click removes it."
+            };
+            ui.label(RichText::new(hint).weak().small());
         }
         ToolMode::Pick => {
             ui.label(RichText::new("Click a cell: copies its tile and colour, then switches to the brush").weak().small());
@@ -1313,6 +1353,227 @@ fn draw_selection(
         painter.line_segment(*l, Stroke::new(1.5, colour));
     }
     best.map(|(_, p)| p)
+}
+
+fn node_label(world: &depthmap_core::World, id: depthmap_core::node::NodeId) -> String {
+    match world.node(id) {
+        Some(n) if !n.name.is_empty() => n.name.clone(),
+        Some(n) => format!("node #{}", n.id),
+        None => "(deleted node)".into(),
+    }
+}
+
+/// Draws the routes visible at the camera's depth: smooth curves through
+/// their points, with the active route's points as handles.
+fn routes_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
+    let ppp = ctx.pixels_per_point();
+    let to_pt = |p: (f64, f64)| egui::pos2(p.0 as f32 / ppp, p.1 as f32 / ppp);
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("routes")))
+        .with_clip_rect(ctx.content_rect());
+    let line = |painter: &egui::Painter, pts: Vec<egui::Pos2>, w: f32, dw: f32, c: Color32, style: depthmap_core::route::RouteStyle| {
+        use depthmap_core::route::RouteStyle;
+        let stroke = Stroke::new(w, c);
+        match style {
+            RouteStyle::Solid => {
+                painter.add(egui::Shape::line(pts, stroke));
+            }
+            RouteStyle::Dashed => {
+                painter.extend(egui::Shape::dashed_line(&pts, stroke, dw * 3.0, dw * 2.0));
+            }
+            RouteStyle::Dotted => {
+                painter.extend(egui::Shape::dashed_line(&pts, stroke, dw * 0.6, dw * 1.8));
+            }
+        }
+    };
+    if st.show_route_lines {
+        let depth = ed.camera.depth;
+        let active = if ed.tool == ToolMode::Route { ed.active_route() } else { None };
+        for (i, r) in ed.world.routes().iter().enumerate() {
+            if !r.shows_at(depth) {
+                continue;
+            }
+            let Some(curve) = ed.route_curve_px(r) else { continue };
+            let pts: Vec<egui::Pos2> = curve.points.iter().map(|&p| to_pt(p)).collect();
+            let w = r.width as f32;
+            let c = Color32::from_rgb(r.color[0], r.color[1], r.color[2]);
+            line(&painter, pts.clone(), w + 3.0, w, Color32::from_black_alpha(130), r.style);
+            if active == Some(i) {
+                line(&painter, pts.clone(), w + 6.0, w, Color32::from_rgba_unmultiplied(255, 255, 255, 70), depthmap_core::route::RouteStyle::Solid);
+            }
+            line(&painter, pts.clone(), w, w, c, r.style);
+            if let Some(&mid) = pts.get(pts.len() / 2) {
+                if ctx.content_rect().contains(mid) && !r.name.is_empty() {
+                    let at = mid + vec2(0.0, -(w * 0.5 + 9.0));
+                    let font = egui::FontId::proportional(13.0);
+                    for d in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                        painter.text(at + vec2(d.0, d.1), Align2::CENTER_CENTER, &r.name, font.clone(), Color32::from_black_alpha(230));
+                    }
+                    painter.text(at, Align2::CENTER_CENTER, &r.name, font, Color32::WHITE);
+                }
+            }
+            if active == Some(i) {
+                for p in ed.route_via_px(r) {
+                    painter.circle(to_pt(p), 6.0, Color32::WHITE, Stroke::new(2.5, c));
+                }
+            }
+        }
+    }
+    // A route being started follows the mouse from its first node.
+    if let (Some(start), Some((mx, my))) = (ed.route_start, ed.cursor_px) {
+        if let Some(s) = ed.world.node(start).and_then(|n| ed.node_screen(n)) {
+            line(
+                &painter,
+                vec![to_pt(s.centre), to_pt((mx, my))],
+                3.0,
+                3.0,
+                Color32::from_rgb(255, 255, 255),
+                depthmap_core::route::RouteStyle::Dashed,
+            );
+        }
+    }
+}
+
+/// The Routes window: the list, and the look of the active route.
+fn routes_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    use depthmap_core::route::{MAX_ROUTE_NAME, MAX_WIDTH, MIN_WIDTH, RouteStyle};
+    let mut open = true;
+    st.layout.route_names.clear();
+    st.layout.route_deletes.clear();
+    egui::Window::new("Routes")
+        .open(&mut open)
+        .default_pos(egui::pos2(290.0, 420.0))
+        .default_width(260.0)
+        .show(ctx, |ui| {
+            ui.checkbox(&mut st.show_route_lines, "Show routes on the map");
+            ui.label(
+                RichText::new("Route tool (T): click a start node, then an end node. Click the map to add points it must pass through. Routes show on their layer and the deeper ones.")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+            if ed.world.routes().is_empty() {
+                ui.label(RichText::new("No routes yet.").weak());
+            }
+            let active = ed.active_route();
+            let mut remove = None;
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for i in 0..ed.world.routes().len() {
+                    let (name, color, visible, depth) = {
+                        let r = &ed.world.routes()[i];
+                        (r.name.clone(), r.color, r.visible, r.depth)
+                    };
+                    ui.horizontal(|ui| {
+                        let mut rgb = color;
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            ed.world.edit_route(i, |r| r.color = rgb);
+                        }
+                        let mut vis = visible;
+                        if ui.checkbox(&mut vis, "").on_hover_text("Show / hide").changed() {
+                            ed.world.edit_route(i, |r| r.visible = vis);
+                        }
+                        let label = ui
+                            .selectable_label(active == Some(i), &name)
+                            .on_hover_text(format!("Drawn on depth {depth}; click to edit"));
+                        st.layout.route_names.push(label.rect);
+                        if label.clicked() {
+                            ed.route_active = Some(i);
+                        }
+                        let del = ui.small_button("X").on_hover_text("Delete this route");
+                        st.layout.route_deletes.push(del.rect);
+                        if del.clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                ed.remove_route(i);
+            }
+            if let Some(i) = ed.active_route() {
+                ui.separator();
+                let (mut name, mut width, style, from, to, n, depth) = {
+                    let r = &ed.world.routes()[i];
+                    (r.name.clone(), r.width, r.style, r.from, r.to, r.via.len(), r.depth)
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
+                        let nm: String = name.chars().take(MAX_ROUTE_NAME).collect();
+                        ed.world.edit_route(i, |r| r.name = nm);
+                    }
+                });
+                if ui.add(egui::Slider::new(&mut width, MIN_WIDTH..=MAX_WIDTH).text("Width")).changed() {
+                    ed.world.edit_route(i, |r| r.width = width);
+                }
+                ui.horizontal(|ui| {
+                    for s in RouteStyle::ALL {
+                        if ui.selectable_label(style == s, s.name()).clicked() {
+                            ed.world.edit_route(i, |r| r.style = s);
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "{} to {}",
+                        node_label(&ed.world, from),
+                        node_label(&ed.world, to)
+                    ))
+                    .small(),
+                );
+                ui.label(RichText::new(format!("{n} points, drawn on depth {depth}")).weak().small());
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(n > 0, egui::Button::new("Remove all points")).clicked() {
+                        ed.world.edit_route(i, |r| r.via.clear());
+                    }
+                    if ui.button("Swap ends").clicked() {
+                        ed.world.edit_route(i, |r| {
+                            std::mem::swap(&mut r.from, &mut r.to);
+                            r.via.reverse();
+                        });
+                    }
+                });
+            }
+        });
+    st.show_routes = open;
+}
+
+/// Flashes the cells drawn with a colour: while its swatch is hovered, and
+/// for a few seconds (fading) after it was clicked.
+fn highlight_layer(ctx: &egui::Context, ed: &Editor, st: &mut UiState) {
+    const HOLD: f64 = 3.0;
+    let now = ctx.input(|i| i.time);
+    let (color, strength) = if let Some(c) = st.hl_hover.take() {
+        (c, 1.0)
+    } else if let Some((c, t0)) = st.hl_click.filter(|&(_, t0)| now - t0 < HOLD) {
+        (c, 1.0 - (now - t0) / HOLD)
+    } else {
+        st.hl_click = None;
+        return;
+    };
+    ctx.request_repaint();
+    let pulse = (0.5 + 0.5 * (now * 7.0).sin()) as f32;
+    let a = |base: f32| (base * strength as f32) as u8;
+    let view = ed.camera.at_depth(ed.camera.depth);
+    let (vw, vh) = ed.viewport;
+    let ppp = ctx.pixels_per_point();
+    let (min, max) = view.visible_cells(vw, vh);
+    let runs = ed.world.color_runs(ed.camera.depth, color, min, max, 20_000);
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("highlight")))
+        .with_clip_rect(ctx.content_rect());
+    let fill = Color32::from_rgba_unmultiplied(255, 235, 90, a(70.0 + 110.0 * pulse));
+    let line = Color32::from_rgba_unmultiplied(255, 255, 255, a(230.0));
+    for (y, x0, x1) in runs {
+        let (ax, ay) = view.cell_origin_px(x0, y, vw, vh);
+        let (bx, by) = view.cell_origin_px(x1 + 1, y + 1, vw, vh);
+        let r = egui::Rect::from_min_max(
+            egui::pos2(ax as f32 / ppp, ay as f32 / ppp),
+            egui::pos2(bx as f32 / ppp, by as f32 / ppp),
+        );
+        painter.rect_filled(r, 0.0, fill);
+        painter.rect_stroke(r, 0.0, Stroke::new(1.5, line), egui::StrokeKind::Inside);
+    }
 }
 
 /// Draws every visible region: tinted fill, outline and name. Regions of
@@ -1505,8 +1766,13 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                             };
                             ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
                             let tip = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                            let hovered = resp.hovered();
                             if resp.on_hover_text(tip).clicked() {
                                 ed.set_brush_rgb(*rgb);
+                                st.hl_click = Some((st.used_colors[i], ctx.input(|inp| inp.time)));
+                            }
+                            if hovered {
+                                st.hl_hover = Some(st.used_colors[i]);
                             }
                             if (i + 1) % 9 == 0 {
                                 ui.end_row();
@@ -2364,7 +2630,8 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Left mouse", "Paint with the selected texture and color"),
                         ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
                         ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("B / F / S / C / R", "Brush / Fill / Select / Pick / Region tool"),
+                        ("B / F / S / C / R / T", "Brush / Fill / Select / Pick / Region / Route tool"),
+                        ("Route tool", "Click two nodes to connect them, click the map to bend the route; shown on its layer and deeper ones"),
                         ("Region tool", "Lasso a place (or click tiles) to mark it; Shift removes; regions show on every depth"),
                         ("Pick tool (click)", "Copy the tile and colour of the clicked cell, then switch to the brush"),
                         ("Fill tool (click)", "Fill the connected area of identical cells (Shift erases it)"),

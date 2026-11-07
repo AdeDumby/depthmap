@@ -424,6 +424,7 @@ impl App {
                 "s" | "S" => self.editor.tool = ToolMode::Select,
                 "c" | "C" => self.editor.tool = ToolMode::Pick,
                 "r" | "R" => self.editor.tool = ToolMode::Zone,
+                "t" | "T" => self.editor.tool = ToolMode::Route,
                 "n" | "N" => {
                     if self.editor.placing_node {
                         self.editor.cancel_placing_node();

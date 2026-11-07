@@ -48,6 +48,8 @@ pub enum ToolMode {
     Pick,
     /// Mark out named regions (lasso, or click to grab connected tiles).
     Zone,
+    /// Draw routes between nodes and bend them with extra points.
+    Route,
 }
 
 /// How Select picks cells.
@@ -191,6 +193,12 @@ pub struct Editor {
     /// Region tool removes instead of adds (Shift flips it for one action).
     pub zone_subtract: bool,
     lasso: Option<LassoDrag>,
+    /// The route the Route tool edits (index into `world.routes()`).
+    pub route_active: Option<usize>,
+    /// A route being started: the node it leaves from.
+    pub route_start: Option<depthmap_core::node::NodeId>,
+    /// A via point being dragged: (route, point).
+    route_drag: Option<(usize, usize)>,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
 }
@@ -314,6 +322,9 @@ impl Editor {
             zone_kind: ZoneKind::Lasso,
             zone_subtract: false,
             lasso: None,
+            route_active: None,
+            route_start: None,
+            route_drag: None,
             selection: None,
             select_drag: None,
         }
@@ -372,6 +383,7 @@ impl Editor {
         self.update_shape();
         self.update_node_drag();
         self.update_lasso(x, y);
+        self.update_route_drag();
     }
 
     pub fn mouse_left_window(&mut self) {
@@ -710,6 +722,10 @@ impl Editor {
     /// Left press: grab the node under the mouse, if any. Returns whether
     /// there was one (so the press must not paint).
     pub fn press_node(&mut self) -> bool {
+        // The Route tool uses nodes as route ends instead of grabbing them.
+        if self.tool == ToolMode::Route {
+            return false;
+        }
         let Some((x, y)) = self.cursor_px else { return false };
         let Some(id) = self.node_at(x, y) else { return false };
         if let Some(n) = self.world.node(id).cloned() {
@@ -864,6 +880,204 @@ impl Editor {
             if self.texture == id {
                 self.set_texture(1);
             }
+        }
+    }
+
+    // ---- routes ---------------------------------------------------------------
+
+    /// Pixels within which a click grabs a route line or one of its points.
+    const ROUTE_GRAB_PX: f64 = 9.0;
+
+    /// A node's position in cells of `depth`.
+    fn node_position_at(&self, id: depthmap_core::node::NodeId, depth: u8) -> Option<(f64, f64)> {
+        let n = self.world.node(id)?;
+        let (x, y) = n.position();
+        let f = (depthmap_core::SUBDIV as f64).powi(depth as i32 - n.depth as i32);
+        Some((x * f, y * f))
+    }
+
+    /// The two end positions of a route, in cells of the route's depth;
+    /// `None` while one of its nodes does not exist.
+    pub fn route_ends(&self, r: &depthmap_core::route::Route) -> Option<((f64, f64), (f64, f64))> {
+        Some((self.node_position_at(r.from, r.depth)?, self.node_position_at(r.to, r.depth)?))
+    }
+
+    /// A point in cells of `depth` as a screen position.
+    pub fn route_point_px(&self, depth: u8, p: (f64, f64)) -> (f64, f64) {
+        let v = self.camera.at_depth(depth);
+        let (vw, vh) = self.viewport;
+        (
+            (p.0 - (v.cell.0 as f64 + v.frac.0)) * v.ppc + vw * 0.5,
+            (p.1 - (v.cell.1 as f64 + v.frac.1)) * v.ppc + vh * 0.5,
+        )
+    }
+
+    /// The route's curve in screen pixels, with the control segment of each
+    /// sample, or `None` when it cannot be drawn.
+    pub fn route_curve_px(&self, r: &depthmap_core::route::Route) -> Option<depthmap_core::route::Curve> {
+        let ends = self.route_ends(r)?;
+        let ctrl: Vec<(f64, f64)> =
+            r.control_points(ends).into_iter().map(|p| self.route_point_px(r.depth, p)).collect();
+        let len: f64 = ctrl.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
+        let per = ((len / (ctrl.len() - 1) as f64) / 10.0).clamp(6.0, 40.0) as usize;
+        Some(depthmap_core::route::spline(&ctrl, per))
+    }
+
+    /// Screen positions of a route's via points.
+    pub fn route_via_px(&self, r: &depthmap_core::route::Route) -> Vec<(f64, f64)> {
+        r.via.iter().map(|&p| self.route_point_px(r.depth, p)).collect()
+    }
+
+    pub fn active_route(&self) -> Option<usize> {
+        self.route_active.filter(|&i| i < self.world.routes().len())
+    }
+
+    /// The via point of the active route under the screen point.
+    fn via_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let i = self.active_route()?;
+        let r = &self.world.routes()[i];
+        if !r.shows_at(self.camera.depth) {
+            return None;
+        }
+        self.route_via_px(r)
+            .iter()
+            .position(|p| (p.0 - x).hypot(p.1 - y) <= Self::ROUTE_GRAB_PX)
+            .map(|j| (i, j))
+    }
+
+    /// The visible route whose line passes under the screen point.
+    pub fn route_at(&self, x: f64, y: f64) -> Option<usize> {
+        let depth = self.camera.depth;
+        self.world
+            .routes()
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, r)| r.shows_at(depth))
+            .find_map(|(i, r)| {
+                let c = self.route_curve_px(r)?;
+                (c.distance_to((x, y)) <= Self::ROUTE_GRAB_PX + r.width as f64 * 0.5).then_some(i)
+            })
+    }
+
+    /// Creates a route from node `from` to node `to` on the current depth.
+    pub fn new_route(&mut self, from: depthmap_core::node::NodeId, to: depthmap_core::node::NodeId) -> Option<usize> {
+        use depthmap_core::route::{ROUTE_COLORS, Route};
+        let n = self.world.routes().len();
+        let mut k = n + 1;
+        let name = loop {
+            let c = format!("Route {k}");
+            if !self.world.routes().iter().any(|r| r.name == c) {
+                break c;
+            }
+            k += 1;
+        };
+        let route = Route::new(&name, ROUTE_COLORS[n % ROUTE_COLORS.len()], self.camera.depth, from, to);
+        match self.world.add_route(route) {
+            Some(i) => {
+                self.route_active = Some(i);
+                Some(i)
+            }
+            None => {
+                self.status = format!("A map can have at most {} routes", depthmap_core::route::MAX_ROUTES);
+                None
+            }
+        }
+    }
+
+    pub fn remove_route(&mut self, index: usize) {
+        if self.world.remove_route(index) {
+            self.route_drag = None;
+            self.route_active = match self.route_active {
+                Some(a) if a == index => None,
+                Some(a) if a > index => Some(a - 1),
+                other => other,
+            };
+        }
+    }
+
+    /// Route tool pressed. In order: grab a point of the active route; click
+    /// a node (first = start, second = end of a new route); select a route
+    /// line; otherwise add a point to the active route where you clicked.
+    pub fn begin_route(&mut self) {
+        let Some((x, y)) = self.cursor_px else { return };
+        if self.route_start.is_none() {
+            if let Some(hit) = self.via_at(x, y) {
+                self.route_drag = Some(hit);
+                return;
+            }
+        }
+        if let Some(node) = self.node_at(x, y) {
+            match self.route_start {
+                None => {
+                    self.route_start = Some(node);
+                    self.status = "Now click the node the route ends at (Esc cancels)".into();
+                }
+                Some(start) if start != node => {
+                    self.route_start = None;
+                    if let Some(i) = self.new_route(start, node) {
+                        self.status = format!(
+                            "Created \"{}\": click the map to add points it must pass through",
+                            self.world.routes()[i].name
+                        );
+                    }
+                }
+                Some(_) => {}
+            }
+            return;
+        }
+        if self.route_start.is_some() {
+            return;
+        }
+        if let Some(i) = self.route_at(x, y) {
+            self.route_active = Some(i);
+            return;
+        }
+        let Some(i) = self.active_route() else {
+            self.status = "Click a node to start a route".into();
+            return;
+        };
+        let r = &self.world.routes()[i];
+        if !r.shows_at(self.camera.depth) {
+            self.status = format!("Go to depth {} or deeper to edit this route", r.depth);
+            return;
+        }
+        let Some(ends) = self.route_ends(r) else {
+            self.status = "One of this route's nodes was deleted".into();
+            return;
+        };
+        let depth = r.depth;
+        let p = self.point_at_depth(depth, x, y);
+        let added = self.world.edit_route(i, |r| r.insert_via(ends, p)).flatten();
+        if let Some(j) = added {
+            self.route_drag = Some((i, j)); // dragging right away fine-tunes it
+        } else {
+            self.status = "This route has too many points".into();
+        }
+    }
+
+    fn update_route_drag(&mut self) {
+        let Some((i, j)) = self.route_drag else { return };
+        let Some((x, y)) = self.cursor_px else { return };
+        let Some(depth) = self.world.routes().get(i).map(|r| r.depth) else {
+            self.route_drag = None;
+            return;
+        };
+        let p = self.point_at_depth(depth, x, y);
+        self.world.edit_route(i, |r| {
+            if let Some(v) = r.via.get_mut(j) {
+                *v = p;
+            }
+        });
+    }
+
+    /// Right click: removes the active route's point under the mouse.
+    fn remove_via_at_cursor(&mut self) {
+        let Some((x, y)) = self.cursor_px else { return };
+        if let Some((i, j)) = self.via_at(x, y) {
+            self.world.edit_route(i, |r| {
+                r.via.remove(j);
+            });
         }
     }
 
@@ -1081,6 +1295,7 @@ impl Editor {
                 self.pick_at_cursor();
             }
             ToolMode::Zone => self.begin_zone(shift),
+            ToolMode::Route => self.begin_route(),
         }
     }
 
@@ -1089,6 +1304,7 @@ impl Editor {
         self.end_stroke();
         self.end_select();
         self.end_zone();
+        self.route_drag = None;
     }
 
     /// Right button pressed: inverts the selection while selecting, draws a
@@ -1096,6 +1312,8 @@ impl Editor {
     pub fn secondary_press(&mut self, shift: bool) {
         if self.tool == ToolMode::Select {
             self.invert_selection();
+        } else if self.tool == ToolMode::Route {
+            self.remove_via_at_cursor();
         } else {
             self.begin_shape(shift);
         }
@@ -1284,6 +1502,9 @@ impl Editor {
             self.cancel_shape();
         } else if self.lasso.is_some() {
             self.lasso = None;
+        } else if self.route_start.is_some() {
+            self.route_start = None;
+            self.status.clear();
         } else if self.select_drag.is_some() {
             self.select_drag = None;
         } else if self.selection.is_some() {
@@ -2318,6 +2539,92 @@ mod tests {
         e.primary_release();
         assert!(e.lasso_screen().is_none());
         assert_eq!(e.world.zones()[0].area().cell_count(), Some(n));
+    }
+
+    #[test]
+    fn routes_connect_two_nodes_and_pass_through_every_added_point() {
+        use depthmap_core::node::{Icon, Node};
+        let mut e = walled();
+        let (a, b) = (e.world.alloc_node_id(), e.world.alloc_node_id());
+        e.world.put_node(Node::new(a, 0, 3, 3, Icon::Builtin(1)));
+        e.world.put_node(Node::new(b, 0, 12, 3, Icon::Builtin(1)));
+        e.tool = ToolMode::Route;
+        let click = |e: &mut Editor, cx: i64, cy: i64| {
+            let (x, y) = px(e, cx, cy);
+            e.mouse_moved(x, y);
+            e.primary_press(false);
+            e.primary_release();
+        };
+        let p = |e: &Editor, x: i64, y: i64| px(e, x, y);
+        // First node: pending start; Esc cancels it.
+        click(&mut e, 3, 3);
+        assert_eq!(e.route_start, Some(a));
+        e.escape();
+        assert_eq!(e.route_start, None);
+        // Second try: start then end creates a route and selects it.
+        click(&mut e, 3, 3);
+        click(&mut e, 12, 3);
+        assert_eq!(e.world.routes().len(), 1, "{}", e.status);
+        let r = &e.world.routes()[0];
+        assert_eq!((r.from, r.to, r.depth), (a, b, 0));
+        assert_eq!(e.active_route(), Some(0));
+        // Clicking the map adds points; the curve goes through each.
+        click(&mut e, 7, 9);
+        click(&mut e, 9, 0);
+        let r = &e.world.routes()[0];
+        assert_eq!(r.via.len(), 2);
+        assert!(!e.history.can_undo(), "routes are not part of the paint history");
+        let curve = e.route_curve_px(r).unwrap();
+        for (x, y) in [p(&e, 7, 9), p(&e, 9, 0)] {
+            assert!(curve.distance_to((x, y)) < 1.0, "the route misses a point");
+        }
+        // Points are ordered along the route: (7,9) comes before (9,0).
+        assert!(r.via[0].0 < r.via[1].0);
+        // Dragging a point moves it.
+        let (vx, vy) = p(&e, 7, 9);
+        e.mouse_moved(vx, vy);
+        e.primary_press(false);
+        let (nx, ny) = p(&e, 6, 11);
+        e.mouse_moved(nx, ny);
+        e.primary_release();
+        let moved = e.world.routes()[0].via[0];
+        assert_eq!((moved.0.floor(), moved.1.floor()), (6.0, 11.0));
+        assert_eq!(e.world.routes()[0].via.len(), 2, "grabbing a point does not add one");
+        // Right click removes a point.
+        let (rx, ry) = p(&e, 6, 11);
+        e.mouse_moved(rx, ry);
+        e.secondary_press(false);
+        e.end_shape();
+        assert_eq!(e.world.routes()[0].via.len(), 1);
+        // Deleting an end node hides the route but keeps it.
+        e.world.remove_node(b);
+        assert!(e.route_curve_px(&e.world.routes()[0]).is_none());
+        assert_eq!(e.world.routes().len(), 1);
+    }
+
+    #[test]
+    fn routes_show_on_their_depth_and_deeper_never_shallower() {
+        use depthmap_core::node::{Icon, Node};
+        let mut e = walled();
+        let (a, b) = (e.world.alloc_node_id(), e.world.alloc_node_id());
+        e.world.put_node(Node::new(a, 0, 3, 3, Icon::Builtin(1)));
+        e.world.put_node(Node::new(b, 0, 12, 3, Icon::Builtin(1)));
+        e.tool = ToolMode::Route;
+        e.new_route(a, b);
+        let r = e.world.routes()[0].clone();
+        assert!(r.shows_at(0) && r.shows_at(1) && r.shows_at(5));
+        // Seen from a deeper camera the curve is the same place, just bigger.
+        let (x0, y0) = e.route_point_px(0, r.control_points(e.route_ends(&r).unwrap())[0]);
+        e.camera.depth = 1;
+        let (x1, y1) = e.route_point_px(0, r.control_points(e.route_ends(&r).unwrap())[0]);
+        assert!(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite());
+        // A route made at depth 1 is not shown at depth 0.
+        let c = e.new_route(a, b).unwrap();
+        assert_eq!(e.world.routes()[c].depth, 1);
+        assert!(!e.world.routes()[c].shows_at(0));
+        e.camera.depth = 0;
+        let mid = e.route_curve_px(&e.world.routes()[0]).unwrap().points[10];
+        assert_eq!(e.route_at(mid.0, mid.1), Some(0), "only the depth-0 route can be picked here");
     }
 
     #[test]

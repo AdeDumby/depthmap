@@ -27,6 +27,7 @@ pub mod selection;
 pub mod shape;
 pub mod spec;
 pub mod texture;
+pub mod route;
 pub mod tile;
 pub mod zone;
 pub mod world;

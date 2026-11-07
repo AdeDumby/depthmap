@@ -12,6 +12,7 @@ use crate::node::{Icon, Node, NodeId};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
 use crate::tile::CustomTile;
+use crate::route::Route;
 use crate::zone::Zone;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
@@ -57,6 +58,7 @@ pub struct World {
     tiles: Vec<Option<CustomTile>>,
     tiles_version: u64,
     zones: Vec<Zone>,
+    routes: Vec<Route>,
 }
 
 impl Default for World {
@@ -84,6 +86,39 @@ impl World {
             tiles: vec![None; MAX_TEXTURES as usize + 1],
             tiles_version: crate::colors::next_version(),
             zones: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+
+    // ---- routes ----------------------------------------------------------------
+
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    pub fn add_route(&mut self, route: Route) -> Option<usize> {
+        if self.routes.len() >= crate::route::MAX_ROUTES {
+            return None;
+        }
+        self.routes.push(route);
+        self.clock += 1;
+        Some(self.routes.len() - 1)
+    }
+
+    pub fn edit_route<R>(&mut self, index: usize, f: impl FnOnce(&mut Route) -> R) -> Option<R> {
+        let r = self.routes.get_mut(index)?;
+        let out = f(r);
+        self.clock += 1;
+        Some(out)
+    }
+
+    pub fn remove_route(&mut self, index: usize) -> bool {
+        if index < self.routes.len() {
+            self.routes.remove(index);
+            self.clock += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -197,6 +232,55 @@ impl World {
             }
         }
         (0..=255u8).filter(|&i| used[i as usize]).collect()
+    }
+
+    /// Horizontal runs `(y, x0, x1)` of cells in the cell rectangle `min..=max`
+    /// of `depth` that are drawn with colour index `color`. Stops after
+    /// `max_runs` runs.
+    pub fn color_runs(
+        &self,
+        depth: u8,
+        color: u8,
+        min: (i64, i64),
+        max: (i64, i64),
+        max_runs: usize,
+    ) -> Vec<(i64, i64, i64)> {
+        use crate::{CHUNK_SHIFT, CHUNK_SIZE};
+        let mut runs: Vec<(i64, i64, i64)> = Vec::new();
+        if max.0 < min.0 || max.1 < min.1 {
+            return runs;
+        }
+        let lo = ChunkPos { x: min.0 >> CHUNK_SHIFT, y: min.1 >> CHUNK_SHIFT };
+        let hi = ChunkPos { x: max.0 >> CHUNK_SHIFT, y: max.1 >> CHUNK_SHIFT };
+        self.visit_chunks(depth, lo, hi, |pos, chunk| {
+            let (ox, oy) = (pos.x << CHUNK_SHIFT, pos.y << CHUNK_SHIFT);
+            let cells = chunk.cells();
+            for ly in 0..CHUNK_SIZE {
+                let y = oy + ly;
+                if y < min.1 || y > max.1 {
+                    continue;
+                }
+                let mut start: Option<i64> = None;
+                for lx in 0..=CHUNK_SIZE {
+                    let x = ox + lx;
+                    let hit = lx < CHUNK_SIZE && x >= min.0 && x <= max.0 && {
+                        let c = cells[(ly * CHUNK_SIZE + lx) as usize];
+                        crate::chunk::cell_texture(c) != 0 && crate::chunk::cell_color(c) == color
+                    };
+                    match (hit, start) {
+                        (true, None) => start = Some(x),
+                        (false, Some(s)) => {
+                            if runs.len() < max_runs {
+                                runs.push((y, s, x - 1));
+                            }
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        runs
     }
 
     /// Removes a custom tile. The cells that used it stay, drawn as nothing.
@@ -478,6 +562,23 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_runs_merge_neighbours_and_respect_the_window() {
+        let mut w = World::with_spec(MapSpec::new(200, 200, 1));
+        for x in 3..=6 {
+            w.set(0, x, 2, crate::make_cell(3, 5));
+        }
+        w.set(0, 9, 2, crate::make_cell(3, 5));
+        w.set(0, 4, 3, crate::make_cell(3, 6));
+        w.set(0, 100, 2, crate::make_cell(3, 5)); // another chunk
+        let all = w.color_runs(0, 5, (0, 0), (150, 10), 100);
+        assert_eq!(all, vec![(2, 3, 6), (2, 9, 9), (2, 100, 100)]);
+        // The window clips runs.
+        assert_eq!(w.color_runs(0, 5, (5, 0), (9, 10), 100), vec![(2, 5, 6), (2, 9, 9)]);
+        assert_eq!(w.color_runs(0, 6, (0, 0), (10, 10), 100), vec![(3, 4, 4)]);
+        assert_eq!(w.color_runs(0, 5, (0, 0), (150, 10), 1).len(), 1, "capped");
+    }
 
     #[test]
     fn used_colors_lists_only_colours_cells_use() {
