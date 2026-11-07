@@ -11,6 +11,8 @@
 //!                       | desc_len u32 + desc }*                         (version 4)
 //!         | tiles u8 | { id u8 | name_len u16 + name | flags u8 (1 = overhang)
 //!                      | art[2048] | overhang art[2048] if flagged }*   (version 6)
+//!         | zones u16 | { name_len u16 + name | rgb[3] | visible u8 | depth u8
+//!                     | rows u32 | { y i64 | spans u32 | { x0 i64, x1 i64 }* }* }*   (version 7)
 //!         | color_count u16 | { r g b }*color_count
 //!         | { depth u8 | count u32 | { x i64 | y i64 | cells[1024] u16 }* }*
 //! ```
@@ -29,11 +31,13 @@ use crate::icons;
 use crate::node::{Icon, Node, Snap};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
+use crate::selection::{MAX_SELECTION_ROWS, Rows, Selection};
+use crate::zone::Zone;
 use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -92,6 +96,22 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         raw.extend(&t.art.la);
         if let Some(o) = &t.overhang {
             raw.extend(&o.la);
+        }
+    }
+    raw.extend((world.zones().len() as u16).to_le_bytes());
+    for z in world.zones() {
+        put_str16(&mut raw, &z.name);
+        raw.extend(z.color);
+        raw.push(z.visible as u8);
+        raw.push(z.depth());
+        raw.extend((z.area().rows().len() as u32).to_le_bytes());
+        for (&y, spans) in z.area().rows() {
+            raw.extend(y.to_le_bytes());
+            raw.extend((spans.len() as u32).to_le_bytes());
+            for &(a, b) in spans {
+                raw.extend(a.to_le_bytes());
+                raw.extend(b.to_le_bytes());
+            }
         }
     }
     let colors = world.colors.as_slice();
@@ -244,6 +264,46 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
         }
     }
 
+    // Zones (version 7).
+    let mut zone_list: Vec<Zone> = Vec::new();
+    if version >= 7 {
+        let count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
+        if count > World::MAX_ZONES {
+            return Err(invalid("too many zones"));
+        }
+        for _ in 0..count {
+            let name = cur.string16()?;
+            let rgb: [u8; 3] = cur.take(3)?.try_into().unwrap();
+            let visible = cur.take(1)?[0] != 0;
+            let depth = cur.take(1)?[0];
+            if depth > spec.max_depth {
+                return Err(invalid("bad zone depth"));
+            }
+            let row_count = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
+            if row_count > MAX_SELECTION_ROWS {
+                return Err(invalid("zone too large"));
+            }
+            let mut rows = Rows::new();
+            for _ in 0..row_count {
+                let y = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+                let n = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
+                let mut spans: Vec<(i64, i64)> = Vec::new();
+                for _ in 0..n {
+                    let a = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+                    let b = i64::from_le_bytes(cur.take(8)?.try_into().unwrap());
+                    if a > b || spans.last().is_some_and(|&(_, l)| l.saturating_add(1) >= a) {
+                        return Err(invalid("bad zone spans"));
+                    }
+                    spans.push((a, b));
+                }
+                if rows.insert(y, spans).is_some() || n == 0 {
+                    return Err(invalid("bad zone rows"));
+                }
+            }
+            zone_list.push(Zone::from_area(&name, rgb, visible, Selection::from_rows(depth, rows)));
+        }
+    }
+
     let color_count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
     if color_count == 0 || color_count > MAX_COLORS {
         return Err(invalid("bad colour table size"));
@@ -301,6 +361,9 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             }
             world.insert_chunk(depth, ChunkPos { x, y }, &cells);
         }
+    }
+    for z in zone_list {
+        world.add_zone(z).ok_or_else(|| invalid("too many zones"))?;
     }
     for (_, tile) in tile_list {
         // Saved ids are kept by adding in id order into the same free slots.
@@ -660,5 +723,24 @@ mod tests {
         assert!(w.add_tile(CustomTile::new("Extra", TileArt::solid(5))).is_err());
         assert!(w.remove_tile(id));
         assert!(w.add_tile(CustomTile::new("Extra", TileArt::solid(5))).is_ok());
+    }
+
+    #[test]
+    fn zones_round_trip() {
+        use crate::selection::Selection;
+        use crate::zone::Zone;
+        let mut w = World::new();
+        let mut z = Zone::new("Old Keep", [10, 20, 30], 1);
+        z.add(&Selection::rect(1, (2, 3), (9, 5)));
+        z.subtract(&Selection::rect(1, (4, 4), (5, 4)));
+        z.visible = false;
+        w.add_zone(z.clone());
+        w.add_zone(Zone::new("Empty", [1, 2, 3], 0));
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let r = read_world(&bytes[..]).unwrap();
+        assert_eq!(r.zones().len(), 2);
+        assert_eq!(r.zones()[0], z);
+        assert_eq!(r.zones()[1].name, "Empty");
     }
 }

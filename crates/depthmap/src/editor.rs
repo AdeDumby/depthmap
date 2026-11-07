@@ -46,6 +46,8 @@ pub enum ToolMode {
     Select,
     /// Eyedropper: click a cell to copy its tile and colour, then go back to the brush.
     Pick,
+    /// Mark out named regions (lasso, or click to grab connected tiles).
+    Zone,
 }
 
 /// How Select picks cells.
@@ -77,6 +79,47 @@ impl SelectKind {
             SelectKind::Matching => "Click: every cell on this layer with the same colour and texture",
         }
     }
+}
+
+/// How the Region tool marks cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoneKind {
+    /// Drag a freehand loop.
+    Lasso,
+    /// Click: the connected cells with the same colour and texture.
+    Connected,
+    /// Click: every cell of this layer with the same colour and texture.
+    SameTiles,
+}
+
+impl ZoneKind {
+    pub const ALL: [ZoneKind; 3] = [ZoneKind::Lasso, ZoneKind::Connected, ZoneKind::SameTiles];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ZoneKind::Lasso => "Lasso",
+            ZoneKind::Connected => "Smart: connected",
+            ZoneKind::SameTiles => "Smart: same tiles",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ZoneKind::Lasso => "Drag a loop around the area (cells whose centre is inside)",
+            ZoneKind::Connected => "Click a tile: grabs the connected tiles of the same kind (click empty floor to fill a room)",
+            ZoneKind::SameTiles => "Click a tile: grabs every tile of that kind on this layer",
+        }
+    }
+}
+
+/// A lasso being dragged. Points are kept in cell units relative to `anchor`
+/// (precise at any zoom) and in screen pixels (for drawing).
+struct LassoDrag {
+    depth: u8,
+    anchor: (i64, i64),
+    cells: Vec<(f64, f64)>,
+    screen: Vec<(f64, f64)>,
+    subtract: bool,
 }
 
 /// Biggest rectangle (in rows) a drag may select.
@@ -142,6 +185,12 @@ pub struct Editor {
     /// What the left mouse button does.
     pub tool: ToolMode,
     pub select_kind: SelectKind,
+    /// The region the Region tool edits (index into `world.zones()`).
+    pub zone_active: Option<usize>,
+    pub zone_kind: ZoneKind,
+    /// Region tool removes instead of adds (Shift flips it for one action).
+    pub zone_subtract: bool,
+    lasso: Option<LassoDrag>,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
 }
@@ -261,6 +310,10 @@ impl Editor {
             node_drag: None,
             tool: ToolMode::Paint,
             select_kind: SelectKind::Rectangle,
+            zone_active: None,
+            zone_kind: ZoneKind::Lasso,
+            zone_subtract: false,
+            lasso: None,
             selection: None,
             select_drag: None,
         }
@@ -318,6 +371,7 @@ impl Editor {
         }
         self.update_shape();
         self.update_node_drag();
+        self.update_lasso(x, y);
     }
 
     pub fn mouse_left_window(&mut self) {
@@ -813,6 +867,177 @@ impl Editor {
         }
     }
 
+    // ---- regions (zones) ----------------------------------------------------
+
+    /// The active region's index, if it still exists.
+    pub fn active_zone(&self) -> Option<usize> {
+        self.zone_active.filter(|&i| i < self.world.zones().len())
+    }
+
+    /// Creates an empty region (named and coloured automatically) and makes it active.
+    pub fn new_zone(&mut self) -> Option<usize> {
+        use depthmap_core::zone::{ZONE_COLORS, Zone};
+        let n = self.world.zones().len();
+        let mut k = n + 1;
+        let name = loop {
+            let c = format!("Region {k}");
+            if !self.world.zones().iter().any(|z| z.name == c) {
+                break c;
+            }
+            k += 1;
+        };
+        let zone = Zone::new(&name, ZONE_COLORS[n % ZONE_COLORS.len()], self.camera.depth);
+        match self.world.add_zone(zone) {
+            Some(i) => {
+                self.zone_active = Some(i);
+                Some(i)
+            }
+            None => {
+                self.status = format!("A map can have at most {} regions", World::MAX_ZONES);
+                None
+            }
+        }
+    }
+
+    pub fn remove_zone(&mut self, index: usize) {
+        if self.world.remove_zone(index) {
+            self.zone_active = match self.zone_active {
+                Some(a) if a == index => None,
+                Some(a) if a > index => Some(a - 1),
+                other => other,
+            };
+        }
+    }
+
+    /// Adds `area` to the active region (creating one if there is none), or
+    /// removes it from there.
+    fn apply_to_zone(&mut self, area: Selection, subtract: bool) {
+        if area.is_empty() {
+            self.status = "Nothing to mark there".into();
+            return;
+        }
+        let index = match self.active_zone() {
+            Some(i) => i,
+            None if subtract => {
+                self.status = "Pick a region to remove from first".into();
+                return;
+            }
+            None => match self.new_zone() {
+                Some(i) => i,
+                None => return,
+            },
+        };
+        let ok = self
+            .world
+            .edit_zone(index, |z| if subtract { z.subtract(&area) } else { z.add(&area) })
+            .unwrap_or(false);
+        if !ok {
+            self.status = "Region too large to combine; zoom out or make it smaller".into();
+            return;
+        }
+        let name = self.world.zones()[index].name.clone();
+        let n = area.cell_count().unwrap_or(0);
+        self.status = format!(
+            "{} {} cells {} \"{name}\"",
+            if subtract { "Removed" } else { "Added" },
+            crate::gui::grouped(n as i64),
+            if subtract { "from" } else { "to" },
+        );
+    }
+
+    /// The current selection becomes part of the active region (or a new one).
+    pub fn zone_from_selection(&mut self) {
+        let Some(sel) = self.selection.clone() else {
+            self.status = "Select something first (Select tool)".into();
+            return;
+        };
+        if sel.is_inverted() {
+            self.status = "A selection of \"everything but...\" cannot become a region".into();
+            return;
+        }
+        let subtract = self.zone_subtract;
+        self.apply_to_zone(sel, subtract);
+    }
+
+    /// Region tool pressed: starts a lasso, or marks tiles straight away.
+    pub fn begin_zone(&mut self, shift: bool) {
+        let Some(cell) = self.cursor_cell() else { return };
+        let Some((sx, sy)) = self.cursor_px else { return };
+        let depth = self.camera.depth;
+        let subtract = self.zone_subtract != shift;
+        match self.zone_kind {
+            ZoneKind::Lasso => {
+                self.lasso = Some(LassoDrag {
+                    depth,
+                    anchor: cell,
+                    cells: Vec::new(),
+                    screen: Vec::new(),
+                    subtract,
+                });
+                self.update_lasso_at(sx, sy, true);
+            }
+            kind => {
+                if !self.world.in_bounds(depth, cell.0, cell.1) {
+                    return;
+                }
+                let found = if kind == ZoneKind::Connected {
+                    region_of_same(&self.world, depth, cell, |_, _| true)
+                } else {
+                    region_of_same_everywhere(&self.world, depth, cell, |_, _| true)
+                };
+                match found {
+                    Ok(rows) => self.apply_to_zone(Selection::from_rows(depth, rows), subtract),
+                    Err(e) => self.status = region_error(e, "mark"),
+                }
+            }
+        }
+    }
+
+    fn update_lasso(&mut self, x: f64, y: f64) {
+        self.update_lasso_at(x, y, false);
+    }
+
+    fn update_lasso_at(&mut self, x: f64, y: f64, force: bool) {
+        let Some(l) = self.lasso.as_mut() else { return };
+        if !force && l.screen.last().is_some_and(|&(px, py)| (px - x).hypot(py - y) < 3.0) {
+            return;
+        }
+        let v = self.camera.at_depth(l.depth);
+        let (vw, vh) = self.viewport;
+        let rel = (
+            (v.cell.0 - l.anchor.0) as f64 + v.frac.0 + (x - vw * 0.5) / v.ppc,
+            (v.cell.1 - l.anchor.1) as f64 + v.frac.1 + (y - vh * 0.5) / v.ppc,
+        );
+        l.cells.push(rel);
+        l.screen.push((x, y));
+    }
+
+    /// Left button released: a finished lasso marks its cells.
+    pub fn end_zone(&mut self) {
+        let Some(mut l) = self.lasso.take() else { return };
+        if let Some((x, y)) = self.cursor_px {
+            self.lasso = Some(l);
+            self.update_lasso_at(x, y, false);
+            l = self.lasso.take().unwrap();
+        }
+        let extent = self.spec().extent(l.depth);
+        match depthmap_core::zone::lasso_rows(l.anchor, &l.cells, extent, MAX_RECT_ROWS) {
+            Ok(rows) if !rows.is_empty() => {
+                self.apply_to_zone(Selection::from_rows(l.depth, rows), l.subtract)
+            }
+            Ok(_) => self.status = "That loop is outside the map".into(),
+            Err(depthmap_core::zone::LassoError::TooSmall) => {
+                self.status = "Drag a loop around the area".into()
+            }
+            Err(depthmap_core::zone::LassoError::TooTall) => self.status = "That loop is too tall".into(),
+        }
+    }
+
+    /// The lasso being drawn, in screen pixels.
+    pub fn lasso_screen(&self) -> Option<&[(f64, f64)]> {
+        self.lasso.as_ref().map(|l| &l.screen[..])
+    }
+
     // ---- pick -----------------------------------------------------------------
 
     /// Copies the tile and colour of the cell under the mouse (at the active
@@ -855,6 +1080,7 @@ impl Editor {
             ToolMode::Pick => {
                 self.pick_at_cursor();
             }
+            ToolMode::Zone => self.begin_zone(shift),
         }
     }
 
@@ -862,6 +1088,7 @@ impl Editor {
     pub fn primary_release(&mut self) {
         self.end_stroke();
         self.end_select();
+        self.end_zone();
     }
 
     /// Right button pressed: inverts the selection while selecting, draws a
@@ -1055,6 +1282,8 @@ impl Editor {
             self.close_node(true);
         } else if self.shape_drag.is_some() {
             self.cancel_shape();
+        } else if self.lasso.is_some() {
+            self.lasso = None;
         } else if self.select_drag.is_some() {
             self.select_drag = None;
         } else if self.selection.is_some() {
@@ -2008,6 +2237,87 @@ mod tests {
             }
         }
         e
+    }
+
+    fn lasso_around(e: &mut Editor, cells: ((i64, i64), (i64, i64)), shift: bool) {
+        let h = e.camera.ppc / 2.0;
+        let ((x0, y0), (x1, y1)) = cells;
+        let (ax, ay) = px(e, x0, y0);
+        let (bx, by) = px(e, x1, y1);
+        let corners = [(ax - h, ay - h), (bx + h, ay - h), (bx + h, by + h), (ax - h, by + h)];
+        e.mouse_moved(corners[0].0, corners[0].1);
+        e.primary_press(shift);
+        for c in &corners[1..] {
+            e.mouse_moved(c.0, c.1);
+        }
+        e.mouse_moved(corners[0].0 + 4.0, corners[0].1 + 4.0);
+        e.primary_release();
+    }
+
+    #[test]
+    fn a_lasso_creates_a_region_and_shift_lasso_removes_from_it() {
+        let mut e = walled();
+        e.tool = ToolMode::Zone;
+        lasso_around(&mut e, ((6, 6), (8, 8)), false);
+        let i = e.active_zone().expect("a region was created and selected");
+        let z = &e.world.zones()[i];
+        assert_eq!(z.area().cell_count(), Some(9), "{}", e.status);
+        assert!(z.contains(0, 6, 6) && z.contains(0, 8, 8) && !z.contains(0, 9, 9));
+        assert!(!e.history.can_undo(), "regions are not part of the paint history");
+        // Shift removes the middle column.
+        lasso_around(&mut e, ((7, 5), (7, 9)), true);
+        let z = &e.world.zones()[i];
+        assert_eq!(z.area().cell_count(), Some(6), "{}", e.status);
+        assert!(!z.contains(0, 7, 7));
+        // A second lasso adds to the same active region.
+        lasso_around(&mut e, ((10, 10), (10, 10)), false);
+        assert_eq!(e.world.zones().len(), 1);
+        assert_eq!(e.world.zones()[i].area().cell_count(), Some(7));
+    }
+
+    #[test]
+    fn smart_marking_grabs_a_room_and_a_region_shows_on_other_depths() {
+        let mut e = walled();
+        e.tool = ToolMode::Zone;
+        e.zone_kind = ZoneKind::Connected;
+        let (x, y) = px(&e, 7, 7);
+        e.mouse_moved(x, y);
+        e.primary_press(false); // empty floor inside the ring
+        e.primary_release();
+        let z = &e.world.zones()[e.active_zone().unwrap()];
+        assert_eq!(z.area().cell_count(), Some(36), "{}", e.status);
+        assert!(z.contains(0, 5, 5) && !z.contains(0, 4, 4), "walls are not part of the room");
+        // Finer layers see it too: depth-1 cells inside (5..10) x4, not in the wall.
+        assert!(z.contains(1, 5 * 4 + 1, 5 * 4 + 2));
+        assert!(!z.contains(1, 4 * 4 + 1, 4 * 4 + 1));
+    }
+
+    #[test]
+    fn the_selection_can_become_a_region_and_esc_cancels_a_lasso() {
+        let mut e = walled();
+        e.tool = ToolMode::Select;
+        e.select_kind = SelectKind::Contiguous;
+        let (x, y) = px(&e, 4, 4);
+        e.mouse_moved(x, y);
+        e.primary_press(false);
+        e.primary_release(); // the whole connected wall ring
+        let n = e.selection().unwrap().cell_count().unwrap();
+        e.zone_from_selection();
+        assert_eq!(e.world.zones().len(), 1);
+        assert_eq!(e.world.zones()[0].area().cell_count(), Some(n));
+        // A lasso in progress is dropped by Esc and marks nothing.
+        e.tool = ToolMode::Zone;
+        let h = e.camera.ppc;
+        let (cx, cy) = px(&e, 7, 7);
+        e.mouse_moved(cx, cy);
+        e.primary_press(false);
+        e.mouse_moved(cx + h, cy);
+        e.mouse_moved(cx + h, cy + h);
+        assert!(e.lasso_screen().is_some());
+        e.escape();
+        e.primary_release();
+        assert!(e.lasso_screen().is_none());
+        assert_eq!(e.world.zones()[0].area().cell_count(), Some(n));
     }
 
     #[test]

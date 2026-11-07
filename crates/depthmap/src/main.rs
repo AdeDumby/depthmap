@@ -23,7 +23,7 @@ depthmap [FILE] [--stress N]
   Ctrl+A select all   Ctrl+D deselect   Ctrl+I invert selection
   Shift+mouse erase    E eraser toggle      Esc cancel shape / node
   N add node, click map   click node edit, drag moves   Del delete open node
-  wheel zoom           WASD / arrows pan    1-9, 0 texture
+  wheel zoom           arrows pan    1-9, 0 texture
   [ ] brush size       Ctrl+Z / Ctrl+Y undo / redo
   Ctrl+N/O/S new / open / save   Ctrl+Shift+S save as   F1 help
 ";
@@ -347,13 +347,12 @@ impl App {
         let pressed = event.state == ElementState::Pressed;
         let ctrl = self.mods.control_key() || self.mods.super_key();
         if let PhysicalKey::Code(code) = event.physical_key {
-            // Physical positions, so WASD means the same place on AZERTY (ZQSD).
+            // Only the arrow keys move the camera; letters are tool shortcuts.
             match code {
-                KeyCode::KeyW | KeyCode::ArrowUp => self.held.up = pressed,
-                // S is the Select tool, so only the arrow key pans down.
+                KeyCode::ArrowUp => self.held.up = pressed,
                 KeyCode::ArrowDown => self.held.down = pressed,
-                KeyCode::KeyA | KeyCode::ArrowLeft if !(ctrl && pressed) => self.held.left = pressed,
-                KeyCode::KeyD | KeyCode::ArrowRight if !(ctrl && pressed) => self.held.right = pressed,
+                KeyCode::ArrowLeft => self.held.left = pressed,
+                KeyCode::ArrowRight => self.held.right = pressed,
                 KeyCode::Space => self.space = pressed,
                 _ => {}
             }
@@ -424,6 +423,7 @@ impl App {
                 "f" | "F" => self.editor.tool = ToolMode::Fill,
                 "s" | "S" => self.editor.tool = ToolMode::Select,
                 "c" | "C" => self.editor.tool = ToolMode::Pick,
+                "r" | "R" => self.editor.tool = ToolMode::Zone,
                 "n" | "N" => {
                     if self.editor.placing_node {
                         self.editor.cancel_placing_node();

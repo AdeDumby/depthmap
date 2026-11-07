@@ -13,7 +13,7 @@ use depthmap_core::{Fill, Icon, MAX_DEPTH, MapSpec, Shape, World};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
 use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
 
-use crate::editor::{Editor, SelectKind, ToolMode, format_zoom};
+use crate::editor::{Editor, SelectKind, ToolMode, ZoneKind, format_zoom};
 use crate::palette::{self, Entry, Palettes};
 use crate::wheel;
 
@@ -87,6 +87,11 @@ pub struct UiLayout {
     pub node_import: Option<egui::Rect>,
     /// Brush, Fill, Select.
     pub tool_buttons: Vec<egui::Rect>,
+    pub zone_kinds: Vec<egui::Rect>,
+    pub zone_new: Option<egui::Rect>,
+    pub zone_from_selection: Option<egui::Rect>,
+    pub zone_names: Vec<egui::Rect>,
+    pub zone_deletes: Vec<egui::Rect>,
     pub select_kinds: Vec<egui::Rect>,
     pub select_all: Option<egui::Rect>,
     pub select_invert: Option<egui::Rect>,
@@ -165,6 +170,11 @@ pub struct UiState {
     pub show_zoom: bool,
     /// The colour wheel and palettes window.
     pub show_colors: bool,
+    /// The Regions window.
+    pub show_regions: bool,
+    /// Draw the regions over the map.
+    pub show_zones: bool,
+    last_tool: ToolMode,
     show_help: bool,
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
@@ -219,6 +229,9 @@ impl UiState {
             show_tools: true,
             show_zoom: true,
             show_colors: true,
+            show_regions: false,
+            show_zones: true,
+            last_tool: ToolMode::Paint,
             show_help: false,
             show_about: false,
             confirm: None,
@@ -567,7 +580,23 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         l.swatches.clear();
         l.palette_entries.clear();
     }
+    if ed.tool != st.last_tool {
+        st.last_tool = ed.tool;
+        if ed.tool == ToolMode::Zone {
+            st.show_regions = true;
+        }
+    }
+    zones_layer(ctx, ed, st);
     selection_layer(ctx, ed);
+    if st.show_regions {
+        regions_window(ctx, ed, st);
+    } else {
+        let l = &mut st.layout;
+        (l.zone_new, l.zone_from_selection) = (None, None);
+        l.zone_kinds.clear();
+        l.zone_names.clear();
+        l.zone_deletes.clear();
+    }
     nodes_layer(ctx, ed, st);
     dialogs(ctx, ed, st);
     node_popup(ctx, ed, st);
@@ -657,6 +686,7 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.checkbox(&mut ed.show_nodes, "Show nodes");
                 ui.checkbox(&mut st.show_tools, "Textures & tools panel");
                 ui.checkbox(&mut st.show_colors, "Colors window");
+                ui.checkbox(&mut st.show_regions, "Regions window");
                 ui.checkbox(&mut st.show_zoom, "Zoom panel");
                 ui.separator();
                 if item(ui, "Zoom in", "") {
@@ -1115,6 +1145,7 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
             (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
             (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
+            (ToolMode::Zone, "Region", "Region (R): mark out named places with a lasso or by clicking tiles"),
             (ToolMode::Pick, "Pick", "Pick (C): click a cell to copy its tile and colour, then go back to the brush"),
         ] {
             let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
@@ -1157,6 +1188,9 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 }
             });
         }
+        ToolMode::Zone => {
+            ui.label(RichText::new(format!("{}. Shift flips add / remove. See the Regions window.", ed.zone_kind.hint())).weak().small());
+        }
         ToolMode::Pick => {
             ui.label(RichText::new("Click a cell: copies its tile and colour, then switches to the brush").weak().small());
         }
@@ -1181,18 +1215,36 @@ fn selection_layer(ctx: &egui::Context, ed: &Editor) {
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
     }
     let preview = ed.select_preview();
-    if ed.selection().is_none() && preview.is_none() {
-        return;
-    }
     let ppp = ctx.pixels_per_point();
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("selection")))
         .with_clip_rect(ctx.content_rect());
+    if let Some(pts) = ed.lasso_screen().filter(|p| p.len() > 1) {
+        let colour = ed
+            .active_zone()
+            .map_or(Color32::from_rgb(255, 214, 90), |i| {
+                let c = ed.world.zones()[i].color;
+                Color32::from_rgb(c[0], c[1], c[2])
+            });
+        let line: Vec<egui::Pos2> = pts.iter().map(|&(x, y)| egui::pos2(x as f32 / ppp, y as f32 / ppp)).collect();
+        painter.add(egui::Shape::line(line.clone(), Stroke::new(3.5, Color32::from_black_alpha(160))));
+        painter.add(egui::Shape::line(line.clone(), Stroke::new(2.0, colour)));
+        // The loop closes back to its start when released.
+        painter.add(egui::Shape::dashed_line(
+            &[*line.last().unwrap(), line[0]],
+            Stroke::new(1.5, colour),
+            6.0,
+            4.0,
+        ));
+    }
+    if ed.selection().is_none() && preview.is_none() {
+        return;
+    }
     if let Some(s) = ed.selection() {
-        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(90, 190, 255));
+        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(90, 190, 255), 56);
     }
     if let Some(s) = &preview {
-        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(255, 214, 90));
+        draw_selection(&painter, ed, s, ppp, Color32::from_rgb(255, 214, 90), 56);
     }
 }
 
@@ -1202,7 +1254,8 @@ fn draw_selection(
     sel: &depthmap_core::Selection,
     ppp: f32,
     colour: Color32,
-) {
+    fill_alpha: u8,
+) -> Option<egui::Pos2> {
     use depthmap_core::selection::spans_subtract;
     /// Enough for any sane selection; keeps a pathological one from stalling the frame.
     const MAX_SHAPES: usize = 20_000;
@@ -1218,14 +1271,21 @@ fn draw_selection(
         let (x, y) = v.cell_origin_px(cx, cy, vw, vh);
         egui::pos2(x as f32 / ppp, y as f32 / ppp)
     };
-    let fill = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 56);
+    let fill = Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), fill_alpha);
     let mut lines: Vec<[egui::Pos2; 2]> = Vec::new();
+    // Where a label fits best: the widest span of the biggest visible block.
+    let mut best: Option<(f64, egui::Pos2)> = None;
     for (i, b) in blocks.iter().enumerate() {
         if lines.len() > MAX_SHAPES {
             break;
         }
         for &(a, c) in &b.spans {
-            painter.rect_filled(egui::Rect::from_two_pos(at(a, b.y0), at(c + 1, b.y1 + 1)), 0.0, fill);
+            let r = egui::Rect::from_two_pos(at(a, b.y0), at(c + 1, b.y1 + 1));
+            let score = r.width() as f64 * r.height().min(60.0) as f64;
+            if best.is_none_or(|(s, _)| score > s) {
+                best = Some((score, r.center()));
+            }
+            painter.rect_filled(r, 0.0, fill);
             lines.push([at(a, b.y0), at(a, b.y1 + 1)]);
             lines.push([at(c + 1, b.y0), at(c + 1, b.y1 + 1)]);
         }
@@ -1248,6 +1308,142 @@ fn draw_selection(
     for l in &lines {
         painter.line_segment(*l, Stroke::new(1.5, colour));
     }
+    best.map(|(_, p)| p)
+}
+
+/// Draws every visible region: tinted fill, outline and name. Regions of
+/// any depth show at the camera's depth, so a boundary drawn on one layer
+/// appears on all of them.
+fn zones_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
+    if !st.show_zones || ed.world.zones().is_empty() {
+        return;
+    }
+    let ppp = ctx.pixels_per_point();
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("zones")))
+        .with_clip_rect(ctx.content_rect());
+    let active = ed.active_zone();
+    for (i, z) in ed.world.zones().iter().enumerate() {
+        if !z.visible || z.is_empty() {
+            continue;
+        }
+        let c = Color32::from_rgb(z.color[0], z.color[1], z.color[2]);
+        let alpha = if Some(i) == active && ed.tool == ToolMode::Zone { 120 } else { 84 };
+        if let Some(at) = draw_selection(&painter, ed, z.area(), ppp, c, alpha) {
+            if ctx.content_rect().contains(at) {
+                let font = egui::FontId::proportional(15.0);
+                for d in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                    painter.text(at + egui::vec2(d.0, d.1), egui::Align2::CENTER_CENTER, &z.name, font.clone(), Color32::from_black_alpha(220));
+                }
+                painter.text(at, egui::Align2::CENTER_CENTER, &z.name, font, Color32::WHITE);
+            }
+        }
+    }
+}
+
+/// The Regions window: how to mark cells, and the list of regions.
+fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    use depthmap_core::zone::MAX_ZONE_NAME;
+    let mut open = true;
+    st.layout.zone_kinds.clear();
+    st.layout.zone_names.clear();
+    st.layout.zone_deletes.clear();
+    st.layout.zone_new = None;
+    st.layout.zone_from_selection = None;
+    egui::Window::new("Regions")
+        .open(&mut open)
+        .default_pos(egui::pos2(290.0, 60.0))
+        .default_width(260.0)
+        .show(ctx, |ui| {
+            ui.checkbox(&mut st.show_zones, "Show regions on the map");
+            ui.separator();
+            ui.label(RichText::new("Mark with").strong());
+            ui.horizontal_wrapped(|ui| {
+                for kind in ZoneKind::ALL {
+                    let r = ui.selectable_label(ed.zone_kind == kind, kind.name()).on_hover_text(kind.hint());
+                    st.layout.zone_kinds.push(r.rect);
+                    if r.clicked() {
+                        ed.zone_kind = kind;
+                        ed.tool = ToolMode::Zone;
+                    }
+                }
+            });
+            ui.label(RichText::new(ed.zone_kind.hint()).weak().small());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut ed.zone_subtract, false, "Add");
+                ui.selectable_value(&mut ed.zone_subtract, true, "Remove");
+                ui.label(RichText::new("(Shift flips)").weak().small());
+            });
+            ui.horizontal(|ui| {
+                let new = ui.button("+ New region").on_hover_text("An empty region; then mark cells");
+                st.layout.zone_new = Some(new.rect);
+                if new.clicked() {
+                    ed.new_zone();
+                    ed.tool = ToolMode::Zone;
+                }
+                let from = ui
+                    .add_enabled(ed.has_selection(), egui::Button::new("Selection to region"))
+                    .on_hover_text("Add (or remove) the current selection to the active region");
+                st.layout.zone_from_selection = Some(from.rect);
+                if from.clicked() {
+                    ed.zone_from_selection();
+                }
+            });
+            ui.separator();
+            if ed.world.zones().is_empty() {
+                ui.label(RichText::new("No regions yet. Press + New region, or just drag a lasso.").weak());
+            }
+            let active = ed.active_zone();
+            let mut remove = None;
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for i in 0..ed.world.zones().len() {
+                    let (name, color, visible) = {
+                        let z = &ed.world.zones()[i];
+                        (z.name.clone(), z.color, z.visible)
+                    };
+                    ui.horizontal(|ui| {
+                        let mut rgb = color;
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            ed.world.edit_zone(i, |z| z.color = rgb);
+                        }
+                        let mut vis = visible;
+                        if ui.checkbox(&mut vis, "").on_hover_text("Show / hide").changed() {
+                            ed.world.edit_zone(i, |z| z.visible = vis);
+                        }
+                        let label = ui.selectable_label(active == Some(i), &name).on_hover_text("Make this the region being edited");
+                        st.layout.zone_names.push(label.rect);
+                        if label.clicked() {
+                            ed.zone_active = Some(i);
+                        }
+                        let del = ui.small_button("X").on_hover_text("Delete this region");
+                        st.layout.zone_deletes.push(del.rect);
+                        if del.clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                ed.remove_zone(i);
+            }
+            if let Some(i) = ed.active_zone() {
+                ui.separator();
+                let mut name = ed.world.zones()[i].name.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
+                        let n: String = name.chars().take(MAX_ZONE_NAME).collect();
+                        ed.world.edit_zone(i, |z| z.name = n);
+                    }
+                });
+                let z = &ed.world.zones()[i];
+                let size = z.area().cell_count().map_or(String::new(), |n| {
+                    format!("{} cells at depth {}", grouped(n as i64), z.depth())
+                });
+                ui.label(RichText::new(size).weak().small());
+            }
+        });
+    st.show_regions = open;
 }
 
 /// The colour wheel, hex field, map colours and palettes.
@@ -2155,7 +2351,8 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Left mouse", "Paint with the selected texture and color"),
                         ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
                         ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("B / F / S / C", "Brush / Fill / Select / Pick tool"),
+                        ("B / F / S / C / R", "Brush / Fill / Select / Pick / Region tool"),
+                        ("Region tool", "Lasso a place (or click tiles) to mark it; Shift removes; regions show on every depth"),
                         ("Pick tool (click)", "Copy the tile and colour of the clicked cell, then switch to the brush"),
                         ("Fill tool (click)", "Fill the connected area of identical cells (Shift erases it)"),
                         ("Select tool", "Drag a rectangle, or click to pick connected / same tiles; each new selection adds"),
@@ -2168,7 +2365,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         ("Delete", "Delete the node whose popup is open"),
                         ("Middle mouse / Space + drag", "Pan"),
                         ("Mouse wheel", "Zoom (deeper zoom = finer layer)"),
-                        ("W A D / arrow keys", "Pan (physical key positions; S is the Select tool)"),
+                        ("Arrow keys", "Pan"),
                         ("1 - 9, 0", "Pick texture"),
                         ("[  ]", "Brush size"),
                         ("Ctrl+Z / Ctrl+Y", "Undo / redo"),

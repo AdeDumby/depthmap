@@ -12,6 +12,7 @@ use crate::node::{Icon, Node, NodeId};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
 use crate::tile::CustomTile;
+use crate::zone::Zone;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
 /// Source of chunk version stamps. Global rather than per-world on purpose:
@@ -55,6 +56,7 @@ pub struct World {
     /// User-drawn tiles, indexed by texture id (`TEXTURE_COUNT + 1..=MAX_TEXTURES`).
     tiles: Vec<Option<CustomTile>>,
     tiles_version: u64,
+    zones: Vec<Zone>,
 }
 
 impl Default for World {
@@ -81,6 +83,43 @@ impl World {
             custom_icons: BTreeMap::new(),
             tiles: vec![None; MAX_TEXTURES as usize + 1],
             tiles_version: crate::colors::next_version(),
+            zones: Vec::new(),
+        }
+    }
+
+    // ---- zones (named regions) -------------------------------------------------
+
+    pub const MAX_ZONES: usize = 64;
+
+    pub fn zones(&self) -> &[Zone] {
+        &self.zones
+    }
+
+    /// Adds a zone; returns its index, or `None` when there are too many.
+    pub fn add_zone(&mut self, zone: Zone) -> Option<usize> {
+        if self.zones.len() >= Self::MAX_ZONES {
+            return None;
+        }
+        self.zones.push(zone);
+        self.clock += 1;
+        Some(self.zones.len() - 1)
+    }
+
+    /// Edits a zone in place (marks the map as changed).
+    pub fn edit_zone<R>(&mut self, index: usize, f: impl FnOnce(&mut Zone) -> R) -> Option<R> {
+        let z = self.zones.get_mut(index)?;
+        let r = f(z);
+        self.clock += 1;
+        Some(r)
+    }
+
+    pub fn remove_zone(&mut self, index: usize) -> bool {
+        if index < self.zones.len() {
+            self.zones.remove(index);
+            self.clock += 1;
+            true
+        } else {
+            false
         }
     }
 

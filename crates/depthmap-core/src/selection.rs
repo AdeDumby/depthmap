@@ -261,6 +261,26 @@ impl Selection {
         true
     }
 
+    /// Removes `other` from this selection. Only for ordinary (non-inverted)
+    /// selections; returns false, changing nothing, otherwise or when the
+    /// result would be too large to store.
+    pub fn subtract(&mut self, other: &Selection) -> bool {
+        if self.inverted || other.inverted {
+            return false;
+        }
+        let depth = self.depth.max(other.depth);
+        let (Some(a), Some(b)) = (self.rebased(depth), other.rebased(depth)) else {
+            return false;
+        };
+        *self = Selection { depth, rows: combine(&a.rows, &b.rows, spans_subtract), inverted: false };
+        true
+    }
+
+    /// The stored rows of an ordinary selection (for saving).
+    pub fn rows(&self) -> &Rows {
+        &self.rows
+    }
+
     /// The selected runs of row `y` within `lo..=hi`.
     pub fn row_spans(&self, y: i64, lo: i64, hi: i64) -> Spans {
         let base = self.rows.get(&y).map_or(&[][..], |s| &s[..]);

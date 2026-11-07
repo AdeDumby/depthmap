@@ -1,7 +1,7 @@
 //! UI behaviour (clicks on real widgets, no GPU needed) plus an offscreen
 //! render of the whole interface. Set `DEPTHMAP_PNG_DIR` to dump screenshots.
 
-use depthmap::editor::Editor;
+use depthmap::editor::{Editor, ToolMode};
 use depthmap::gui::{Command, Gui, UiState, draw, setup_style};
 use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::texture::TEXTURE_COUNT;
@@ -395,6 +395,18 @@ fn full_window_renders_map_and_interface() {
     ed.set_brush_rgb(DEFAULT_COLORS[3]);
     ed.brush_half = 1;
 
+    {
+        use depthmap_core::selection::Selection;
+        use depthmap_core::zone::{ZONE_COLORS, Zone};
+        let mut keep = Zone::new("Wandering Bear Tavern", ZONE_COLORS[0], 0);
+        keep.add(&Selection::rect(0, (-8, -5), (2, 4)));
+        ed.world.add_zone(keep);
+        let mut pond = Zone::new("Marsh", ZONE_COLORS[1], 0);
+        pond.add(&Selection::rect(0, (3, 1), (7, 4)));
+        ed.world.add_zone(pond);
+        ed.zone_active = Some(0);
+        ed.tool = ToolMode::Zone;
+    }
     let screen = Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32));
     let view = gpu.target.create_view(&Default::default());
     // The first frames only size the windows; every frame's texture updates
@@ -735,7 +747,7 @@ fn key(k: egui::Key, pressed: bool) -> Event {
 fn tool_buttons_switch_tools_and_select_controls_work() {
     use depthmap::editor::{SelectKind, ToolMode};
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.tool_buttons.len(), 4);
+    assert_eq!(h.st.layout.tool_buttons.len(), 5);
     assert_eq!(h.ed.tool, ToolMode::Paint);
     assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
 
@@ -1131,4 +1143,32 @@ fn drawing_a_tile_and_saving_it_adds_it_to_the_map_and_selects_it() {
     // It now appears in the texture grid after the built-ins.
     h.frame(vec![]);
     assert_eq!(h.st.layout.textures.len(), TEXTURE_COUNT as usize + 1);
+}
+
+#[test]
+fn regions_window_creates_renames_recolours_and_deletes_regions() {
+    let mut h = Harness::new();
+    h.ed.tool = ToolMode::Zone;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.show_regions, "choosing the Region tool opens its window");
+    let new = h.st.layout.zone_new.expect("New region button");
+    h.click(new.center());
+    h.click(h.st.layout.zone_new.unwrap().center());
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.zones().len(), 2);
+    assert_eq!(h.ed.active_zone(), Some(1));
+    assert_eq!(h.st.layout.zone_names.len(), 2);
+    h.click(h.st.layout.zone_names[0].center());
+    assert_eq!(h.ed.active_zone(), Some(0));
+    h.click(h.st.layout.zone_deletes[0].center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.zones().len(), 1);
+    assert_eq!(h.ed.active_zone(), None, "the deleted active region is gone");
+    // Closing the window hides its controls.
+    h.st.show_regions = false;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.layout.zone_new.is_none());
 }
