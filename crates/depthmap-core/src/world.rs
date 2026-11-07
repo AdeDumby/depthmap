@@ -185,6 +185,20 @@ impl World {
             .sum()
     }
 
+    /// Colour indices that at least one cell (of any depth) is drawn with,
+    /// in table order.
+    pub fn used_colors(&self) -> Vec<u8> {
+        let mut used = [false; 256];
+        for chunk in self.layers.iter().flat_map(|l| l.values()) {
+            for &c in chunk.cells() {
+                if crate::chunk::cell_texture(c) != 0 {
+                    used[crate::chunk::cell_color(c) as usize] = true;
+                }
+            }
+        }
+        (0..=255u8).filter(|&i| used[i as usize]).collect()
+    }
+
     /// Removes a custom tile. The cells that used it stay, drawn as nothing.
     pub fn remove_tile(&mut self, id: u8) -> bool {
         match self.tiles.get_mut(id as usize) {
@@ -464,6 +478,21 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn used_colors_lists_only_colours_cells_use() {
+        let mut w = World::with_spec(MapSpec::new(64, 64, 2));
+        assert!(w.used_colors().is_empty());
+        w.set(0, 1, 1, crate::make_cell(3, 5));
+        w.set(1, 9, 9, crate::make_cell(3, 2));
+        w.set(0, 2, 2, crate::make_cell(3, 5));
+        assert_eq!(w.used_colors(), vec![2, 5]);
+        w.set(0, 1, 1, 0);
+        w.set(0, 2, 2, 0);
+        assert_eq!(w.used_colors(), vec![2], "erased cells stop counting");
+        w.colors.index_of([7, 7, 7]);
+        assert_eq!(w.used_colors(), vec![2], "table colours nothing uses are not listed");
+    }
 
     #[test]
     fn changing_the_depth_adds_layers_or_deletes_the_deeper_ones() {

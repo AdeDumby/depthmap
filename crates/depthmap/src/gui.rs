@@ -175,6 +175,9 @@ pub struct UiState {
     /// Draw the regions over the map.
     pub show_zones: bool,
     last_tool: ToolMode,
+    /// Colours the map's cells use, refreshed when the map changes.
+    used_colors: Vec<u8>,
+    used_colors_key: Option<(u64, u64)>,
     show_help: bool,
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
@@ -232,6 +235,8 @@ impl UiState {
             show_regions: false,
             show_zones: true,
             last_tool: ToolMode::Paint,
+            used_colors: Vec::new(),
+            used_colors_key: None,
             show_help: false,
             show_about: false,
             confirm: None,
@@ -675,19 +680,12 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         ed.clear_selection();
                     }
                 });
-                ui.separator();
-                if item(ui, "Add node", "N") {
-                    ed.start_placing_node();
-                }
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut st.show_grid, "Show grid");
                 ui.checkbox(&mut st.show_checker, "Checker overlay (darken every other cell)");
                 ui.checkbox(&mut ed.show_nodes, "Show nodes");
-                ui.checkbox(&mut st.show_tools, "Textures & tools panel");
-                ui.checkbox(&mut st.show_colors, "Colors window");
-                ui.checkbox(&mut st.show_regions, "Regions window");
-                ui.checkbox(&mut st.show_zoom, "Zoom panel");
+                ui.checkbox(&mut st.show_zones, "Show regions on the map");
                 ui.separator();
                 if item(ui, "Zoom in", "") {
                     ed.zoom_centre(2.0);
@@ -701,6 +699,12 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 if item(ui, "Reset view", "") {
                     ed.reset_view();
                 }
+            });
+            ui.menu_button("Pages", |ui| {
+                ui.checkbox(&mut st.show_tools, "Textures & tools");
+                ui.checkbox(&mut st.show_zoom, "Zoom");
+                ui.checkbox(&mut st.show_colors, "Colors");
+                ui.checkbox(&mut st.show_regions, "Regions");
             });
             ui.menu_button("Help", |ui| {
                 if item(ui, "Controls", "F1") {
@@ -1479,7 +1483,16 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     picker_section(ui, ed, st);
                     ui.separator();
                     ui.label(RichText::new("Map colors").strong());
-                    let colors: Vec<[u8; 3]> = ed.world.colors.as_slice().to_vec();
+                    // Only colours some cell is drawn with; updates as the map changes.
+                    let key = (ed.world.revision(), ed.world.colors.version());
+                    if st.used_colors_key != Some(key) {
+                        st.used_colors_key = Some(key);
+                        st.used_colors = ed.world.used_colors();
+                    }
+                    let colors: Vec<[u8; 3]> = st.used_colors.iter().map(|&i| ed.world.colors.get(i)).collect();
+                    if colors.is_empty() {
+                        ui.label(RichText::new("The colors you paint with appear here").weak().small());
+                    }
                     egui::Grid::new("swatches").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
                         for (i, rgb) in colors.iter().enumerate() {
                             let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());

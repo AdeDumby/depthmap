@@ -76,13 +76,40 @@ fn clicking_a_texture_selects_it() {
     }
 }
 
+/// Paints one cell per colour index so those colours appear in "Map colors".
+fn paint_colours(h: &mut Harness, indices: std::ops::RangeInclusive<usize>) {
+    for i in indices {
+        h.ed.world.set(0, i as i64, 0, make_cell(2, i as u8));
+    }
+    h.frame(vec![]);
+    h.frame(vec![]);
+}
+
+#[test]
+fn map_colors_list_follows_the_cells_on_the_map() {
+    let mut h = Harness::new();
+    assert!(h.st.layout.swatches.is_empty(), "a fresh map uses no colours yet");
+    paint_colours(&mut h, 3..=4);
+    assert_eq!(h.st.layout.swatches.len(), 2);
+    h.ed.world.set(0, 3, 0, depthmap_core::EMPTY);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.swatches.len(), 1, "an erased colour leaves the list");
+    // Region colours never enter the map's colour table.
+    let n = h.ed.world.colors.len();
+    h.ed.new_zone();
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.colors.len(), n);
+}
+
 #[test]
 fn clicking_a_swatch_sets_the_brush_colour() {
     let mut h = Harness::new();
-    let rect = h.st.layout.swatches[5];
+    paint_colours(&mut h, 1..=10);
+    let rect = h.st.layout.swatches[4]; // the 5th colour used = table index 5
     h.click(rect.center());
     assert_eq!(h.ed.brush_rgb, DEFAULT_COLORS[5]);
-    let rect = h.st.layout.swatches[10];
+    let rect = h.st.layout.swatches[9];
     h.click(rect.center());
     assert_eq!(h.ed.brush_rgb, DEFAULT_COLORS[10]);
     // Choosing colours alone never grows the colour table.
@@ -847,7 +874,8 @@ fn hex_field_follows_the_brush_and_accepts_typed_colours() {
     h.frame(vec![]);
     assert_eq!(h.st.hex_text(), "#12abef");
     // Selecting a swatch updates the text and the wheel's brightness.
-    h.click(h.st.layout.swatches[1].center());
+    paint_colours(&mut h, 1..=3);
+    h.click(h.st.layout.swatches[0].center());
     assert_eq!(h.st.hex_text(), format!("#{:02x}{:02x}{:02x}", 34, 34, 38));
 
     // Type a new colour: focus the field, select all, type.
