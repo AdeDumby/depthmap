@@ -32,6 +32,8 @@ pub enum Command {
     SaveAs,
     /// Pick PNG files with a dialog and import them as node icons.
     ImportIcons,
+    /// Pick a PNG file with a dialog, then export the map image into it.
+    ExportImage(crate::export::ExportOptions),
     Quit,
 }
 
@@ -59,6 +61,7 @@ impl RecentEntry {
 /// tests and tooling click on real widgets instead of guessing coordinates.
 #[derive(Default, Clone, Debug)]
 pub struct UiLayout {
+    pub export_button: Option<egui::Rect>,
     pub textures: Vec<egui::Rect>,
     pub tile_new: Option<egui::Rect>,
     pub tile_edit: Option<egui::Rect>,
@@ -180,6 +183,10 @@ pub struct UiState {
     pub show_routes: bool,
     /// Draw the routes over the map.
     pub show_route_lines: bool,
+    /// The Export image window, with the options being edited.
+    pub export_dialog: Option<crate::export::ExportOptions>,
+    /// Options of the last export, offered again next time.
+    pub last_export: Option<crate::export::ExportOptions>,
     last_tool: ToolMode,
     /// Colours the map's cells use, refreshed when the map changes.
     used_colors: Vec<u8>,
@@ -245,6 +252,8 @@ impl UiState {
             show_zones: true,
             show_routes: false,
             show_route_lines: true,
+            export_dialog: None,
+            last_export: None,
             last_tool: ToolMode::Paint,
             used_colors: Vec::new(),
             used_colors_key: None,
@@ -443,6 +452,19 @@ impl UiState {
         }
     }
 
+    /// Opens the Export image window (with the last options, if any).
+    pub fn open_export(&mut self, ed: &Editor) {
+        let max = ed.spec().max_depth;
+        let mut o = self
+            .last_export
+            .unwrap_or_else(|| crate::export::ExportOptions::new(ed.camera.depth));
+        o.depth = o.depth.min(max);
+        if !ed.spec().is_bounded() {
+            o.area = crate::export::ExportArea::View;
+        }
+        self.export_dialog = Some(o);
+    }
+
     /// Opens the New Map dialog with the default size.
     pub fn open_new_map(&mut self) {
         self.new_map = Some(NewMapForm::default());
@@ -632,6 +654,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         st.layout.route_deletes.clear();
     }
     nodes_layer(ctx, ed, st);
+    export_window(ctx, ed, st);
     dialogs(ctx, ed, st);
     node_popup(ctx, ed, st);
     startup_window(ctx, st, modal);
@@ -674,6 +697,9 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     st.request(Command::SaveAs, ed.modified());
                 }
                 ui.separator();
+                if item(ui, "Export image...", "Ctrl+E") {
+                    st.open_export(ed);
+                }
                 if item(ui, "Import PNG icons...", "") {
                     st.request(Command::ImportIcons, false);
                 }
@@ -2388,6 +2414,91 @@ pub fn grouped(n: i64) -> String {
 }
 
 /// The Map depth dialog: add or remove zoom levels of the open map.
+/// Regions, routes and nodes as drawn over the map (also used by the image
+/// export, which draws them onto its own texture).
+pub fn draw_map_overlays(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    zones_layer(ctx, ed, st);
+    routes_layer(ctx, ed, st);
+    nodes_layer(ctx, ed, st);
+}
+
+fn export_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    use crate::export::{ExportArea, MAX_PX_PER_CELL, MIN_PX_PER_CELL, plan};
+    st.layout.export_button = None;
+    let Some(mut o) = st.export_dialog else { return };
+    let (mut go, mut close) = (false, ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+    let bounded = ed.spec().is_bounded();
+    egui::Window::new("Export image")
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label("Area");
+            for a in ExportArea::ALL {
+                let enabled = a != ExportArea::WholeMap || bounded;
+                ui.add_enabled_ui(enabled, |ui| ui.radio_value(&mut o.area, a, a.name()));
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Layer (depth)");
+                ui.add(egui::DragValue::new(&mut o.depth).range(0..=ed.spec().max_depth).speed(0.1));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Pixels per cell");
+                ui.add(
+                    egui::DragValue::new(&mut o.px_per_cell)
+                        .range(MIN_PX_PER_CELL..=MAX_PX_PER_CELL)
+                        .speed(0.5),
+                );
+                for p in [8, 16, 32, 64] {
+                    if ui.small_button(p.to_string()).clicked() {
+                        o.px_per_cell = p;
+                    }
+                }
+            });
+            ui.label(RichText::new("32 is the tiles' own size; 64 is sharper.").weak());
+            ui.add_space(4.0);
+            ui.label("Draw on top");
+            ui.checkbox(&mut o.regions, "Regions (tint, outline, names)");
+            ui.checkbox(&mut o.routes, "Routes");
+            ui.checkbox(&mut o.nodes, "Nodes (icons and names)");
+            ui.checkbox(&mut o.grid, "Grid lines");
+            ui.checkbox(&mut o.parent_layer, "Faded layer above");
+            ui.add_space(6.0);
+            let result = plan(ed, &o);
+            match &result {
+                Ok(p) => {
+                    ui.label(format!(
+                        "Image: {} \u{d7} {} px  ({:.1} MB uncompressed)",
+                        p.size_px.0,
+                        p.size_px.1,
+                        p.megabytes()
+                    ));
+                }
+                Err(e) => {
+                    ui.colored_label(Color32::from_rgb(230, 90, 80), e);
+                }
+            }
+            ui.horizontal(|ui| {
+                let b = ui.add_enabled(result.is_ok(), egui::Button::new("Export..."));
+                st.layout.export_button = Some(b.rect);
+                go = b.clicked();
+                close |= ui.button("Cancel").clicked();
+            });
+        });
+    st.export_dialog = Some(o);
+    if go {
+        st.last_export = Some(o);
+        st.export_dialog = None;
+        st.request(Command::ExportImage(o), false);
+    } else if close {
+        st.last_export = Some(o);
+        st.export_dialog = None;
+    }
+}
+
 fn depth_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.depth_minus = None;
     st.layout.depth_plus = None;

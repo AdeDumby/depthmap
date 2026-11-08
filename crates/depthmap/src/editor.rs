@@ -1323,6 +1323,11 @@ impl Editor {
         self.selection.as_ref()
     }
 
+    /// Replaces the selection (used by tests and scripts).
+    pub fn set_selection(&mut self, s: Option<Selection>) {
+        self.selection = s;
+    }
+
     pub fn has_selection(&self) -> bool {
         self.selection.is_some()
     }

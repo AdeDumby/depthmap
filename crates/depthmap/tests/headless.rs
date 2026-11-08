@@ -585,3 +585,66 @@ fn overhang_spills_outside_and_rotates_to_face_the_forest() {
     let (x, y) = corner((1, -1));
     assert!(near(px(&img, x + 16, y + 29), water, 3), "its own north edge");
 }
+
+#[test]
+fn export_renders_the_chosen_area_at_the_chosen_scale() {
+    use depthmap::editor::Editor;
+    use depthmap::export::{ExportArea, ExportOptions, render};
+    use depthmap_core::selection::Selection;
+    use depthmap_core::zone::Zone;
+
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    // 8x6 cells at depth 0 (16x... at depth 1); paint two depth-0 cells.
+    let mut ed = Editor::with_spec(MapSpec::new(8, 6, 1));
+    ed.resize(800.0, 600.0);
+    ed.world.set(0, 2, 1, make_cell(1, 5));
+    ed.world.set(0, 7, 5, make_cell(1, 9));
+    let mut o = ExportOptions::new(0);
+    o.px_per_cell = 16;
+    o.grid = false;
+    o.regions = false;
+    o.routes = false;
+    o.nodes = false;
+
+    let (w, h, img) = render(&mut ed, &o, 0.4, &gpu.device, &gpu.queue).unwrap();
+    assert_eq!((w, h), (128, 96));
+    assert_eq!(img.len(), 128 * 96 * 4);
+    let at = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [img[i], img[i + 1], img[i + 2]]
+    };
+    assert!(near(at(2 * 16 + 8, 16 + 8), color(5), 3), "{:?}", at(40, 24));
+    assert!(near(at(7 * 16 + 8, 5 * 16 + 8), color(9), 3), "{:?}", at(120, 88));
+    assert!(near(at(8, 8), [230, 222, 204], 4), "empty cell is parchment: {:?}", at(8, 8));
+
+    // The editor is left exactly as it was.
+    assert_eq!(ed.viewport, (800.0, 600.0));
+
+    // A selection exports just its box, at twice the scale if asked.
+    ed.set_selection(Some(Selection::rect(0, (2, 1), (3, 2))));
+    o.area = ExportArea::Selection;
+    o.px_per_cell = 32;
+    let (w, h, img) = render(&mut ed, &o, 0.4, &gpu.device, &gpu.queue).unwrap();
+    assert_eq!((w, h), (64, 64));
+    let i = ((16 * w + 16) * 4) as usize;
+    assert!(near([img[i], img[i + 1], img[i + 2]], color(5), 3));
+
+    // Regions are drawn over the tiles when switched on.
+    ed.set_selection(None);
+    o.area = ExportArea::WholeMap;
+    o.px_per_cell = 16;
+    let mut zone = Zone::new("Marsh", [255, 0, 0], 0);
+    zone.add(&Selection::rect(0, (0, 0), (7, 5)));
+    ed.world.add_zone(zone);
+    let (_, _, plain) = render(&mut ed, &o, 0.4, &gpu.device, &gpu.queue).unwrap();
+    o.regions = true;
+    let (_, _, tinted) = render(&mut ed, &o, 0.4, &gpu.device, &gpu.queue).unwrap();
+    assert!(max_diff(&plain, &tinted) > 20, "the region tint should change the picture");
+    if let Ok(dir) = std::env::var("DEPTHMAP_PNG_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        depthmap::export::write_png(&std::path::Path::new(&dir).join("export.png"), 128, 96, &tinted).unwrap();
+    }
+}

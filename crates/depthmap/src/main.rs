@@ -258,6 +258,29 @@ impl App {
                     self.editor.import_icons(&paths);
                 }
             }
+            Command::ExportImage(opts) => {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Export map image")
+                    .add_filter("PNG image", &["png"])
+                    .set_file_name(self.editor.file_name_for_dialog().replace(".dmap", ".png"));
+                if let Some(dir) = self.dialog_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(mut path) = dialog.save_file() {
+                    if path.extension().is_none() {
+                        path.set_extension("png");
+                    }
+                    if let Some(g) = self.gfx.as_ref() {
+                        self.editor.status = "Exporting...".into();
+                        let ghost = g.gui.state.ghost_opacity;
+                        self.editor.status = match depthmap::export::export_png(
+                            &mut self.editor, &opts, ghost, &g.device, &g.queue, &path,
+                        ) {
+                            Ok(msg) | Err(msg) => msg,
+                        };
+                    }
+                }
+            }
             Command::Quit => event_loop.exit(),
         }
     }
@@ -405,6 +428,11 @@ impl App {
                     "s" if self.mods.shift_key() => self.request(Command::SaveAs),
                     "s" => self.save(),
                     "o" => self.request(Command::Open),
+                    "e" => {
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.gui.state.open_export(&self.editor);
+                        }
+                    }
                     "n" => self.request(Command::New),
                     _ => {}
                 }

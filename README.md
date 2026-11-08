@@ -173,6 +173,14 @@ saved in the map (format v8) and are not part of undo/redo.
 Clicking a colour in **Colors > Map colors** now also flashes every cell drawn with that colour on the current
 layer (while hovered, and for a few seconds after the click).
 
+## Exporting an image
+
+**File > Export image...** (Ctrl+E) saves the map as a PNG, drawn by the same renderer as the screen, so it uses your tiles and forest edges.
+
+- **Area**: the whole map, the current selection's bounding box, or what is on screen.
+- **Layer (depth)** and **pixels per cell**: cells of that layer become that many pixels wide (32 is the tiles' own size, 64 is sharper). The window shows the final size and explains when it is too large (at most 16384 px a side and 64 million pixels).
+- **Draw on top**, each toggleable: regions (tint, outline, names), routes, nodes (icons and names), grid lines and the faded layer above.
+
 ## Layout
 
 * `crates/depthmap-core`: no GPU, no window. Sparse chunked grids per depth

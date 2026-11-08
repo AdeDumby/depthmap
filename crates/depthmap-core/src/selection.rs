@@ -199,6 +199,20 @@ impl Selection {
         self.inverted = !self.inverted;
     }
 
+    /// Smallest rectangle `((x0, y0), (x1, y1))` (inclusive, cells of
+    /// [`depth`](Self::depth)) around an ordinary selection; `None` when it is
+    /// empty or inverted.
+    pub fn bounds(&self) -> Option<((i64, i64), (i64, i64))> {
+        if self.inverted {
+            return None;
+        }
+        let y0 = *self.rows.keys().next()?;
+        let y1 = *self.rows.keys().next_back()?;
+        let x0 = self.rows.values().filter_map(|s| s.first()).map(|&(a, _)| a).min()?;
+        let x1 = self.rows.values().filter_map(|s| s.last()).map(|&(_, b)| b).max()?;
+        Some(((x0, y0), (x1, y1)))
+    }
+
     /// Number of cells, or `None` for an inverted selection (unbounded).
     pub fn cell_count(&self) -> Option<u64> {
         (!self.inverted).then(|| {

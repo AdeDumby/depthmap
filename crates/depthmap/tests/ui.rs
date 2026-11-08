@@ -1244,3 +1244,38 @@ fn regions_window_creates_renames_recolours_and_deletes_regions() {
     h.frame(vec![]);
     assert!(h.st.layout.zone_new.is_none());
 }
+
+#[test]
+fn export_window_opens_and_sends_the_export_command() {
+    use depthmap::export::{ExportArea, ExportOptions};
+    let mut h = Harness::new();
+    h.ed.new_map(depthmap_core::MapSpec::new(16, 12, 2));
+    h.frame(vec![]);
+    assert!(h.st.layout.export_button.is_none(), "closed until asked for");
+
+    h.st.open_export(&h.ed);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let b = h.st.layout.export_button.expect("window shows an Export button");
+    let o = h.st.export_dialog.unwrap();
+    assert_eq!(o.area, ExportArea::WholeMap);
+
+    // An impossible size disables the button.
+    h.st.export_dialog = Some(ExportOptions { px_per_cell: 256, depth: 2, ..o });
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.export_button.unwrap().center());
+    assert!(h.st.take_commands().is_empty());
+    assert!(h.st.export_dialog.is_some(), "still open");
+
+    // A fine one sends the options and closes.
+    let ok = ExportOptions { px_per_cell: 16, depth: 0, ..o };
+    h.st.export_dialog = Some(ok);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let _ = b;
+    h.click(h.st.layout.export_button.unwrap().center());
+    assert_eq!(h.st.take_commands(), vec![Command::ExportImage(ok)]);
+    assert!(h.st.export_dialog.is_none());
+    assert_eq!(h.st.last_export, Some(ok));
+}
