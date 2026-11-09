@@ -111,6 +111,168 @@ pub fn la_mips(la: &[u8]) -> Vec<Vec<u8>> {
     chain
 }
 
+/// A rectangle of pixels cut or copied from a tile (shade, alpha pairs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Clip {
+    pub w: usize,
+    pub h: usize,
+    pub la: Vec<u8>,
+}
+
+impl Clip {
+    pub fn flip_h(&self) -> Clip {
+        let mut la = Vec::with_capacity(self.la.len());
+        for y in 0..self.h {
+            for x in (0..self.w).rev() {
+                let i = (y * self.w + x) * 2;
+                la.extend([self.la[i], self.la[i + 1]]);
+            }
+        }
+        Clip { w: self.w, h: self.h, la }
+    }
+
+    pub fn flip_v(&self) -> Clip {
+        let mut la = Vec::with_capacity(self.la.len());
+        for y in (0..self.h).rev() {
+            la.extend_from_slice(&self.la[y * self.w * 2..(y + 1) * self.w * 2]);
+        }
+        Clip { w: self.w, h: self.h, la }
+    }
+
+    /// Turned a quarter clockwise.
+    pub fn rotate_cw(&self) -> Clip {
+        let (w, h) = (self.h, self.w);
+        let mut la = vec![0; self.la.len()];
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let (nx, ny) = (self.h - 1 - y, x);
+                let (s, d) = ((y * self.w + x) * 2, (ny * w + nx) * 2);
+                la[d] = self.la[s];
+                la[d + 1] = self.la[s + 1];
+            }
+        }
+        Clip { w, h, la }
+    }
+}
+
+impl TileArt {
+    /// The art of a built-in texture.
+    pub fn from_builtin(id: u8) -> Option<Self> {
+        (1..=crate::texture::TEXTURE_COUNT).contains(&id).then(|| Self { la: crate::texture::tile(id).into_iter().flat_map(|s| [s, 255]).collect() })
+    }
+
+    /// Copies the rectangle between two corners (inclusive, any order).
+    pub fn copy_rect(&self, a: (usize, usize), b: (usize, usize)) -> Clip {
+        let (x0, x1) = (a.0.min(b.0).min(TILE - 1), a.0.max(b.0).min(TILE - 1));
+        let (y0, y1) = (a.1.min(b.1).min(TILE - 1), a.1.max(b.1).min(TILE - 1));
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut la = Vec::with_capacity(w * h * 2);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (s, al) = self.get(x, y);
+                la.extend([s, al]);
+            }
+        }
+        Clip { w, h, la }
+    }
+
+    /// Makes the rectangle transparent.
+    pub fn clear_rect(&mut self, a: (usize, usize), b: (usize, usize)) {
+        for y in a.1.min(b.1)..=a.1.max(b.1).min(TILE - 1) {
+            for x in a.0.min(b.0)..=a.0.max(b.0).min(TILE - 1) {
+                self.set(x, y, 0, 0);
+            }
+        }
+    }
+
+    /// Puts a clip with its top left at `(x, y)`. Transparent pixels of the
+    /// clip leave the tile alone when `skip_transparent` is set. Anything
+    /// outside the tile is cut off.
+    pub fn paste(&mut self, clip: &Clip, x: i32, y: i32, skip_transparent: bool) {
+        for cy in 0..clip.h {
+            for cx in 0..clip.w {
+                let (tx, ty) = (x + cx as i32, y + cy as i32);
+                if !(0..TILE as i32).contains(&tx) || !(0..TILE as i32).contains(&ty) {
+                    continue;
+                }
+                let i = (cy * clip.w + cx) * 2;
+                if skip_transparent && clip.la[i + 1] == 0 {
+                    continue;
+                }
+                self.set(tx as usize, ty as usize, clip.la[i], clip.la[i + 1]);
+            }
+        }
+    }
+
+    /// Whole tile as a clip.
+    pub fn as_clip(&self) -> Clip {
+        Clip { w: TILE, h: TILE, la: self.la.clone() }
+    }
+
+    pub fn flip_h(&self) -> Self {
+        Self { la: self.as_clip().flip_h().la }
+    }
+
+    pub fn flip_v(&self) -> Self {
+        Self { la: self.as_clip().flip_v().la }
+    }
+
+    pub fn rotate_cw(&self) -> Self {
+        Self { la: self.as_clip().rotate_cw().la }
+    }
+
+    /// Slides the picture, wrapping round the edges: the way to check or fix
+    /// the seams of a tile that has to repeat.
+    pub fn shifted(&self, dx: i32, dy: i32) -> Self {
+        let mut out = Self::blank();
+        for y in 0..TILE {
+            for x in 0..TILE {
+                let (s, a) = self.get(x, y);
+                let nx = (x as i32 + dx).rem_euclid(TILE as i32) as usize;
+                let ny = (y as i32 + dy).rem_euclid(TILE as i32) as usize;
+                out.set(nx, ny, s, a);
+            }
+        }
+        out
+    }
+
+    /// Adds up to `amount` of random grain to every visible pixel's shade.
+    pub fn grain(&mut self, amount: u8, seed: u32) {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(0x9E37_79B9) | 1;
+        for p in self.la.chunks_mut(2) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            if p[1] > 0 {
+                let d = (state % (2 * amount as u32 + 1)) as i32 - amount as i32;
+                p[0] = (p[0] as i32 + d).clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    /// Lightens (positive) or darkens (negative) every visible pixel.
+    pub fn brighten(&mut self, delta: i32) {
+        for p in self.la.chunks_mut(2) {
+            if p[1] > 0 {
+                p[0] = (p[0] as i32 + delta).clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    /// Is the left edge a continuation of the right one, and the top of the
+    /// bottom one? A rough count of the visible jump across each seam, 0 for a
+    /// perfectly seamless tile.
+    pub fn seam_error(&self) -> u32 {
+        let jump = |a: (u8, u8), b: (u8, u8)| (a.0 as i32 - b.0 as i32).unsigned_abs() + (a.1 as i32 - b.1 as i32).unsigned_abs();
+        let mut e = 0;
+        for i in 0..TILE {
+            e += jump(self.get(TILE - 1, i), self.get(0, i));
+            e += jump(self.get(i, TILE - 1), self.get(i, 0));
+        }
+        e
+    }
+}
+
 /// A tile in a map or in the library.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomTile {
@@ -450,5 +612,81 @@ mod tests {
         assert_eq!(at(2 * TILE + 5, 10), [0, 0, 0], "a transparent part of the overhang shows the background");
         // The art's single pixel (top-left of the art) lands at the top-left of the cell above the block.
         assert_eq!(at(2 * TILE, 0), [255, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+
+    fn gradient() -> TileArt {
+        let mut a = TileArt::blank();
+        for y in 0..TILE {
+            for x in 0..TILE {
+                a.set(x, y, (x * 8) as u8, 255);
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn flips_rotations_and_shifts_are_exact() {
+        let a = gradient();
+        assert_eq!(a.flip_h().get(0, 5), a.get(TILE - 1, 5));
+        assert_eq!(a.flip_h().flip_h(), a);
+        assert_eq!(a.flip_v().get(3, 0), a.get(3, TILE - 1));
+        let r = a.rotate_cw();
+        assert_eq!(r.get(TILE - 1, 0), a.get(0, 0), "top left goes to top right");
+        assert_eq!(r.get(TILE - 1, TILE - 1), a.get(TILE - 1, 0));
+        assert_eq!(a.rotate_cw().rotate_cw().rotate_cw().rotate_cw(), a);
+        assert_eq!(a.shifted(1, 0).get(1, 0), a.get(0, 0));
+        assert_eq!(a.shifted(1, 0).get(0, 0), a.get(TILE - 1, 0), "wraps round");
+        assert_eq!(a.shifted(7, 3).shifted(-7, -3), a);
+    }
+
+    #[test]
+    fn copy_paste_and_clear_rectangles() {
+        let a = gradient();
+        let clip = a.copy_rect((10, 4), (3, 2)); // corners in any order
+        assert_eq!((clip.w, clip.h), (8, 3));
+        let mut b = TileArt::blank();
+        b.paste(&clip, 20, 29, false);
+        assert_eq!(b.get(20, 29), a.get(3, 2));
+        assert_eq!(b.get(27, 31), a.get(10, 4));
+        assert_eq!(b.get(28, 31), (0, 0), "nothing beyond the clip");
+        // Cut off at the tile's edge instead of panicking.
+        b.paste(&clip, 30, 30, false);
+        assert_eq!(b.get(31, 31), a.get(4, 3));
+        let mut c = TileArt::solid(9);
+        c.clear_rect((2, 2), (4, 3));
+        assert_eq!(c.get(3, 3), (0, 0));
+        assert_eq!(c.get(5, 3), (9, 255));
+        // Transparent pixels can be left out of a paste.
+        let mut hole = TileArt::solid(50);
+        hole.clear_rect((0, 0), (31, 31));
+        let mut d = TileArt::solid(7);
+        d.paste(&hole.as_clip(), 0, 0, true);
+        assert_eq!(d, TileArt::solid(7));
+    }
+
+    #[test]
+    fn grain_brighten_builtin_and_seams() {
+        let mut a = TileArt::solid(128);
+        a.grain(10, 3);
+        assert!(a.la.chunks(2).all(|p| (118..=138).contains(&p[0]) && p[1] == 255));
+        assert!(a.la.chunks(2).any(|p| p[0] != 128));
+        let mut t = TileArt::blank();
+        t.grain(50, 1);
+        assert!(t.is_blank(), "grain leaves transparent pixels alone");
+        let mut b = TileArt::solid(250);
+        b.brighten(20);
+        assert_eq!(b.get(0, 0).0, 255);
+        b.brighten(-300);
+        assert_eq!(b.get(0, 0).0, 0);
+        assert_eq!(TileArt::from_builtin(4).unwrap().la.len(), TILE_PIXELS * 2);
+        assert!(TileArt::from_builtin(1).is_some() && TileArt::from_builtin(0).is_none() && TileArt::from_builtin(99).is_none());
+        assert_eq!(TileArt::solid(40).seam_error(), 0);
+        assert!(gradient().seam_error() > 0, "a ramp has a jump at the seam");
+        assert!(gradient().shifted(16, 0).seam_error() > 0);
     }
 }

@@ -59,6 +59,21 @@ impl Harness {
         self.frame(vec![]);
     }
 
+    fn drag(&mut self, from: Pos2, to: Pos2) {
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        self.frame(vec![Event::PointerMoved(from)]);
+        self.frame(vec![button(from, true)]);
+        self.frame(vec![Event::PointerMoved(from + (to - from) * 0.5)]);
+        self.frame(vec![Event::PointerMoved(to)]);
+        self.frame(vec![button(to, false)]);
+        self.frame(vec![]);
+    }
+
     fn hover(&mut self, pos: Pos2) {
         self.frame(vec![Event::PointerMoved(pos)]);
         self.frame(vec![]);
@@ -1314,4 +1329,103 @@ fn header_depth_buttons_move_between_layers() {
     assert_eq!(h.ed.camera.depth, 1);
     h.click(h.st.layout.depth_up.unwrap().center());
     assert_eq!(h.ed.camera.depth, 0);
+}
+
+#[test]
+fn quitting_with_unsaved_changes_does_not_ask_and_recovery_is_offered_at_startup() {
+    use depthmap::autosave::Recovered;
+    let mut h = Harness::new();
+    h.st.request(Command::Quit, true);
+    assert_eq!(h.st.take_commands(), vec![Command::Quit]);
+
+    h.st.recovery = Some(Recovered {
+        original: None,
+        name: "Untitled".into(),
+        saved: None,
+        file: std::path::PathBuf::new(),
+    });
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // Discard goes through the app as a command and closes the question.
+    let discard = h.st.layout.recovery_discard.expect("restore dialog has a Discard button");
+    h.click(discard.center());
+    assert!(h.st.recovery.is_none());
+    assert_eq!(h.st.take_commands(), vec![Command::DiscardRecovery]);
+}
+
+#[test]
+fn brush_style_buttons_pick_the_style() {
+    use depthmap::editor::BrushStyle;
+    let mut h = Harness::new();
+    assert_eq!(h.st.layout.brush_styles.len(), 5);
+    h.click(h.st.layout.brush_styles[3].center());
+    assert_eq!(h.ed.brush_style, BrushStyle::Spray);
+    h.click(h.st.layout.brush_styles[1].center());
+    assert_eq!(h.ed.brush_style, BrushStyle::PaletteMix);
+    h.frame(vec![]);
+    assert!(!h.ed.brush_mix.is_empty(), "the mix comes from the current palette");
+}
+
+#[test]
+fn tile_editor_tools_draw_select_and_undo() {
+    use depthmap::tile_editor::{TileEditor, Tool};
+    use depthmap_core::tile::{CustomTile, TileArt};
+    let mut h = Harness::new();
+    h.st.tile_ed = Some(TileEditor::from_tile(CustomTile::new("Mine", TileArt::blank()), None));
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let canvas = h.st.tile_ed.as_ref().unwrap().canvas.expect("canvas drawn");
+    let cell = canvas.width() / 32.0;
+    let px = |x: f32, y: f32| canvas.min + egui::vec2((x + 0.5) * cell, (y + 0.5) * cell);
+
+    // A 3x3 brush paints a 3x3 square with one click, and it can be undone.
+    h.st.tile_ed.as_mut().unwrap().brush = 3;
+    h.click(px(10.0, 10.0));
+    let te = h.st.tile_ed.as_ref().unwrap();
+    assert_eq!((te.art.get(9, 9).1, te.art.get(11, 11).1, te.art.get(12, 12).1), (255, 255, 0));
+    h.st.tile_ed.as_mut().unwrap().undo();
+    assert!(h.st.tile_ed.as_ref().unwrap().art.is_blank());
+
+    // Select a rectangle by dragging, then the selection exists.
+    h.st.tile_ed.as_mut().unwrap().brush = 1;
+    h.st.tile_ed.as_mut().unwrap().tool = Tool::Pencil;
+    h.click(px(4.0, 4.0));
+    h.st.tile_ed.as_mut().unwrap().tool = Tool::Select;
+    h.drag(px(2.0, 2.0), px(6.0, 6.0));
+    let te = h.st.tile_ed.as_ref().unwrap();
+    assert_eq!(te.selection, Some(((2, 2), (6, 6))));
+}
+
+#[test]
+fn screenshots_of_header_and_tile_editor() {
+    use depthmap::tile_editor::TileEditor;
+    use depthmap_core::tile::{CustomTile, TileArt};
+    let Some(gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = depthmap::renderer::Renderer::new(gpu.device.clone(), gpu.queue.clone(), format);
+    let mut gui = Gui::new(&gpu.device, format);
+    let mut ed = Editor::with_spec(depthmap_core::MapSpec::new(64, 40, 3));
+    ed.resize(PW as f64, PH as f64);
+    for y in 10..20 {
+        for x in 10..24 {
+            ed.world.set(0, x, y, depthmap_core::make_cell(if x < 16 { 7 } else { 9 }, 3));
+        }
+    }
+    ed.mouse_moved(600.0, 400.0);
+    gui.state.tile_ed = Some(TileEditor::from_tile(CustomTile::new("Mine", TileArt::solid(180)), None));
+    let view = gpu.target.create_view(&Default::default());
+    for i in 0..4 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+            time: Some(i as f64 * 0.1),
+            ..Default::default()
+        };
+        let out = gui.run(input, &mut ed);
+        renderer.render(&view, (PW, PH), &ed.world, &ed.camera, &Default::default());
+        gui.paint(&gpu.device, &gpu.queue, &view, [PW, PH], out);
+    }
+    save_png("ui_tile_editor", &read_back(&gpu));
 }

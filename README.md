@@ -181,6 +181,27 @@ layer (while hovered, and for a few seconds after the click).
 - **Layer (depth)** and **pixels per cell**: cells of that layer become that many pixels wide (32 is the tiles' own size, 64 is sharper). The window shows the final size and explains when it is too large (at most 16384 px a side and 64 million pixels).
 - **Draw on top**, each toggleable: regions (tint, outline, names), routes, nodes (icons and names), grid lines and the faded layer above.
 
+## Header bar, measuring and 3D
+
+The bar under the menu holds the tools (Brush, Fill, Select, Region, Route, Pick, Measure, Add node), the view switch, zoom and depth. The strip at the bottom shows the cell under the mouse, the last message and the file name.
+
+- **Measure (M):** click points to lay out a path; the label shows its length in cells of the layer you started on (and in depth-0 cells), the last leg's dx/dy, and the number of board-game moves with and without diagonals. Right click removes the last point, Esc clears.
+- **2D / Isometric / Top-down:** the 3D views draw the map as a heightfield. A cell's height is its tile's height plus its colour's (0 to 255 each, capped at 255). **Right click a tile** in the Tools window, or a colour in *Map colors*, to set its height; water starts flat and brick walls tall. The *height* slider sets how many cells tall 255 is. Isometric can be turned with `<` `>` buttons or the `,` `.` keys; `V` cycles the views. The 3D views are for looking (pan and zoom as usual); empty cells show the parent layer through.
+
+## Undo and recovery
+
+Undo (Ctrl+Z) and redo (Ctrl+Shift+Z or Ctrl+Y) cover painting, nodes, regions, routes, custom tiles and heights. A drag or a slider movement is one step. While the tile editor is open the keys undo the tile instead.
+
+Unsaved work is copied to a recovery file every minute and when you quit (quitting never asks). The next start offers to restore it; your real map file is never touched until you save.
+
+## Brush styles
+
+Under the brush size: **Solid**, **Palette mix** (each cell takes a random colour and texture of the current palette), **Mottled** (the brush colour, a little lighter or darker per cell), **Spray** (a random third of the cells under the brush) and **Dither** (a checkerboard). The eraser ignores styles.
+
+## Tile editor
+
+Brush sizes 1 to 8, mirror left/right and up/down, pencil, eraser, fill, line, rectangle (outline or filled), eyedropper (also right click), rectangle select with copy, cut, paste and stamp, flips, rotation, wrap-around slide (and *Half*, which moves the seams to the middle so you can see them), lighter, darker, grain, copying any built-in or map tile into the one you are editing, PNG import, undo and redo. It tells you when the left/right and top/bottom edges match.
+
 ## Layout
 
 * `crates/depthmap-core`: no GPU, no window. Sparse chunked grids per depth

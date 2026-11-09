@@ -1,3 +1,4 @@
+pub mod autosave;
 pub mod editor;
 pub mod export;
 pub mod iso;

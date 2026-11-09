@@ -70,6 +70,10 @@ pub enum Command {
     ImportIcons,
     /// Pick a PNG file with a dialog, then export the map image into it.
     ExportImage(crate::export::ExportOptions),
+    /// Load the leftover recovery file as unsaved work.
+    RestoreRecovery,
+    /// Throw the leftover recovery file away.
+    DiscardRecovery,
     Quit,
 }
 
@@ -97,6 +101,8 @@ impl RecentEntry {
 /// tests and tooling click on real widgets instead of guessing coordinates.
 #[derive(Default, Clone, Debug)]
 pub struct UiLayout {
+    pub brush_styles: Vec<egui::Rect>,
+    pub recovery_discard: Option<egui::Rect>,
     pub view_buttons: Vec<egui::Rect>,
     pub depth_up: Option<egui::Rect>,
     pub depth_down: Option<egui::Rect>,
@@ -226,6 +232,8 @@ pub struct UiState {
     /// Draw the routes over the map.
     pub show_route_lines: bool,
     /// The Export image window, with the options being edited.
+    /// Unsaved work found at startup, waiting for a decision.
+    pub recovery: Option<crate::autosave::Recovered>,
     pub export_dialog: Option<crate::export::ExportOptions>,
     /// Options of the last export, offered again next time.
     pub last_export: Option<crate::export::ExportOptions>,
@@ -295,6 +303,7 @@ impl UiState {
             show_zones: true,
             show_routes: false,
             show_route_lines: true,
+            recovery: None,
             export_dialog: None,
             last_export: None,
             last_tool: ToolMode::Paint,
@@ -474,10 +483,12 @@ impl UiState {
 
     /// Asks for a command to run. Commands that would throw away unsaved
     /// work first show a confirmation dialog.
+    /// Quitting never asks: unsaved work is kept in a recovery file and
+    /// offered back at the next start.
     pub fn request(&mut self, cmd: Command, modified: bool) {
         let destructive = matches!(
             cmd,
-            Command::New | Command::Open | Command::OpenPath(_) | Command::Quit
+            Command::New | Command::Open | Command::OpenPath(_)
         );
         if destructive && modified {
             self.confirm = Some(cmd);
@@ -649,6 +660,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     let ctx = &ui.ctx().clone();
     st.layout.tool_buttons.clear();
     st.layout.view_buttons.clear();
+    st.layout.place_node = None;
     menu_bar(ui, ed, st);
     header_bar(ui, ed, st);
     status_bar(ui, ed, st);
@@ -830,6 +842,22 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     });
 }
 
+/// A height editor (0 to 255) for a right-click menu; true when it changed.
+fn height_menu(ui: &mut egui::Ui, title: &str, h: &mut u8) -> bool {
+    ui.label(RichText::new(title).strong());
+    ui.label(RichText::new("Used by the 3D views. A cell is its tile's height plus its colour's.").weak().small());
+    let before = *h;
+    ui.add(egui::Slider::new(h, 0..=255));
+    ui.horizontal(|ui| {
+        for v in [0u8, 10, 40, 100, 255] {
+            if ui.small_button(v.to_string()).clicked() {
+                *h = v;
+            }
+        }
+    });
+    *h != before
+}
+
 /// The row under the menu: tools, how the map is shown, zoom and depth.
 fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     egui::Panel::top("header").show(root, |ui| {
@@ -849,6 +877,18 @@ fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     st.layout.tool_buttons.push(r.rect);
                     if r.clicked() {
                         ed.tool = mode;
+                    }
+                }
+
+                let add = ui
+                    .selectable_label(ed.placing_node, "Add node")
+                    .on_hover_text("Add node (N): then click the map. Click a node later to edit it, drag to move it.");
+                st.layout.place_node = Some(add.rect);
+                if add.clicked() {
+                    if ed.placing_node {
+                        ed.cancel_placing_node();
+                    } else {
+                        ed.start_placing_node();
                     }
                 }
             });
@@ -1008,16 +1048,16 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.tile_new = None;
     st.layout.shapes.clear();
     st.layout.select_kinds.clear();
+    st.layout.brush_styles.clear();
     st.layout.select_all = None;
     st.layout.select_invert = None;
     st.layout.select_clear = None;
     st.layout.fills.clear();
     st.layout.border_toggle = None;
     st.layout.eraser_toggle = None;
-    st.layout.place_node = None;
     st.layout.import_icons = None;
     // Below the header (76 px) and above the status bar, title bar included.
-    let max_height = (ctx.content_rect().height() - 76.0 - 90.0).max(240.0);
+    let max_height = (ctx.content_rect().height() - 76.0 - 70.0).max(240.0);
     egui::Window::new("Tools")
         .anchor(Align2::LEFT_TOP, [10.0, 76.0])
         .max_width(260.0)
@@ -1070,7 +1110,15 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         };
                         ui.painter()
                             .rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-                        if resp.on_hover_text(tex_name(ed, id)).clicked() {
+                        let tip = format!("{}  (height {})\nRight click to set its height", tex_name(ed, id), ed.world.tile_height(id));
+                        let resp = resp.on_hover_text(tip);
+                        resp.context_menu(|ui| {
+                            let mut h = ed.world.tile_height(id);
+                            if height_menu(ui, &format!("Height of {}", tex_name(ed, id)), &mut h) {
+                                ed.world.set_tile_height(id, h);
+                            }
+                        });
+                        if resp.clicked() {
                             ed.set_texture(id);
                         }
                         if (n + 1) % COLUMNS == 0 {
@@ -1091,6 +1139,19 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 );
             });
             ed.brush_half = half;
+            ui.horizontal_wrapped(|ui| {
+                for style in crate::editor::BrushStyle::ALL {
+                    let r = ui.selectable_label(ed.brush_style == style, style.name()).on_hover_text(style.tip());
+                    st.layout.brush_styles.push(r.rect);
+                    if r.clicked() {
+                        ed.brush_style = style;
+                    }
+                }
+            });
+            if ed.brush_style == crate::editor::BrushStyle::PaletteMix {
+                ed.brush_mix = st.palettes.current().entries.iter().map(|e| (e.rgb, e.texture)).collect();
+                ui.label(RichText::new(format!("Mixing the {} entries of \"{}\"", ed.brush_mix.len(), st.palettes.current().name)).weak().small());
+            }
             let eraser = ui
                 .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
                 .on_hover_text("Brush and shapes remove cells instead of painting");
@@ -1139,7 +1200,6 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 let add = ui
                     .selectable_label(ed.placing_node, "Add node  (N)")
                     .on_hover_text("Then click the map. Click a node later to edit it, drag to move it.");
-                st.layout.place_node = Some(add.rect);
                 if add.clicked() {
                     if ed.placing_node {
                         ed.cancel_placing_node();
@@ -1733,7 +1793,7 @@ fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.zone_from_selection = None;
     egui::Window::new("Regions")
         .open(&mut open)
-        .default_pos(egui::pos2(290.0, 60.0))
+        .default_pos(egui::pos2(290.0, 80.0))
         .default_width(260.0)
         .show(ctx, |ui| {
             ui.checkbox(&mut st.show_zones, "Show regions on the map");
@@ -1846,7 +1906,7 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let mut acts: Vec<PaletteAct> = Vec::new();
     egui::Window::new("Colors")
         // Left of the zoom panel, so the two do not cover each other.
-        .default_pos(egui::pos2((screen.right() - 500.0).max(290.0), 40.0))
+        .default_pos(egui::pos2((screen.right() - 500.0).max(290.0), 80.0))
         .resizable(false)
         .collapsible(true)
         .open(&mut open)
@@ -1881,9 +1941,20 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                                 Stroke::new(1.0, Color32::from_black_alpha(120))
                             };
                             ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
-                            let tip = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                            let idx = st.used_colors[i];
+                            let tip = format!(
+                                "#{:02x}{:02x}{:02x}  (extra height {})\nRight click to set its height",
+                                rgb[0], rgb[1], rgb[2], ed.world.color_height(idx)
+                            );
                             let hovered = resp.hovered();
-                            if resp.on_hover_text(tip).clicked() {
+                            let resp = resp.on_hover_text(tip);
+                            resp.context_menu(|ui| {
+                                let mut h = ed.world.color_height(idx);
+                                if height_menu(ui, "Extra height of this colour", &mut h) {
+                                    ed.world.set_color_height(idx, h);
+                                }
+                            });
+                            if resp.clicked() {
                                 ed.set_brush_rgb(*rgb);
                                 st.hl_click = Some((st.used_colors[i], ctx.input(|inp| inp.time)));
                             }
@@ -2815,6 +2886,34 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     }
                     if ui.button("Cancel").clicked() {
                         st.confirm = None;
+                    }
+                });
+            });
+    }
+
+    if let Some(r) = st.recovery.clone() {
+        egui::Window::new("Restore unsaved work?")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label(format!("Depthmap kept a copy of \"{}\" with changes that were never saved.", r.name));
+                if let Some(p) = &r.original {
+                    ui.label(RichText::new(p.display().to_string()).weak().small());
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Restore").clicked() {
+                        st.recovery = None;
+                        st.ready.push(Command::RestoreRecovery);
+                    }
+                    let d = ui.button("Discard");
+                    st.layout.recovery_discard = Some(d.rect);
+                    if d.clicked() {
+                        st.recovery = None;
+                        st.ready.push(Command::DiscardRecovery);
                     }
                 });
             });

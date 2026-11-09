@@ -41,6 +41,72 @@ fn trim_num(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// How the brush lays down cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushStyle {
+    /// Every cell the same.
+    Solid,
+    /// Every cell takes a random entry (colour and texture) of the current palette.
+    PaletteMix,
+    /// The brush colour, a little lighter or darker from cell to cell.
+    Mottled,
+    /// Only some cells of the brush are painted, at random.
+    Spray,
+    /// Every other cell, like a checkerboard.
+    Dither,
+}
+
+impl BrushStyle {
+    pub const ALL: [BrushStyle; 5] =
+        [BrushStyle::Solid, BrushStyle::PaletteMix, BrushStyle::Mottled, BrushStyle::Spray, BrushStyle::Dither];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BrushStyle::Solid => "Solid",
+            BrushStyle::PaletteMix => "Palette mix",
+            BrushStyle::Mottled => "Mottled",
+            BrushStyle::Spray => "Spray",
+            BrushStyle::Dither => "Dither",
+        }
+    }
+
+    pub fn tip(self) -> &'static str {
+        match self {
+            BrushStyle::Solid => "Every cell gets the selected texture and colour",
+            BrushStyle::PaletteMix => "Every cell gets a random entry (colour and texture) of the current palette",
+            BrushStyle::Mottled => "The brush colour, slightly lighter or darker from cell to cell",
+            BrushStyle::Spray => "Paints a random third of the cells under the brush (use a big brush)",
+            BrushStyle::Dither => "Paints every other cell, like a checkerboard",
+        }
+    }
+}
+
+/// A stable pseudo-random number for a cell, so a stroke is repeatable and
+/// two strokes differ by their seed.
+fn cell_hash(seed: u32, x: i64, y: i64) -> u32 {
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (seed as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= h >> 32;
+    h as u32
+}
+
+/// The cell a style puts at `(x, y)`, or `None` to leave it alone.
+fn styled_cell(style: BrushStyle, seed: u32, x: i64, y: i64, solid: Cell, variants: &[Cell]) -> Option<Cell> {
+    if solid == EMPTY || variants.is_empty() && style != BrushStyle::Spray && style != BrushStyle::Dither {
+        return Some(solid);
+    }
+    let h = cell_hash(seed, x, y);
+    match style {
+        BrushStyle::Solid => Some(solid),
+        BrushStyle::PaletteMix | BrushStyle::Mottled => Some(variants[h as usize % variants.len()]),
+        BrushStyle::Spray => (h % 100 < 33).then_some(solid),
+        BrushStyle::Dither => ((x + y) & 1 == 0).then_some(solid),
+    }
+}
+
 /// What the left mouse button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
@@ -189,6 +255,11 @@ pub struct Editor {
     touched: Option<PathBuf>,
     stroke: Option<Tool>,
     stroke_cell: Cell,
+    stroke_variants: Vec<Cell>,
+    stroke_seed: u32,
+    pub brush_style: BrushStyle,
+    /// The colours and textures `PaletteMix` chooses from (the current palette).
+    pub brush_mix: Vec<([u8; 3], u8)>,
     last_cell: Option<(i64, i64)>,
     panning: bool,
     shape_drag: Option<ShapeDrag>,
@@ -326,6 +397,10 @@ impl Editor {
             touched: None,
             stroke: None,
             stroke_cell: EMPTY,
+            stroke_variants: Vec::new(),
+            stroke_seed: 1,
+            brush_style: BrushStyle::Solid,
+            brush_mix: Vec::new(),
             last_cell: None,
             panning: false,
             shape_drag: None,
@@ -417,6 +492,21 @@ impl Editor {
         }
         let color = self.world.colors.index_of(self.brush_rgb);
         self.stroke_cell = make_cell(self.texture, color);
+        self.stroke_seed = self.stroke_seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.stroke_variants = match self.brush_style {
+            BrushStyle::PaletteMix => {
+                let mix = self.brush_mix.clone();
+                mix.into_iter().map(|(rgb, tex)| make_cell(tex, self.world.colors.index_of(rgb))).collect()
+            }
+            BrushStyle::Mottled => [0.8f32, 0.9, 1.0, 1.0, 1.1, 1.2]
+                .into_iter()
+                .map(|f| {
+                    let c = self.brush_rgb.map(|v| (v as f32 * f).round().clamp(0.0, 255.0) as u8);
+                    make_cell(self.texture, self.world.colors.index_of(c))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         self.begin(Tool::Paint);
     }
 
@@ -452,14 +542,19 @@ impl Editor {
         let depth = self.camera.depth;
         let half = self.brush_half;
         let from = self.last_cell.unwrap_or(cell);
+        let (style, seed) = (self.brush_style, self.stroke_seed);
+        let variants = std::mem::take(&mut self.stroke_variants);
         let (world, history, sel) = (&mut self.world, &mut self.history, &self.selection);
         line_cells(from, cell, |x, y| {
             square_cells((x, y), half, |a, b| {
                 if sel.as_ref().is_none_or(|s| s.contains(depth, a, b)) {
-                    history.paint(world, depth, a, b, m);
+                    if let Some(c) = styled_cell(style, seed, a, b, m, &variants) {
+                        history.paint(world, depth, a, b, c);
+                    }
                 }
             });
         });
+        self.stroke_variants = variants;
         self.last_cell = Some(cell);
     }
 
@@ -1838,6 +1933,24 @@ impl Editor {
         }
     }
 
+    /// Loads a recovery file as unsaved work: the map belongs to `original`
+    /// (or is untitled) and counts as modified until it is saved.
+    pub fn restore_recovered(&mut self, file: &Path, original: Option<PathBuf>) {
+        self.end_stroke();
+        match io::load(file) {
+            Ok(w) => {
+                self.reset_transient();
+                self.world = w;
+                self.clear_history();
+                self.path = original;
+                self.saved_revision = u64::MAX;
+                self.status = "Restored unsaved work".into();
+                self.fit_view();
+            }
+            Err(e) => self.status = format!("Could not restore: {e}"),
+        }
+    }
+
     pub fn load_from(&mut self, path: &Path) {
         self.end_stroke();
         match io::load(path) {
@@ -3179,5 +3292,61 @@ mod tests {
         mclick(&mut e, 4, 0);
         let t = e.measure_text().unwrap();
         assert!(t.contains("depth-0"), "{t}");
+    }
+
+    #[test]
+    fn brush_styles_lay_down_cells_differently() {
+        let paint = |style: BrushStyle, mix: Vec<([u8; 3], u8)>| {
+            let mut e = bounded(32, 32, 1);
+            e.brush_style = style;
+            e.brush_mix = mix;
+            e.brush_half = 5; // 11 x 11
+            e.texture = 4;
+            e.set_brush_rgb([200, 100, 50]);
+            let (px, py) = centre_of(&e, (16, 16));
+            e.mouse_moved(px, py);
+            e.begin_paint();
+            e.end_stroke();
+            let mut cells = Vec::new();
+            for y in 11..=21 {
+                for x in 11..=21 {
+                    cells.push(e.world.get(0, x, y));
+                }
+            }
+            (e, cells)
+        };
+        let (_, solid) = paint(BrushStyle::Solid, vec![]);
+        assert!(solid.iter().all(|&c| c == solid[0] && c != EMPTY));
+
+        let (_, dither) = paint(BrushStyle::Dither, vec![]);
+        let filled = dither.iter().filter(|&&c| c != EMPTY).count();
+        assert_eq!(filled, 61, "a checkerboard of 11x11 has 61 of one colour");
+
+        let (_, spray) = paint(BrushStyle::Spray, vec![]);
+        let filled = spray.iter().filter(|&&c| c != EMPTY).count();
+        assert!((15..=70).contains(&filled), "about a third of 121: {filled}");
+
+        let (_, mottled) = paint(BrushStyle::Mottled, vec![]);
+        let colours: std::collections::HashSet<_> = mottled.iter().map(|&c| depthmap_core::chunk::cell_color(c)).collect();
+        assert!(colours.len() >= 3 && mottled.iter().all(|&c| depthmap_core::chunk::cell_texture(c) == 4));
+
+        let (e, mix) = paint(BrushStyle::PaletteMix, vec![([255, 0, 0], 1), ([0, 255, 0], 2), ([0, 0, 255], 3)]);
+        let textures: std::collections::HashSet<_> = mix.iter().map(|&c| depthmap_core::chunk::cell_texture(c)).collect();
+        assert_eq!(textures, [1u8, 2, 3].into_iter().collect(), "all three entries appear");
+        assert!(e.world.colors.as_slice().contains(&[0, 255, 0]));
+
+        // The eraser ignores styles.
+        let mut e2 = bounded(32, 32, 1);
+        e2.brush_style = BrushStyle::Spray;
+        e2.brush_half = 3;
+        let (px, py) = centre_of(&e2, (16, 16));
+        e2.mouse_moved(px, py);
+        e2.begin_paint();
+        e2.end_stroke();
+        e2.brush_style = BrushStyle::Dither;
+        e2.eraser = true;
+        e2.begin_paint();
+        e2.end_stroke();
+        assert!((13..=19).all(|y| (13..=19).all(|x| e2.world.get(0, x, y) == EMPTY)), "erased completely");
     }
 }

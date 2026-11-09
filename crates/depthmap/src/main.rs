@@ -134,6 +134,11 @@ struct App {
     recent: Recent,
     /// Show the welcome screen once the window exists.
     show_startup: bool,
+    /// Where recovery copies of unsaved work go.
+    recovery_dir: PathBuf,
+    next_autosave: Instant,
+    /// Revision last written to the recovery file.
+    autosaved_revision: Option<u64>,
 }
 
 impl App {
@@ -150,6 +155,9 @@ impl App {
             stats: FrameStats::default(),
             recent,
             show_startup,
+            recovery_dir: depthmap::autosave::default_dir(),
+            next_autosave: Instant::now() + Duration::from_secs(depthmap::autosave::INTERVAL_SECS),
+            autosaved_revision: None,
         }
     }
 
@@ -163,6 +171,25 @@ impl App {
             .filter(|d| d.is_dir())
             .map(PathBuf::from)
             .or_else(|| self.recent.dialog_dir())
+    }
+
+    /// Keeps a recovery copy of unsaved work, or removes it once everything
+    /// is saved. Waits while a leftover copy is still waiting for an answer.
+    fn autosave(&mut self) {
+        if self.gfx.as_ref().is_some_and(|g| g.gui.state.recovery.is_some()) {
+            return;
+        }
+        if self.editor.modified() {
+            let rev = self.editor.world.revision();
+            if self.autosaved_revision != Some(rev) {
+                match depthmap::autosave::save(&self.recovery_dir, &self.editor) {
+                    Ok(()) => self.autosaved_revision = Some(rev),
+                    Err(e) => eprintln!("autosave failed: {e}"),
+                }
+            }
+        } else if self.autosaved_revision.take().is_some() || depthmap::autosave::exists(&self.recovery_dir) {
+            depthmap::autosave::clear(&self.recovery_dir);
+        }
     }
 
     /// Records the map that was just opened or saved in the recent list.
@@ -283,7 +310,16 @@ impl App {
                     }
                 }
             }
-            Command::Quit => event_loop.exit(),
+            Command::RestoreRecovery => {
+                if let Some(r) = depthmap::autosave::pending(&self.recovery_dir) {
+                    self.editor.restore_recovered(&r.file, r.original);
+                }
+            }
+            Command::DiscardRecovery => depthmap::autosave::clear(&self.recovery_dir),
+            Command::Quit => {
+                self.autosave();
+                event_loop.exit();
+            }
         }
     }
 
@@ -440,6 +476,16 @@ impl App {
                     "a" => self.editor.select_all(),
                     "d" => self.editor.clear_selection(),
                     "i" => self.editor.invert_selection(),
+                    // While the tile editor is open, undo applies to the tile.
+                    "z" | "y" if self.gfx.as_ref().is_some_and(|g| g.gui.state.tile_ed.is_some()) => {
+                        if let Some(te) = self.gfx.as_mut().and_then(|g| g.gui.state.tile_ed.as_mut()) {
+                            if c.as_str() == "y" || self.mods.shift_key() {
+                                te.redo();
+                            } else {
+                                te.undo();
+                            }
+                        }
+                    }
                     "z" if self.mods.shift_key() => self.editor.redo(),
                     "z" => self.editor.undo(),
                     "y" => self.editor.redo(),
@@ -517,7 +563,8 @@ impl ApplicationHandler for App {
         let mut gfx = Gfx::new(window);
         gfx.gui.state.set_recent(self.recent.paths());
         gfx.gui.state.set_palettes(depthmap::palette::Palettes::load());
-        if self.show_startup {
+        gfx.gui.state.recovery = depthmap::autosave::pending(&self.recovery_dir);
+        if self.show_startup && gfx.gui.state.recovery.is_none() {
             gfx.gui.state.open_startup();
         }
         self.gfx = Some(gfx);
@@ -525,6 +572,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_autosave {
+            self.autosave();
+            self.next_autosave = now + Duration::from_secs(depthmap::autosave::INTERVAL_SECS);
+        }
         match self.repaint_at {
             Some(t) if t <= Instant::now() => {
                 self.repaint_at = None;
