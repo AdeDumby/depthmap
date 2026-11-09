@@ -15,6 +15,7 @@
 //!                     | rows u32 | { y i64 | spans u32 | { x0 i64, x1 i64 }* }* }*   (version 7)
 //!         | routes u16 | { name_len u16 + name | rgb[3] | width u8 | style u8 | visible u8 | depth u8
 //!                      | from u64 | to u64 | via u16 | { x f64, y f64 }* }*   (version 8)
+//!         | tile heights u8 * 32 | colour heights u8 * 256               (version 9)
 //!         | color_count u16 | { r g b }*color_count
 //!         | { depth u8 | count u32 | { x i64 | y i64 | cells[1024] u16 }* }*
 //! ```
@@ -40,7 +41,7 @@ use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -133,6 +134,9 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
             raw.extend(y.to_le_bytes());
         }
     }
+    // Heights (version 9): one byte per texture id, then one per colour index.
+    raw.extend((0..=crate::texture::MAX_TEXTURES).map(|id| world.tile_height(id)));
+    raw.extend((0..=255u8).map(|i| world.color_height(i)));
     let colors = world.colors.as_slice();
     raw.extend((colors.len() as u16).to_le_bytes());
     for c in colors {
@@ -361,6 +365,14 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
         }
     }
 
+    // Heights (version 9); older files get the defaults.
+    let mut heights: Option<(Vec<u8>, Vec<u8>)> = None;
+    if version >= 9 {
+        let t = cur.take(crate::texture::MAX_TEXTURES as usize + 1)?.to_vec();
+        let c = cur.take(256)?.to_vec();
+        heights = Some((t, c));
+    }
+
     let color_count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
     if color_count == 0 || color_count > MAX_COLORS {
         return Err(invalid("bad colour table size"));
@@ -417,6 +429,14 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
                 };
             }
             world.insert_chunk(depth, ChunkPos { x, y }, &cells);
+        }
+    }
+    if let Some((t, c)) = heights {
+        for (id, h) in t.into_iter().enumerate() {
+            world.set_tile_height(id as u8, h);
+        }
+        for (i, h) in c.into_iter().enumerate() {
+            world.set_color_height(i as u8, h);
         }
     }
     for r in route_list {
@@ -818,5 +838,23 @@ mod tests {
         write_world(&w, &mut bytes).unwrap();
         let back = read_world(&bytes[..]).unwrap();
         assert_eq!(back.routes(), &[r]);
+    }
+}
+
+#[cfg(test)]
+mod height_io_tests {
+    use super::*;
+
+    #[test]
+    fn heights_round_trip() {
+        let mut w = World::with_spec(crate::MapSpec::new(8, 8, 1));
+        w.set_tile_height(5, 77);
+        w.set_color_height(4, 33);
+        let path = std::env::temp_dir().join("depthmap_heights_test.dmap");
+        save(&w, &path).unwrap();
+        let back = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((back.tile_height(5), back.color_height(4)), (77, 33));
+        assert_eq!(back.tile_height(9), 0);
     }
 }

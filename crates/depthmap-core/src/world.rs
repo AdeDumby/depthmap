@@ -59,6 +59,23 @@ pub struct World {
     tiles_version: u64,
     zones: Vec<Zone>,
     routes: Vec<Route>,
+    /// Height (0..=255) of each tile, indexed by texture id.
+    tile_heights: [u8; MAX_TEXTURES as usize + 1],
+    /// Extra height of each colour index, added to the tile's.
+    color_heights: Vec<u8>,
+    /// Bumped by every change to regions, routes, tiles and heights.
+    meta_clock: u64,
+}
+
+/// Everything about a map that is not cells or nodes and is small enough to
+/// snapshot for undo: regions, routes, custom tiles and heights.
+#[derive(Clone, PartialEq)]
+pub struct Meta {
+    zones: Vec<Zone>,
+    routes: Vec<Route>,
+    tiles: Vec<Option<CustomTile>>,
+    tile_heights: [u8; MAX_TEXTURES as usize + 1],
+    color_heights: Vec<u8>,
 }
 
 impl Default for World {
@@ -87,7 +104,84 @@ impl World {
             tiles_version: crate::colors::next_version(),
             zones: Vec::new(),
             routes: Vec::new(),
+            tile_heights: crate::texture::default_heights(),
+            color_heights: vec![0; 256],
+            meta_clock: 0,
         }
+    }
+
+    fn touch_meta(&mut self) {
+        self.clock += 1;
+        self.meta_clock += 1;
+    }
+
+    // ---- heights (for the 3D view) ------------------------------------------------
+
+    pub fn tile_height(&self, id: u8) -> u8 {
+        self.tile_heights.get(id as usize).copied().unwrap_or(0)
+    }
+
+    pub fn color_height(&self, index: u8) -> u8 {
+        self.color_heights.get(index as usize).copied().unwrap_or(0)
+    }
+
+    pub fn set_tile_height(&mut self, id: u8, h: u8) {
+        if let Some(slot) = self.tile_heights.get_mut(id as usize) {
+            if *slot != h {
+                *slot = h;
+                self.touch_meta();
+            }
+        }
+    }
+
+    pub fn set_color_height(&mut self, index: u8, h: u8) {
+        if let Some(slot) = self.color_heights.get_mut(index as usize) {
+            if *slot != h {
+                *slot = h;
+                self.touch_meta();
+            }
+        }
+    }
+
+    /// Height of a cell: its tile's height plus its colour's, at most 255.
+    /// Empty cells are 0.
+    pub fn cell_height(&self, cell: Cell) -> u8 {
+        if cell == crate::EMPTY {
+            return 0;
+        }
+        let h = self.tile_height(crate::cell_texture(cell)) as u16
+            + self.color_height(crate::cell_color(cell)) as u16;
+        h.min(255) as u8
+    }
+
+    // ---- snapshots for undo --------------------------------------------------------
+
+    /// Changes whenever regions, routes, tiles or heights change.
+    pub fn meta_clock(&self) -> u64 {
+        self.meta_clock
+    }
+
+    pub fn meta(&self) -> Meta {
+        Meta {
+            zones: self.zones.clone(),
+            routes: self.routes.clone(),
+            tiles: self.tiles.clone(),
+            tile_heights: self.tile_heights,
+            color_heights: self.color_heights.clone(),
+        }
+    }
+
+    /// Puts a snapshot back (cells that use a removed tile just draw nothing).
+    pub fn restore_meta(&mut self, m: &Meta) {
+        self.zones = m.zones.clone();
+        self.routes = m.routes.clone();
+        if self.tiles != m.tiles {
+            self.tiles = m.tiles.clone();
+            self.tiles_version = crate::colors::next_version();
+        }
+        self.tile_heights = m.tile_heights;
+        self.color_heights = m.color_heights.clone();
+        self.touch_meta();
     }
 
     // ---- routes ----------------------------------------------------------------
@@ -101,21 +195,21 @@ impl World {
             return None;
         }
         self.routes.push(route);
-        self.clock += 1;
+        self.touch_meta();
         Some(self.routes.len() - 1)
     }
 
     pub fn edit_route<R>(&mut self, index: usize, f: impl FnOnce(&mut Route) -> R) -> Option<R> {
         let r = self.routes.get_mut(index)?;
         let out = f(r);
-        self.clock += 1;
+        self.touch_meta();
         Some(out)
     }
 
     pub fn remove_route(&mut self, index: usize) -> bool {
         if index < self.routes.len() {
             self.routes.remove(index);
-            self.clock += 1;
+            self.touch_meta();
             true
         } else {
             false
@@ -136,7 +230,7 @@ impl World {
             return None;
         }
         self.zones.push(zone);
-        self.clock += 1;
+        self.touch_meta();
         Some(self.zones.len() - 1)
     }
 
@@ -144,14 +238,14 @@ impl World {
     pub fn edit_zone<R>(&mut self, index: usize, f: impl FnOnce(&mut Zone) -> R) -> Option<R> {
         let z = self.zones.get_mut(index)?;
         let r = f(z);
-        self.clock += 1;
+        self.touch_meta();
         Some(r)
     }
 
     pub fn remove_zone(&mut self, index: usize) -> bool {
         if index < self.zones.len() {
             self.zones.remove(index);
-            self.clock += 1;
+            self.touch_meta();
             true
         } else {
             false
@@ -206,7 +300,7 @@ impl World {
         if self.tiles[id as usize].as_ref() != Some(&tile) {
             self.tiles[id as usize] = Some(tile);
             self.tiles_version = crate::colors::next_version();
-            self.clock += 1;
+            self.touch_meta();
         }
         Ok(id)
     }
@@ -289,7 +383,7 @@ impl World {
             Some(slot) if id > TEXTURE_COUNT && slot.is_some() => {
                 *slot = None;
                 self.tiles_version = crate::colors::next_version();
-                self.clock += 1;
+                self.touch_meta();
                 true
             }
             _ => false,
@@ -806,5 +900,41 @@ mod tests {
         assert_eq!(w.get(0, -33, 127), 9 | (3 << 8));
         w.insert_chunk(0, ChunkPos { x: -2, y: 3 }, &[EMPTY; CHUNK_AREA]);
         assert_eq!(w.total_chunks(), 0);
+    }
+}
+
+#[cfg(test)]
+mod height_tests {
+    use super::*;
+    use crate::make_cell;
+
+    #[test]
+    fn heights_add_tile_and_colour_and_saturate() {
+        let mut w = World::new();
+        assert_eq!(w.cell_height(crate::EMPTY), 0);
+        assert_eq!(w.cell_height(make_cell(9, 0)), 0, "water is flat by default");
+        assert!(w.cell_height(make_cell(4, 0)) > w.cell_height(make_cell(7, 0)));
+        w.set_tile_height(1, 200);
+        w.set_color_height(3, 100);
+        assert_eq!(w.cell_height(make_cell(1, 3)), 255);
+        assert_eq!(w.cell_height(make_cell(1, 0)), 200);
+    }
+
+    #[test]
+    fn meta_snapshot_round_trips_and_ticks() {
+        let mut w = World::new();
+        let before = w.meta();
+        let c0 = w.meta_clock();
+        w.add_zone(Zone::new("a", [1, 2, 3], 0));
+        w.set_tile_height(2, 99);
+        assert!(w.meta_clock() > c0);
+        let after = w.meta();
+        assert!(before != after);
+        w.restore_meta(&before);
+        assert!(w.zones().is_empty());
+        assert_eq!(w.tile_height(2), crate::texture::default_heights()[2]);
+        w.restore_meta(&after);
+        assert_eq!(w.zones().len(), 1);
+        assert_eq!(w.tile_height(2), 99);
     }
 }

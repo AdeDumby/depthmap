@@ -648,3 +648,78 @@ fn export_renders_the_chosen_area_at_the_chosen_scale() {
         depthmap::export::write_png(&std::path::Path::new(&dir).join("export.png"), 128, 96, &tinted).unwrap();
     }
 }
+
+#[test]
+fn the_3d_view_draws_raised_columns_with_darker_sides() {
+    use depthmap::iso::{Iso, Mode3d, View3d};
+    let Some(mut gpu) = gpu() else {
+        eprintln!("SKIPPED: no GPU adapter available");
+        return;
+    };
+    let mut world = World::with_spec(MapSpec::new(16, 16, 1));
+    for y in 6..10 {
+        for x in 6..10 {
+            world.set(0, x, y, make_cell(1, 5)); // a tall green block (solid)
+        }
+    }
+    world.set_tile_height(1, 255);
+    let mut cam = Camera::new();
+    cam.max_depth = 1;
+    cam.cell = (8, 8);
+    let mut iso = Iso::new(&gpu.renderer, wgpu::TextureFormat::Rgba8Unorm);
+    let view_of = |gpu: &Gpu| gpu.target.create_view(&Default::default());
+    let read = |gpu: &Gpu| -> Vec<u8> {
+        let row = W * 4;
+        let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * H) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &gpu.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(H) } },
+            wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let out = slice.get_mapped_range().unwrap().to_vec();
+        out
+    };
+    // 512 x 384 target; the camera looks at the middle of the block.
+    let v = view_of(&gpu);
+    let mut view = View3d { yaw: 0.0, height_cells: 6.0, ..Default::default() };
+    iso.render(&mut gpu.renderer, &v, (W, H), &world, &cam, &view);
+    let img = read(&gpu);
+    if let Ok(dir) = std::env::var("DEPTHMAP_PNG_DIR") {
+        let _ = std::fs::create_dir_all(&dir);
+        depthmap::export::write_png(&std::path::Path::new(&dir).join("iso.png"), W, H, &img).unwrap();
+    }
+    let at = |x: u32, y: u32| [img[((y * W + x) * 4) as usize], img[((y * W + x) * 4 + 1) as usize], img[((y * W + x) * 4 + 2) as usize]];
+    // Far corner of the screen is background (parchment).
+    assert!(near(at(5, 5), [230, 222, 204], 4), "{:?}", at(5, 5));
+    // The block's top is lifted: its green shows above the point where the
+    // flat map would have put the centre of the block.
+    let green = color(5);
+    let lifted = (0..H).filter(|&y| near(at(W / 2, y), green, 40)).count();
+    assert!(lifted > 20, "top of the block should be visible, only {lifted} rows");
+    // The south wall (towards the viewer) is the block colour darkened.
+    let col: Vec<[u8; 3]> = (0..H).map(|y| at(W / 2, y)).collect();
+    let dark = col.iter().filter(|c| c[1] < green[1] - 20 && c[1] > 20 && c[0] < c[1]).count();
+    assert!(dark > 10, "no darker wall found: {dark}");
+
+    // Top-down: no walls, the block is a flat square of its colour (shaded at the rim).
+    view.mode = Mode3d::TopDown;
+    iso.render(&mut gpu.renderer, &v, (W, H), &world, &cam, &view);
+    let img = read(&gpu);
+    if let Ok(dir) = std::env::var("DEPTHMAP_PNG_DIR") {
+        depthmap::export::write_png(&std::path::Path::new(&dir).join("topdown.png"), W, H, &img).unwrap();
+    }
+    let c = [img[((H / 2 * W + W / 2) * 4) as usize], img[((H / 2 * W + W / 2) * 4 + 1) as usize], img[((H / 2 * W + W / 2) * 4 + 2) as usize]];
+    assert!(near(c, green, 30), "{c:?} vs {green:?}");
+}

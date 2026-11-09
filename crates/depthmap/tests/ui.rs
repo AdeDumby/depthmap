@@ -139,7 +139,7 @@ fn panels_capture_the_pointer_but_the_canvas_does_not() {
     h.hover(thumb);
     assert!(h.ctx.is_pointer_over_egui(), "over the texture panel");
     h.hover(h.st.layout.zoom_in.unwrap().center());
-    assert!(h.ctx.is_pointer_over_egui(), "over the zoom panel");
+    assert!(h.ctx.is_pointer_over_egui(), "over the header bar");
     h.hover(Pos2::new(5.0, 5.0));
     assert!(h.ctx.is_pointer_over_egui(), "over the menu bar");
     h.hover(Pos2::new(W * 0.5, H * 0.6));
@@ -150,7 +150,6 @@ fn panels_capture_the_pointer_but_the_canvas_does_not() {
 fn panels_can_be_hidden() {
     let mut h = Harness::new();
     h.st.show_tools = false;
-    h.st.show_zoom = false;
     h.frame(vec![]);
     h.hover(Pos2::new(40.0, 100.0));
     assert!(!h.ctx.is_pointer_over_egui());
@@ -787,7 +786,7 @@ fn key(k: egui::Key, pressed: bool) -> Event {
 fn tool_buttons_switch_tools_and_select_controls_work() {
     use depthmap::editor::{SelectKind, ToolMode};
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.tool_buttons.len(), 6);
+    assert_eq!(h.st.layout.tool_buttons.len(), 7);
     assert_eq!(h.ed.tool, ToolMode::Paint);
     assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
 
@@ -815,7 +814,11 @@ fn tool_buttons_switch_tools_and_select_controls_work() {
 
     // Outside the select tool a selection can still be cleared from the panel.
     h.ed.select_all();
-    h.click(h.st.layout.tool_buttons[0].center());
+    h.frame(vec![Event::PointerGone]);
+    h.frame(vec![]);
+    let c = h.st.layout.tool_buttons[0].center();
+    h.click(c);
+    assert_eq!(h.ed.tool, ToolMode::Paint);
     h.frame(vec![]);
     h.click(h.st.layout.select_clear.unwrap().center());
     assert!(!h.ed.has_selection());
@@ -1278,4 +1281,37 @@ fn export_window_opens_and_sends_the_export_command() {
     assert_eq!(h.st.take_commands(), vec![Command::ExportImage(ok)]);
     assert!(h.st.export_dialog.is_none());
     assert_eq!(h.st.last_export, Some(ok));
+}
+
+#[test]
+fn header_switches_between_the_flat_map_and_the_3d_views() {
+    use depthmap::gui::ViewMode;
+    let mut h = Harness::new();
+    assert_eq!(h.st.layout.view_buttons.len(), 3);
+    assert_eq!(h.st.view_mode, ViewMode::Edit);
+    h.click(h.st.layout.view_buttons[1].center());
+    assert_eq!(h.st.view_mode, ViewMode::Isometric);
+    // Tools cannot be changed in 3D (the buttons are disabled), the views can.
+    let tool = h.ed.tool;
+    h.click(h.st.layout.tool_buttons[1].center());
+    assert_eq!(h.ed.tool, tool);
+    h.click(h.st.layout.view_buttons[2].center());
+    assert_eq!(h.st.view_mode, ViewMode::TopDown);
+    h.click(h.st.layout.view_buttons[0].center());
+    assert_eq!(h.st.view_mode, ViewMode::Edit);
+    h.click(h.st.layout.tool_buttons[1].center());
+    assert_eq!(h.ed.tool, ToolMode::Fill);
+    assert_eq!(ViewMode::Edit.next().next().next(), ViewMode::Edit);
+}
+
+#[test]
+fn header_depth_buttons_move_between_layers() {
+    let mut h = Harness::new();
+    h.ed.new_map(depthmap_core::MapSpec::new(16, 12, 2));
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.click(h.st.layout.depth_down.unwrap().center());
+    assert_eq!(h.ed.camera.depth, 1);
+    h.click(h.st.layout.depth_up.unwrap().center());
+    assert_eq!(h.ed.camera.depth, 0);
 }

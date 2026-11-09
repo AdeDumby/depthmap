@@ -664,6 +664,27 @@ impl Renderer {
         }
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The array of tile patterns (shared with the 3D view).
+    pub fn pattern_texture(&self) -> &wgpu::Texture {
+        &self.pattern_tex
+    }
+
+    /// Uploads custom tiles that changed since the last draw.
+    pub fn sync_tiles(&mut self, world: &World) {
+        if self.tiles_version != world.tiles_version() {
+            self.tiles_version = world.tiles_version();
+            self.upload_tiles(world);
+        }
+    }
+
     /// Draws the world into `target`.
     pub fn render(
         &mut self,

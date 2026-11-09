@@ -35,6 +35,7 @@ struct Gfx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: Renderer,
+    iso: depthmap::iso::Iso,
     gui: Gui,
     egui_state: egui_winit::State,
 }
@@ -91,7 +92,8 @@ impl Gfx {
             window.theme(),
             Some(device.limits().max_texture_dimension_2d as usize),
         );
-        Self { window, surface, config, device, queue, renderer, gui, egui_state }
+        let iso = depthmap::iso::Iso::new(&renderer, format);
+        Self { window, surface, config, device, queue, renderer, iso, gui, egui_state }
     }
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -300,6 +302,12 @@ impl App {
             self.editor.pan_keys(-dx, -dy);
         }
 
+        // Regions, routes, tiles and heights become one undo step once the
+        // mouse button is up (so dragging a route point is a single step).
+        if !gfx.gui.ctx.input(|i| i.pointer.any_down()) {
+            self.editor.settle();
+        }
+
         // Get the image to draw into first: egui hands out texture uploads
         // exactly once, so a frame must never be skipped after the UI ran.
         let frame = match gfx.surface.get_current_texture() {
@@ -331,6 +339,15 @@ impl App {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let size = (gfx.config.width, gfx.config.height);
         let over_ui = gfx.gui.pointer_over_ui();
+        if gfx.gui.state.view_mode.is_3d() {
+            let mut v = gfx.gui.state.view3d;
+            v.mode = if gfx.gui.state.view_mode == depthmap::gui::ViewMode::TopDown {
+                depthmap::iso::Mode3d::TopDown
+            } else {
+                depthmap::iso::Mode3d::Isometric
+            };
+            gfx.iso.render(&mut gfx.renderer, &view, size, &self.editor.world, &self.editor.camera, &v);
+        } else {
         self.stats = gfx.renderer.render(
             &view,
             size,
@@ -344,6 +361,7 @@ impl App {
                 ghost_opacity: gfx.gui.state.ghost_opacity,
             },
         );
+        }
         gfx.gui.paint(&gfx.device, &gfx.queue, &view, [size.0, size.1], output);
         gfx.window.pre_present_notify();
         gfx.queue.present(frame);
@@ -453,6 +471,18 @@ impl App {
                 "c" | "C" => self.editor.tool = ToolMode::Pick,
                 "r" | "R" => self.editor.tool = ToolMode::Zone,
                 "t" | "T" => self.editor.tool = ToolMode::Route,
+                "m" | "M" => self.editor.tool = ToolMode::Measure,
+                "v" | "V" => {
+                    if let Some(g) = self.gfx.as_mut() {
+                        g.gui.state.view_mode = g.gui.state.view_mode.next();
+                    }
+                }
+                "," | "." => {
+                    if let Some(g) = self.gfx.as_mut() {
+                        let step = std::f32::consts::FRAC_PI_4 * if c.as_str() == "," { -1.0 } else { 1.0 };
+                        g.gui.state.view3d.yaw += step;
+                    }
+                }
                 "n" | "N" => {
                     if self.editor.placing_node {
                         self.editor.cancel_placing_node();
@@ -548,7 +578,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
+                let is3d = self.gfx.as_ref().is_some_and(|g| g.gui.state.view_mode.is_3d());
                 match (button, down) {
+                    // The 3D views only look; panning still works.
+                    (MouseButton::Left | MouseButton::Right, true) if is3d && !self.space => {}
                     // Clicks that land on a panel or dialog belong to egui.
                     (_, true) if over_ui || consumed => {}
                     (MouseButton::Left, true) if self.space => self.editor.set_panning(true),

@@ -17,6 +17,42 @@ use crate::editor::{Editor, SelectKind, ToolMode, ZoneKind, format_zoom};
 use crate::palette::{self, Entry, Palettes};
 use crate::wheel;
 
+/// How the map is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The flat map you draw on.
+    Edit,
+    /// Heightfield seen from an angle (view only).
+    Isometric,
+    /// Heightfield seen from above with relief shading (view only).
+    TopDown,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 3] = [ViewMode::Edit, ViewMode::Isometric, ViewMode::TopDown];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewMode::Edit => "2D",
+            ViewMode::Isometric => "Isometric",
+            ViewMode::TopDown => "Top-down",
+        }
+    }
+
+    pub fn is_3d(self) -> bool {
+        self != ViewMode::Edit
+    }
+
+    /// The next mode in the cycle 2D, isometric, top-down.
+    pub fn next(self) -> Self {
+        match self {
+            ViewMode::Edit => ViewMode::Isometric,
+            ViewMode::Isometric => ViewMode::TopDown,
+            ViewMode::TopDown => ViewMode::Edit,
+        }
+    }
+}
+
 /// Things the UI cannot do itself (file dialogs, quitting); the app runs them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -61,6 +97,9 @@ impl RecentEntry {
 /// tests and tooling click on real widgets instead of guessing coordinates.
 #[derive(Default, Clone, Debug)]
 pub struct UiLayout {
+    pub view_buttons: Vec<egui::Rect>,
+    pub depth_up: Option<egui::Rect>,
+    pub depth_down: Option<egui::Rect>,
     pub export_button: Option<egui::Rect>,
     pub textures: Vec<egui::Rect>,
     pub tile_new: Option<egui::Rect>,
@@ -172,7 +211,10 @@ pub struct UiState {
     /// Opacity of the parent layer shown behind the layer being drawn.
     pub ghost_opacity: f32,
     pub show_tools: bool,
-    pub show_zoom: bool,
+    /// 2D editing or one of the 3D views.
+    pub view_mode: ViewMode,
+    /// Turn and height of the 3D views.
+    pub view3d: crate::iso::View3d,
     /// The colour wheel and palettes window.
     pub show_colors: bool,
     /// The Regions window.
@@ -246,7 +288,8 @@ impl UiState {
             show_checker: false,
             ghost_opacity: 0.35,
             show_tools: true,
-            show_zoom: true,
+            view_mode: ViewMode::Edit,
+            view3d: crate::iso::View3d::default(),
             show_colors: true,
             show_regions: false,
             show_zones: true,
@@ -604,14 +647,15 @@ pub fn setup_style(ctx: &egui::Context) {
 /// Draws the whole interface for one frame.
 pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     let ctx = &ui.ctx().clone();
+    st.layout.tool_buttons.clear();
+    st.layout.view_buttons.clear();
     menu_bar(ui, ed, st);
+    header_bar(ui, ed, st);
+    status_bar(ui, ed, st);
     // Dialogs that ask for something block the Enter shortcut of the welcome screen.
     let modal = st.new_map.is_some() || st.confirm.is_some();
     if st.show_tools {
         tools_panel(ctx, ed, st);
-    }
-    if st.show_zoom {
-        zoom_panel(ctx, ed, st);
     }
     if st.show_colors {
         colors_window(ctx, ed, st);
@@ -634,10 +678,13 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             st.show_routes = true;
         }
     }
-    zones_layer(ctx, ed, st);
-    routes_layer(ctx, ed, st);
-    highlight_layer(ctx, ed, st);
-    selection_layer(ctx, ed);
+    if !st.view_mode.is_3d() {
+        zones_layer(ctx, ed, st);
+        routes_layer(ctx, ed, st);
+        highlight_layer(ctx, ed, st);
+        selection_layer(ctx, ed);
+        measure_layer(ctx, ed);
+    }
     if st.show_regions {
         regions_window(ctx, ed, st);
     } else {
@@ -653,7 +700,9 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         st.layout.route_names.clear();
         st.layout.route_deletes.clear();
     }
-    nodes_layer(ctx, ed, st);
+    if !st.view_mode.is_3d() {
+        nodes_layer(ctx, ed, st);
+    }
     export_window(ctx, ed, st);
     dialogs(ctx, ed, st);
     node_popup(ctx, ed, st);
@@ -755,10 +804,16 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 if item(ui, "Reset view", "") {
                     ed.reset_view();
                 }
+                ui.separator();
+                ui.label("Parent layer opacity");
+                ui.add(
+                    egui::Slider::new(&mut st.ghost_opacity, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .on_hover_text("Opacity of the layer behind the one you are drawing on");
             });
             ui.menu_button("Pages", |ui| {
                 ui.checkbox(&mut st.show_tools, "Textures & tools");
-                ui.checkbox(&mut st.show_zoom, "Zoom");
                 ui.checkbox(&mut st.show_colors, "Colors");
                 ui.checkbox(&mut st.show_regions, "Regions");
                 ui.checkbox(&mut st.show_routes, "Routes");
@@ -771,8 +826,107 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     st.show_about = true;
                 }
             });
-            if let Some(info) = ed.hover_info() {
-                ui.separator();
+        });
+    });
+}
+
+/// The row under the menu: tools, how the map is shown, zoom and depth.
+fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    egui::Panel::top("header").show(root, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let enabled = !st.view_mode.is_3d();
+            ui.add_enabled_ui(enabled, |ui| {
+                for (mode, label, tip) in [
+                    (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
+                    (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
+                    (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
+                    (ToolMode::Zone, "Region", "Region (R): mark out named places with a lasso or by clicking tiles"),
+                    (ToolMode::Route, "Route", "Route (T): click two nodes to connect them, then click the map to bend the route"),
+                    (ToolMode::Pick, "Pick", "Pick (C): click a cell to copy its tile and colour, then go back to the brush"),
+                    (ToolMode::Measure, "Measure", "Measure (M): click points to measure distances in cells"),
+                ] {
+                    let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
+                    st.layout.tool_buttons.push(r.rect);
+                    if r.clicked() {
+                        ed.tool = mode;
+                    }
+                }
+            });
+            ui.separator();
+            for mode in ViewMode::ALL {
+                let tip = match mode {
+                    ViewMode::Edit => "The flat map you draw on (V cycles the views)",
+                    ViewMode::Isometric => "See the map as a 3D heightfield from an angle (view only)",
+                    ViewMode::TopDown => "See the map from above with relief shading (view only)",
+                };
+                let r = ui.selectable_label(st.view_mode == mode, mode.name()).on_hover_text(tip);
+                st.layout.view_buttons.push(r.rect);
+                if r.clicked() {
+                    st.view_mode = mode;
+                }
+            }
+            if st.view_mode.is_3d() {
+                if st.view_mode == ViewMode::Isometric {
+                    if ui.small_button("<").on_hover_text("Turn the map left ( , )").clicked() {
+                        st.view3d.yaw -= std::f32::consts::FRAC_PI_4;
+                    }
+                    if ui.small_button(">").on_hover_text("Turn the map right ( . )").clicked() {
+                        st.view3d.yaw += std::f32::consts::FRAC_PI_4;
+                    }
+                }
+                ui.add(
+                    egui::Slider::new(&mut st.view3d.height_cells, 0.0..=crate::iso::MAX_HEIGHT_CELLS)
+                        .text("height")
+                        .max_decimals(0),
+                )
+                .on_hover_text("How tall the highest tile is, in cells. Set tile and colour heights with a right click in the palettes.");
+            }
+            ui.separator();
+            let out = ui.small_button("-").on_hover_text("Zoom out");
+            st.layout.zoom_out = Some(out.rect);
+            if out.clicked() {
+                ed.zoom_centre(0.5);
+            }
+            let reset = ui.small_button(ed.zoom_label()).on_hover_text("Reset zoom");
+            st.layout.zoom_reset = Some(reset.rect);
+            if reset.clicked() {
+                ed.reset_zoom();
+            }
+            let zin = ui.small_button("+").on_hover_text("Zoom in");
+            st.layout.zoom_in = Some(zin.rect);
+            if zin.clicked() {
+                ed.zoom_centre(2.0);
+            }
+            ui.separator();
+            let up = ui
+                .add_enabled(ed.camera.depth > 0, egui::Button::new("Up").small())
+                .on_hover_text("Back to the parent layer");
+            st.layout.depth_up = Some(up.rect);
+            if up.clicked() {
+                ed.jump_depth(-1);
+            }
+            ui.label(format!("depth {} / {}", ed.camera.depth, ed.spec().max_depth))
+                .on_hover_text(format!("Strokes snap to cells of {}", snap_label(ed.camera.depth)));
+            let down = ui
+                .add_enabled(ed.camera.depth < ed.spec().max_depth, egui::Button::new("Down").small())
+                .on_hover_text("Into the next, finer layer");
+            st.layout.depth_down = Some(down.rect);
+            if down.clicked() {
+                ed.jump_depth(1);
+            }
+            let whole = ui.small_button("Whole map").on_hover_text("Fit the whole map in the window");
+            if whole.clicked() {
+                ed.reset_view();
+            }
+        });
+    });
+}
+
+/// The strip at the bottom: cell under the mouse, last message, file name.
+fn status_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    egui::Panel::bottom("status").show(root, |ui| {
+        ui.horizontal(|ui| {
+            if let (false, Some(info)) = (st.view_mode.is_3d(), ed.hover_info()) {
                 let mut text = RichText::new(info.text()).monospace();
                 if !info.inside {
                     text = text.weak();
@@ -780,14 +934,14 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.label(text).on_hover_text(
                     "Cell under the mouse at the depth you are drawing on,\nand the parent cell (one depth up) it belongs to",
                 );
+                ui.separator();
+            }
+            if !ed.status.is_empty() {
+                ui.label(RichText::new(&ed.status).weak());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let name = format!("{}{}", ed.file_name(), if ed.modified() { " *" } else { "" });
                 ui.label(RichText::new(name).strong());
-                if !ed.status.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new(&ed.status).weak());
-                }
             });
         });
     });
@@ -853,7 +1007,6 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.textures.clear();
     st.layout.tile_new = None;
     st.layout.shapes.clear();
-    st.layout.tool_buttons.clear();
     st.layout.select_kinds.clear();
     st.layout.select_all = None;
     st.layout.select_invert = None;
@@ -863,9 +1016,10 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.eraser_toggle = None;
     st.layout.place_node = None;
     st.layout.import_icons = None;
-    let max_height = (ctx.content_rect().height() - 70.0).max(240.0);
+    // Below the header (76 px) and above the status bar, title bar included.
+    let max_height = (ctx.content_rect().height() - 76.0 - 90.0).max(240.0);
     egui::Window::new("Tools")
-        .anchor(Align2::LEFT_TOP, [10.0, 40.0])
+        .anchor(Align2::LEFT_TOP, [10.0, 76.0])
         .max_width(260.0)
         .resizable(false)
         .collapsible(true)
@@ -1005,101 +1159,6 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
         });
 }
 
-fn zoom_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
-    egui::Window::new("Zoom")
-        .anchor(Align2::RIGHT_TOP, [-10.0, 40.0])
-        .max_width(210.0)
-        .resizable(false)
-        .collapsible(true)
-        .show(ctx, |ui| {
-            ui.set_width(190.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(ed.zoom_label()).size(26.0).strong());
-                ui.label(
-                    RichText::new(format!(
-                        "depth {} of {}  ·  {:.1} px/cell",
-                        ed.camera.depth,
-                        ed.spec().max_depth,
-                        ed.pixels_per_cell()
-                    ))
-                    .weak(),
-                );
-                if let Some((w, h)) = ed.spec().extent(0) {
-                    ui.label(RichText::new(format!("map {w} × {h} cells")).weak());
-                }
-                ui.label(RichText::new(format!("snap: {}", snap_label(ed.camera.depth))).weak())
-                    .on_hover_text(
-                        "Strokes snap to the cells of the depth you are drawing on.\n\
-                         The grid is only an overlay; it never changes the map.",
-                    );
-            });
-
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 12.0) / 3.0;
-                let out = ui.add_sized([w, 28.0], egui::Button::new("−")).on_hover_text("Zoom out");
-                st.layout.zoom_out = Some(out.rect);
-                if out.clicked() {
-                    ed.zoom_centre(0.5);
-                }
-                let reset = ui.add_sized([w, 28.0], egui::Button::new("1:1")).on_hover_text("Reset zoom");
-                st.layout.zoom_reset = Some(reset.rect);
-                if reset.clicked() {
-                    ed.reset_zoom();
-                }
-                let zin = ui.add_sized([w, 28.0], egui::Button::new("+")).on_hover_text("Zoom in");
-                st.layout.zoom_in = Some(zin.rect);
-                if zin.clicked() {
-                    ed.zoom_centre(2.0);
-                }
-            });
-
-            let mut level = ed.zoom_level();
-            ui.spacing_mut().slider_width = 170.0;
-            let (lo, hi) = ed.zoom_range();
-            let slider = egui::Slider::new(&mut level, lo..=hi).show_value(false);
-            if ui.add(slider).changed() {
-                ed.set_zoom_level(level);
-            }
-
-            ui.separator();
-            ui.label(RichText::new("Depth").strong());
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 6.0) / 2.0;
-                if ui
-                    .add_sized([w, 26.0], egui::Button::new("Up one"))
-                    .on_hover_text("Back to the parent layer")
-                    .clicked()
-                {
-                    ed.jump_depth(-1);
-                }
-                if ui
-                    .add_enabled(
-                        ed.camera.depth < ed.spec().max_depth,
-                        egui::Button::new("Down one").min_size(vec2(w, 26.0)),
-                    )
-                    .on_hover_text("Into the next, finer layer")
-                    .clicked()
-                {
-                    ed.jump_depth(1);
-                }
-            });
-
-            ui.separator();
-            ui.label(RichText::new("Parent layer").strong());
-            ui.add(
-                egui::Slider::new(&mut st.ghost_opacity, 0.0..=1.0)
-                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-            )
-            .on_hover_text("Opacity of the layer behind the one you are drawing on");
-            ui.checkbox(&mut st.show_grid, "Show grid");
-            ui.checkbox(&mut st.show_checker, "Checker overlay")
-                .on_hover_text("Darkens every other cell of the depth you draw on, so single cells are easier to see");
-            if ui.button("Show whole map").clicked() {
-                ed.reset_view();
-            }
-        });
-}
-
 /// Cell size of a depth relative to a depth-0 cell, e.g. `1/16 cell`.
 pub fn snap_label(depth: u8) -> String {
     let n = (depth_subdiv() as u128).pow(depth as u32);
@@ -1200,23 +1259,15 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
 
 /// Brush / Fill / Select buttons and the selection controls.
 fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
-    ui.label(RichText::new("Tool").strong());
-    ui.horizontal_wrapped(|ui| {
-        for (mode, label, tip) in [
-            (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
-            (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
-            (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
-            (ToolMode::Zone, "Region", "Region (R): mark out named places with a lasso or by clicking tiles"),
-            (ToolMode::Route, "Route", "Route (T): click two nodes to connect them, then click the map to bend the route"),
-            (ToolMode::Pick, "Pick", "Pick (C): click a cell to copy its tile and colour, then go back to the brush"),
-        ] {
-            let r = ui.selectable_label(ed.tool == mode, label).on_hover_text(tip);
-            st.layout.tool_buttons.push(r.rect);
-            if r.clicked() {
-                ed.tool = mode;
-            }
-        }
-    });
+    ui.label(RichText::new(match ed.tool {
+        ToolMode::Paint => "Brush",
+        ToolMode::Fill => "Fill",
+        ToolMode::Select => "Select",
+        ToolMode::Zone => "Region",
+        ToolMode::Route => "Route",
+        ToolMode::Pick => "Pick",
+        ToolMode::Measure => "Measure",
+    }).strong());
     match ed.tool {
         ToolMode::Fill => {
             ui.label(RichText::new("Click: fill the connected area of the same tile (Shift: erase)").weak().small());
@@ -1261,6 +1312,11 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             };
             ui.label(RichText::new(hint).weak().small());
         }
+        ToolMode::Measure => {
+            let text = ed.measure_text().unwrap_or_else(|| "Click to start measuring, click again to add legs".into());
+            ui.label(RichText::new(text).small());
+            ui.label(RichText::new("Right click removes the last point, Esc clears.").weak().small());
+        }
         ToolMode::Pick => {
             ui.label(RichText::new("Click a cell: copies its tile and colour, then switches to the brush").weak().small());
         }
@@ -1276,6 +1332,40 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ed.clear_selection();
             }
         }
+    }
+}
+
+/// The measuring path with a label showing the distance.
+fn measure_layer(ctx: &egui::Context, ed: &Editor) {
+    if ed.tool != ToolMode::Measure || ed.measure.is_empty() {
+        return;
+    }
+    let ppp = ctx.pixels_per_point();
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("measure")))
+        .with_clip_rect(ctx.content_rect());
+    let pts: Vec<egui::Pos2> = ed
+        .measure_points()
+        .iter()
+        .map(|&p| {
+            let (x, y) = ed.route_point_px(ed.measure_depth, p);
+            egui::pos2(x as f32 / ppp, y as f32 / ppp)
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(4.0, Color32::from_black_alpha(170))));
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.0, Color32::from_rgb(255, 230, 90))));
+    for (i, &p) in pts.iter().enumerate() {
+        if i < ed.measure.len() {
+            painter.circle(p, 4.0, Color32::from_rgb(255, 230, 90), Stroke::new(1.5, Color32::BLACK));
+        }
+    }
+    if let (Some(text), Some(&at)) = (ed.measure_text(), pts.last()) {
+        let font = egui::FontId::proportional(13.0);
+        let pos = at + vec2(14.0, -14.0);
+        let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+        let r = Align2::LEFT_BOTTOM.anchor_size(pos, galley.size()).expand(4.0);
+        painter.rect_filled(r, 4.0, Color32::from_black_alpha(200));
+        painter.galley(r.min + vec2(4.0, 4.0), galley, Color32::WHITE);
     }
 }
 

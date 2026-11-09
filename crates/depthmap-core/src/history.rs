@@ -1,4 +1,5 @@
 use crate::node::Node;
+use crate::world::Meta;
 use crate::{Cell, World};
 
 /// One changed cell. Undo history stores these deltas, never snapshots, so
@@ -28,6 +29,8 @@ impl NodeEdit {
 enum Entry {
     Cells(Vec<CellEdit>),
     Node(NodeEdit),
+    /// Regions, routes, tiles and heights, before and after.
+    Meta(Box<(Meta, Meta)>),
 }
 
 const MAX_STROKES: usize = 2000;
@@ -87,6 +90,17 @@ impl History {
         self.push_undo(Entry::Node(NodeEdit { before, after }));
     }
 
+    /// Records a change to regions, routes, tiles or heights that was
+    /// already applied to the world.
+    pub fn record_meta(&mut self, before: Meta, after: Meta) {
+        if before == after {
+            return;
+        }
+        self.end_stroke();
+        self.redo.clear();
+        self.push_undo(Entry::Meta(Box::new((before, after))));
+    }
+
     pub fn undo(&mut self, world: &mut World) -> bool {
         self.end_stroke();
         let Some(entry) = self.undo.pop() else {
@@ -103,6 +117,7 @@ impl History {
                     world.set_node_state(id, e.before.as_ref());
                 }
             }
+            Entry::Meta(m) => world.restore_meta(&m.0),
         }
         self.redo.push(entry);
         true
@@ -123,6 +138,7 @@ impl History {
                     world.set_node_state(id, e.after.as_ref());
                 }
             }
+            Entry::Meta(m) => world.restore_meta(&m.1),
         }
         self.undo.push(entry);
         true

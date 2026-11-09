@@ -33,6 +33,17 @@ pub const NAMES: [&str; 14] = [
 /// Number of defined textures; valid ids are `1..=TEXTURE_COUNT`.
 pub const TEXTURE_COUNT: u8 = NAMES.len() as u8;
 
+/// Height (0..=255) each tile starts with in a new map, indexed by texture
+/// id. Water is low, brick walls high, the rest in between.
+pub fn default_heights() -> [u8; MAX_TEXTURES as usize + 1] {
+    let mut h = [10u8; MAX_TEXTURES as usize + 1];
+    h[0] = 0;
+    for (id, v) in [(2, 12), (3, 12), (4, 40), (5, 14), (6, 8), (8, 6), (9, 0), (13, 12)] {
+        h[id] = v;
+    }
+    h
+}
+
 pub fn name(id: u8) -> &'static str {
     if id == 0 {
         return "Empty";

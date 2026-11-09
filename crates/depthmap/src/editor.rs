@@ -35,6 +35,12 @@ enum Tool {
     Erase,
 }
 
+/// Formats a number with at most two decimals and no trailing zeros.
+fn trim_num(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// What the left mouse button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
@@ -50,6 +56,8 @@ pub enum ToolMode {
     Zone,
     /// Draw routes between nodes and bend them with extra points.
     Route,
+    /// Click points to measure distances in cells.
+    Measure,
 }
 
 /// How Select picks cells.
@@ -135,6 +143,9 @@ struct SelectDrag {
 pub struct Editor {
     pub world: World,
     pub history: History,
+    /// Regions, routes, tiles and heights as of the last undo step.
+    meta_base: depthmap_core::world::Meta,
+    meta_seen: u64,
     pub camera: Camera,
     /// Texture id painted by the left button (`1..=TEXTURE_COUNT`).
     pub texture: u8,
@@ -199,6 +210,9 @@ pub struct Editor {
     pub route_start: Option<depthmap_core::node::NodeId>,
     /// A via point being dragged: (route, point).
     route_drag: Option<(usize, usize)>,
+    /// Points being measured, in cells of `measure_depth`.
+    pub measure: Vec<(f64, f64)>,
+    pub measure_depth: u8,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
 }
@@ -287,6 +301,8 @@ impl Editor {
             saved_revision: world.revision(),
             world,
             history: History::new(),
+            meta_base: World::new().meta(),
+            meta_seen: 0,
             camera: Camera::new(),
             texture: 2,
             brush_rgb: DEFAULT_COLORS[2],
@@ -325,6 +341,8 @@ impl Editor {
             route_active: None,
             route_start: None,
             route_drag: None,
+            measure: Vec::new(),
+            measure_depth: 0,
             selection: None,
             select_drag: None,
         }
@@ -619,6 +637,59 @@ impl Editor {
             v.cell.0 as f64 + v.frac.0 + (sx - vw * 0.5) / v.ppc,
             v.cell.1 as f64 + v.frac.1 + (sy - vh * 0.5) / v.ppc,
         )
+    }
+
+    // ---- measuring --------------------------------------------------------
+
+    /// Adds a measuring point where the mouse is. The first point fixes the
+    /// layer the distances are counted in.
+    pub fn measure_click(&mut self) {
+        let Some((x, y)) = self.cursor_px else { return };
+        if self.measure.is_empty() {
+            self.measure_depth = self.camera.depth;
+        }
+        let p = self.point_at_depth(self.measure_depth, x, y);
+        self.measure.push(p);
+    }
+
+    /// The measured points plus the mouse position as a moving last point.
+    pub fn measure_points(&self) -> Vec<(f64, f64)> {
+        let mut pts = self.measure.clone();
+        if let (false, Some((x, y))) = (pts.is_empty(), self.cursor_px) {
+            pts.push(self.point_at_depth(self.measure_depth, x, y));
+        }
+        pts
+    }
+
+    /// Total length of the measured path in cells of the measured layer, and
+    /// the last leg's `(dx, dy)` in cells.
+    pub fn measure_totals(&self) -> Option<(f64, (f64, f64))> {
+        let pts = self.measure_points();
+        if pts.len() < 2 {
+            return None;
+        }
+        let total = pts.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
+        let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+        Some((total, ((b.0 - a.0).abs(), (b.1 - a.1).abs())))
+    }
+
+    /// One line describing the measurement, e.g. for the label by the cursor.
+    pub fn measure_text(&self) -> Option<String> {
+        let (total, (dx, dy)) = self.measure_totals()?;
+        let d = self.measure_depth;
+        let mut s = format!("{} cells", trim_num(total));
+        if self.measure.len() > 1 {
+            s += &format!(" (last leg dx {} dy {})", trim_num(dx), trim_num(dy));
+        } else {
+            s += &format!(" (dx {} dy {})", trim_num(dx), trim_num(dy));
+        }
+        // Counting squares like a board game: diagonals cost the same, or double.
+        s += &format!(", {} moves with diagonals / {} without", trim_num(dx.max(dy).round()), trim_num((dx + dy).round()));
+        if d > 0 {
+            let f = (depthmap_core::SUBDIV as f64).powi(d as i32);
+            s += &format!(", {} depth-0 cells", trim_num(total / f));
+        }
+        Some(s)
     }
 
     pub fn start_placing_node(&mut self) {
@@ -1296,6 +1367,7 @@ impl Editor {
             }
             ToolMode::Zone => self.begin_zone(shift),
             ToolMode::Route => self.begin_route(),
+            ToolMode::Measure => self.measure_click(),
         }
     }
 
@@ -1312,6 +1384,8 @@ impl Editor {
     pub fn secondary_press(&mut self, shift: bool) {
         if self.tool == ToolMode::Select {
             self.invert_selection();
+        } else if self.tool == ToolMode::Measure {
+            self.measure.pop();
         } else if self.tool == ToolMode::Route {
             self.remove_via_at_cursor();
         } else {
@@ -1507,6 +1581,8 @@ impl Editor {
             self.cancel_shape();
         } else if self.lasso.is_some() {
             self.lasso = None;
+        } else if self.tool == ToolMode::Measure && !self.measure.is_empty() {
+            self.measure.clear();
         } else if self.route_start.is_some() {
             self.route_start = None;
             self.status.clear();
@@ -1624,18 +1700,48 @@ impl Editor {
 
     // ---- history and files ------------------------------------------------
 
+    /// Forgets undo history and takes the current regions, routes, tiles and
+    /// heights as the starting point.
+    fn clear_history(&mut self) {
+        self.history.clear();
+        self.meta_base = self.world.meta();
+        self.meta_seen = self.world.meta_clock();
+    }
+
+    /// Turns changes to regions, routes, tiles and heights since the last
+    /// call into one undo step. The app calls this every frame while no
+    /// mouse button is held, so a drag is a single step.
+    pub fn settle(&mut self) {
+        if self.world.meta_clock() == self.meta_seen {
+            return;
+        }
+        let now = self.world.meta();
+        let before = std::mem::replace(&mut self.meta_base, now.clone());
+        self.meta_seen = self.world.meta_clock();
+        self.history.record_meta(before, now);
+    }
+
+    fn rebase_meta(&mut self) {
+        self.meta_base = self.world.meta();
+        self.meta_seen = self.world.meta_clock();
+    }
+
     pub fn undo(&mut self) {
+        self.settle();
         self.end_stroke();
         self.end_shape();
         self.close_node(true);
         self.history.undo(&mut self.world);
+        self.rebase_meta();
     }
 
     pub fn redo(&mut self) {
+        self.settle();
         self.end_stroke();
         self.end_shape();
         self.close_node(true);
         self.history.redo(&mut self.world);
+        self.rebase_meta();
     }
 
     /// True if the map changed since it was last saved, loaded or created.
@@ -1656,6 +1762,7 @@ impl Editor {
         self.node_session = None;
         self.node_drag = None;
         self.placing_node = false;
+        self.measure.clear();
         self.selection = None;
         self.select_drag = None;
         self.icons_revision += 1;
@@ -1678,7 +1785,7 @@ impl Editor {
         self.select_drag = None;
         let lost = self.world.set_max_depth(max_depth);
         if max_depth < before {
-            self.history.clear();
+            self.clear_history();
             self.selection = None;
         }
         self.constrain();
@@ -1696,7 +1803,7 @@ impl Editor {
         self.end_stroke();
         self.reset_transient();
         self.world = World::with_spec(spec);
-        self.history.clear();
+        self.clear_history();
         self.path = None;
         self.saved_revision = self.world.revision();
         self.status = match spec.extent(0) {
@@ -1737,7 +1844,7 @@ impl Editor {
             Ok(w) => {
                 self.reset_transient();
                 self.world = w;
-                self.history.clear();
+                self.clear_history();
                 self.path = Some(path.to_path_buf());
                 self.saved_revision = self.world.revision();
                 self.touched = Some(path.to_path_buf());
@@ -2489,7 +2596,11 @@ mod tests {
         let z = &e.world.zones()[i];
         assert_eq!(z.area().cell_count(), Some(9), "{}", e.status);
         assert!(z.contains(0, 6, 6) && z.contains(0, 8, 8) && !z.contains(0, 9, 9));
-        assert!(!e.history.can_undo(), "regions are not part of the paint history");
+        e.settle();
+        e.undo();
+        assert!(e.world.zones().is_empty(), "undo removes the region");
+        e.redo();
+        assert_eq!(e.world.zones().len(), 1);
         // Shift removes the middle column.
         lasso_around(&mut e, ((7, 5), (7, 9)), true);
         let z = &e.world.zones()[i];
@@ -2578,7 +2689,6 @@ mod tests {
         click(&mut e, 9, 0);
         let r = &e.world.routes()[0];
         assert_eq!(r.via.len(), 2);
-        assert!(!e.history.can_undo(), "routes are not part of the paint history");
         let curve = e.route_curve_px(r).unwrap();
         for (x, y) in [p(&e, 7, 9), p(&e, 9, 0)] {
             assert!(curve.distance_to((x, y)) < 1.0, "the route misses a point");
@@ -2988,5 +3098,86 @@ mod tests {
         assert_eq!(e.spec().max_depth, 5);
         e.set_zoom_level(10.0);
         assert!(e.camera.depth >= 4, "the new levels can be zoomed into");
+    }
+
+    #[test]
+    fn regions_tiles_and_heights_undo_and_redo_in_order_with_cells() {
+        let mut e = bounded(32, 32, 1);
+        e.mouse_moved(400.0, 300.0);
+        e.begin_paint();
+        e.end_stroke();
+        e.world.set_tile_height(3, 99);
+        e.settle();
+        e.world.add_zone(depthmap_core::zone::Zone::new("Z", [1, 2, 3], 0));
+        e.settle();
+        e.world.set_tile_height(3, 120);
+        e.world.set_color_height(5, 7);
+        e.settle(); // two changes before the next settle are one step
+        assert_eq!(e.world.tile_height(3), 120);
+        e.undo();
+        assert_eq!((e.world.tile_height(3), e.world.color_height(5)), (99, 0));
+        assert_eq!(e.world.zones().len(), 1);
+        e.undo();
+        assert!(e.world.zones().is_empty());
+        e.undo();
+        assert_eq!(e.world.tile_height(3), depthmap_core::texture::default_heights()[3]);
+        assert!(e.history.can_undo(), "the painted stroke is still undoable");
+        e.redo();
+        e.redo();
+        e.redo();
+        assert_eq!((e.world.tile_height(3), e.world.color_height(5)), (120, 7));
+        assert_eq!(e.world.zones().len(), 1);
+        // New work clears the redo stack.
+        e.undo();
+        e.world.set_tile_height(1, 5);
+        e.settle();
+        e.redo();
+        assert_eq!(e.world.tile_height(1), 5);
+        assert_eq!(e.world.tile_height(3), 99, "redo did nothing after new work");
+    }
+
+    #[test]
+    fn a_new_map_starts_with_clean_undo() {
+        let mut e = bounded(8, 8, 1);
+        e.world.set_tile_height(2, 1);
+        e.settle();
+        e.new_map(MapSpec::new(8, 8, 1));
+        e.undo();
+        assert_eq!(e.world.tile_height(2), depthmap_core::texture::default_heights()[2]);
+    }
+
+    #[test]
+    fn measuring_counts_cells_across_legs_and_depths() {
+        fn mclick(e: &mut Editor, x: i64, y: i64) {
+            let (px, py) = centre_of(e, (x, y));
+            e.mouse_moved(px, py);
+            e.primary_press(false);
+            e.primary_release();
+        }
+        let mut e = bounded(64, 64, 2);
+        e.tool = ToolMode::Measure;
+        assert!(e.measure_text().is_none());
+        mclick(&mut e, 10, 10);
+        assert!(e.measure_text().is_some() || e.measure.len() == 1);
+        // A second click 3 right and 4 down is 5 cells away.
+        mclick(&mut e, 13, 14);
+        let (total, (dx, dy)) = e.measure_totals().unwrap();
+        assert!((total - 5.0).abs() < 0.6, "{total}");
+        assert_eq!((dx, dy), (0.0, 0.0), "the last leg runs to the mouse, which is on the last point");
+        let (px, py) = centre_of(&e, (13, 20));
+        e.mouse_moved(px, py);
+        let (total, (dx, dy)) = e.measure_totals().unwrap();
+        assert!((total - 11.0).abs() < 0.6 && dx < 0.6 && (dy - 6.0).abs() < 0.6, "{total} {dx} {dy}");
+        // Right click drops the last point; Esc clears.
+        e.secondary_press(false);
+        assert_eq!(e.measure.len(), 1);
+        e.escape();
+        assert!(e.measure.is_empty());
+        // The first point fixes the layer; deeper depths report depth-0 cells too.
+        e.camera.depth = 1;
+        mclick(&mut e, 0, 0);
+        mclick(&mut e, 4, 0);
+        let t = e.measure_text().unwrap();
+        assert!(t.contains("depth-0"), "{t}");
     }
 }

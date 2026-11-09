@@ -1,5 +1,6 @@
 pub mod editor;
 pub mod export;
+pub mod iso;
 pub mod gui;
 pub mod palette;
 pub mod renderer;
