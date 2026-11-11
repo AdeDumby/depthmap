@@ -101,6 +101,8 @@ impl RecentEntry {
 /// tests and tooling click on real widgets instead of guessing coordinates.
 #[derive(Default, Clone, Debug)]
 pub struct UiLayout {
+    pub hex_copy: Option<egui::Rect>,
+    pub hex_paste: Option<egui::Rect>,
     pub brush_styles: Vec<egui::Rect>,
     pub recovery_discard: Option<egui::Rect>,
     pub view_buttons: Vec<egui::Rect>,
@@ -217,6 +219,9 @@ pub struct UiState {
     /// Opacity of the parent layer shown behind the layer being drawn.
     pub ghost_opacity: f32,
     pub show_tools: bool,
+    /// The part of the window left for the map once the bars are in place;
+    /// overlays and windows stay inside it.
+    pub map_area: egui::Rect,
     /// A height menu is open and is using the left and right arrow keys.
     pub arrows_captured: bool,
     /// 2D editing or one of the 3D views.
@@ -298,6 +303,7 @@ impl UiState {
             show_checker: false,
             ghost_opacity: 0.35,
             show_tools: true,
+            map_area: egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(100_000.0, 100_000.0)),
             arrows_captured: false,
             view_mode: ViewMode::Edit,
             view3d: crate::iso::View3d::default(),
@@ -668,6 +674,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     menu_bar(ui, ed, st);
     header_bar(ui, ed, st);
     status_bar(ui, ed, st);
+    st.map_area = ui.available_rect_before_wrap();
     // Dialogs that ask for something block the Enter shortcut of the welcome screen.
     let modal = st.new_map.is_some() || st.confirm.is_some();
     if st.show_tools {
@@ -698,8 +705,8 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         zones_layer(ctx, ed, st);
         routes_layer(ctx, ed, st);
         highlight_layer(ctx, ed, st);
-        selection_layer(ctx, ed);
-        measure_layer(ctx, ed);
+        selection_layer(ctx, ed, st.map_area);
+        measure_layer(ctx, ed, st.map_area);
     }
     if st.show_regions {
         regions_window(ctx, ed, st);
@@ -725,7 +732,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     startup_window(ctx, st, modal);
     new_map_window(ctx, st);
     depth_window(ctx, ed, st);
-    crate::tile_editor::window(ctx, ed, &mut st.tile_ed);
+    crate::tile_editor::window(ctx, ed, &mut st.tile_ed, st.map_area);
 }
 
 fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -1089,8 +1096,9 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.eraser_toggle = None;
     st.layout.import_icons = None;
     // Below the header (76 px) and above the status bar, title bar included.
-    let max_height = (ctx.content_rect().height() - 76.0 - 70.0).max(240.0);
+    let max_height = (st.map_area.height() - 40.0).max(240.0);
     egui::Window::new("Tools")
+        .constrain_to(st.map_area)
         .anchor(Align2::LEFT_TOP, [10.0, 76.0])
         .max_width(260.0)
         .resizable(false)
@@ -1276,6 +1284,7 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     let mut chosen: Option<Command> = None;
 
     egui::Window::new("Welcome to depthmap")
+        .constrain_to(st.map_area)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1419,14 +1428,14 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
 }
 
 /// The measuring path with a label showing the distance.
-fn measure_layer(ctx: &egui::Context, ed: &Editor) {
+fn measure_layer(ctx: &egui::Context, ed: &Editor, area: egui::Rect) {
     if ed.tool != ToolMode::Measure || ed.measure.is_empty() {
         return;
     }
     let ppp = ctx.pixels_per_point();
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("measure")))
-        .with_clip_rect(ctx.content_rect());
+        .with_clip_rect(area);
     let pts: Vec<egui::Pos2> = ed
         .measure_points()
         .iter()
@@ -1453,7 +1462,7 @@ fn measure_layer(ctx: &egui::Context, ed: &Editor) {
 }
 
 /// Draws the selection (and the rectangle being dragged) over the map.
-fn selection_layer(ctx: &egui::Context, ed: &Editor) {
+fn selection_layer(ctx: &egui::Context, ed: &Editor, area: egui::Rect) {
     if ed.tool != ToolMode::Paint && !ctx.is_pointer_over_egui() {
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
     }
@@ -1461,7 +1470,7 @@ fn selection_layer(ctx: &egui::Context, ed: &Editor) {
     let ppp = ctx.pixels_per_point();
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("selection")))
-        .with_clip_rect(ctx.content_rect());
+        .with_clip_rect(area);
     if let Some(pts) = ed.lasso_screen().filter(|p| p.len() > 1) {
         let colour = ed
             .active_zone()
@@ -1565,11 +1574,12 @@ fn node_label(world: &depthmap_core::World, id: depthmap_core::node::NodeId) -> 
 /// Draws the routes visible at the camera's depth: smooth curves through
 /// their points, with the active route's points as handles.
 fn routes_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
+    let area = st.map_area;
     let ppp = ctx.pixels_per_point();
     let to_pt = |p: (f64, f64)| egui::pos2(p.0 as f32 / ppp, p.1 as f32 / ppp);
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("routes")))
-        .with_clip_rect(ctx.content_rect());
+        .with_clip_rect(area);
     let line = |painter: &egui::Painter, pts: Vec<egui::Pos2>, w: f32, dw: f32, c: Color32, style: depthmap_core::route::RouteStyle| {
         use depthmap_core::route::RouteStyle;
         let stroke = Stroke::new(w, c);
@@ -1602,7 +1612,7 @@ fn routes_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
             }
             line(&painter, pts.clone(), w, w, c, r.style);
             if let Some(&mid) = pts.get(pts.len() / 2) {
-                if ctx.content_rect().contains(mid) && !r.name.is_empty() {
+                if area.contains(mid) && !r.name.is_empty() {
                     let at = mid + vec2(0.0, -(w * 0.5 + 9.0));
                     let font = egui::FontId::proportional(13.0);
                     for d in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
@@ -1640,6 +1650,7 @@ fn routes_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.route_names.clear();
     st.layout.route_deletes.clear();
     egui::Window::new("Routes")
+        .constrain_to(st.map_area)
         .open(&mut open)
         .default_pos(egui::pos2(290.0, 420.0))
         .default_width(260.0)
@@ -1664,7 +1675,7 @@ fn routes_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     };
                     ui.horizontal(|ui| {
                         let mut rgb = color;
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        if colour_button(ui, &mut rgb) {
                             ed.world.edit_route(i, |r| r.color = rgb);
                         }
                         let mut vis = visible;
@@ -1740,6 +1751,7 @@ fn routes_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 /// Flashes the cells drawn with a colour: while its swatch is hovered, and
 /// for a few seconds (fading) after it was clicked.
 fn highlight_layer(ctx: &egui::Context, ed: &Editor, st: &mut UiState) {
+    let area = st.map_area;
     const HOLD: f64 = 3.0;
     let now = ctx.input(|i| i.time);
     let (color, strength) = if let Some(c) = st.hl_hover.take() {
@@ -1760,7 +1772,7 @@ fn highlight_layer(ctx: &egui::Context, ed: &Editor, st: &mut UiState) {
     let runs = ed.world.color_runs(ed.camera.depth, color, min, max, 20_000);
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("highlight")))
-        .with_clip_rect(ctx.content_rect());
+        .with_clip_rect(area);
     let fill = Color32::from_rgba_unmultiplied(255, 235, 90, a(70.0 + 110.0 * pulse));
     let line = Color32::from_rgba_unmultiplied(255, 255, 255, a(230.0));
     for (y, x0, x1) in runs {
@@ -1779,13 +1791,14 @@ fn highlight_layer(ctx: &egui::Context, ed: &Editor, st: &mut UiState) {
 /// any depth show at the camera's depth, so a boundary drawn on one layer
 /// appears on all of them.
 fn zones_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
+    let area = st.map_area;
     if !st.show_zones || ed.world.zones().is_empty() {
         return;
     }
     let ppp = ctx.pixels_per_point();
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("zones")))
-        .with_clip_rect(ctx.content_rect());
+        .with_clip_rect(area);
     let active = ed.active_zone();
     for (i, z) in ed.world.zones().iter().enumerate() {
         if !z.visible || z.is_empty() {
@@ -1794,7 +1807,7 @@ fn zones_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
         let c = Color32::from_rgb(z.color[0], z.color[1], z.color[2]);
         let alpha = if Some(i) == active && ed.tool == ToolMode::Zone { 120 } else { 84 };
         if let Some(at) = draw_selection(&painter, ed, z.area(), ppp, c, alpha) {
-            if ctx.content_rect().contains(at) {
+            if area.contains(at) {
                 let font = egui::FontId::proportional(15.0);
                 for d in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
                     painter.text(at + egui::vec2(d.0, d.1), egui::Align2::CENTER_CENTER, &z.name, font.clone(), Color32::from_black_alpha(220));
@@ -1815,6 +1828,7 @@ fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.zone_new = None;
     st.layout.zone_from_selection = None;
     egui::Window::new("Regions")
+        .constrain_to(st.map_area)
         .open(&mut open)
         .default_pos(egui::pos2(290.0, 80.0))
         .default_width(260.0)
@@ -1867,7 +1881,7 @@ fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     };
                     ui.horizontal(|ui| {
                         let mut rgb = color;
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        if colour_button(ui, &mut rgb) {
                             ed.world.edit_zone(i, |z| z.color = rgb);
                         }
                         let mut vis = visible;
@@ -1916,6 +1930,7 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     l.swatches.clear();
     l.palette_entries.clear();
     (l.sv_square, l.hue_bar, l.hex_field) = (None, None, None);
+    (l.hex_copy, l.hex_paste) = (None, None);
     l.rgb_fields.clear();
     (l.palette_new, l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None, None);
     (l.palette_name_field, l.palette_rename_ok) = (None, None);
@@ -1928,6 +1943,7 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let mut open = st.show_colors;
     let mut acts: Vec<PaletteAct> = Vec::new();
     egui::Window::new("Colors")
+        .constrain_to(st.map_area)
         // Left of the zoom panel, so the two do not cover each other.
         .default_pos(egui::pos2((screen.right() - 500.0).max(290.0), 80.0))
         .resizable(false)
@@ -2183,7 +2199,71 @@ fn picker_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             }
         }
         ui.label(RichText::new("hex").weak().small());
+        let mut c = ed.brush_rgb;
+        if let Some((copy, paste)) = hex_copy_paste(ui, &mut c) {
+            st.layout.hex_copy = Some(copy);
+            st.layout.hex_paste = Some(paste);
+        }
+        if c != ed.brush_rgb {
+            st.follow_brush(c);
+            st.hsv_rgb = c;
+            ed.set_brush_rgb(c);
+        }
     });
+}
+
+/// `#rrggbb` text for a colour.
+pub fn hex_string(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+/// A colour from whatever is on the system clipboard, if it reads as hex.
+fn clipboard_colour() -> Option<[u8; 3]> {
+    let text = arboard::Clipboard::new().ok()?.get_text().ok()?;
+    palette::parse_hex(text.lines().next()?)
+}
+
+/// Copy and Paste buttons for a hex colour: copy puts `#rrggbb` on the
+/// clipboard, paste reads one (`#rgb` and `rrggbb` work too) and sets `rgb`.
+/// Returns the two button rectangles.
+fn hex_copy_paste(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> Option<(egui::Rect, egui::Rect)> {
+    let copy = ui.small_button("Copy").on_hover_text("Copy the hex code to the clipboard");
+    if copy.clicked() {
+        ui.ctx().copy_text(hex_string(*rgb));
+    }
+    let paste = ui.small_button("Paste").on_hover_text("Use the hex code on the clipboard");
+    if paste.clicked() {
+        if let Some(c) = clipboard_colour() {
+            *rgb = c;
+        }
+    }
+    Some((copy.rect, paste.rect))
+}
+
+/// A colour swatch that opens a picker with the hex code and Copy / Paste;
+/// true when the colour changed.
+fn colour_button(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 20.0), Sense::click());
+    ui.painter().rect_filled(rect, 3.0, rgb32(*rgb));
+    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
+    let resp = resp.on_hover_text(format!("{}  (click to change)", hex_string(*rgb)));
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let mut c = rgb32(*rgb);
+            if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+                *rgb = [c.r(), c.g(), c.b()];
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(hex_string(*rgb)).monospace());
+                let before = *rgb;
+                hex_copy_paste(ui, rgb);
+                changed |= *rgb != before;
+            });
+        });
+    changed
 }
 
 fn palette_section(
@@ -2328,7 +2408,7 @@ fn nodes_layer(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     if !ed.show_nodes && !ed.placing_node {
         return;
     }
-    let avail = ctx.content_rect();
+    let avail = st.map_area;
     let painter = ctx
         .layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::unique("nodes")))
         .with_clip_rect(avail);
@@ -2444,6 +2524,7 @@ fn node_popup(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let focus = st.focus_node == Some(id);
 
     egui::Window::new("Node")
+        .constrain_to(st.map_area)
         .id(egui::Id::unique(("node-popup", id)))
         .default_pos(pos)
         .resizable(false)
@@ -2613,6 +2694,7 @@ fn export_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let (mut go, mut close) = (false, ctx.input(|i| i.key_pressed(egui::Key::Escape)));
     let bounded = ed.spec().is_bounded();
     egui::Window::new("Export image")
+        .constrain_to(st.map_area)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
@@ -2697,6 +2779,7 @@ fn depth_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     let (mut minus, mut plus, mut field, mut ok, mut no) = (None, None, None, None, None);
 
     egui::Window::new("Map depth")
+        .constrain_to(st.map_area)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
@@ -2788,6 +2871,7 @@ fn new_map_window(ctx: &egui::Context, st: &mut UiState) {
     let mut cancel_rect = None;
 
     egui::Window::new("New map")
+        .constrain_to(st.map_area)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
@@ -2886,6 +2970,7 @@ fn new_map_window(ctx: &egui::Context, st: &mut UiState) {
 fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     if let Some(cmd) = st.confirm.clone() {
         egui::Window::new("Unsaved changes")
+        .constrain_to(st.map_area)
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
@@ -2916,6 +3001,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 
     if let Some(r) = st.recovery.clone() {
         egui::Window::new("Restore unsaved work?")
+        .constrain_to(st.map_area)
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
@@ -2944,6 +3030,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 
     if st.show_help {
         egui::Window::new("Controls")
+        .constrain_to(st.map_area)
             .open(&mut st.show_help)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2985,6 +3072,7 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 
     if st.show_about {
         egui::Window::new("About depthmap")
+        .constrain_to(st.map_area)
             .open(&mut st.show_about)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])

@@ -400,7 +400,7 @@ fn pixel_rect(rect: Rect, cell: f32, (x, y): (usize, usize)) -> Rect {
 }
 
 /// Draws the window.
-pub fn window(ctx: &egui::Context, ed: &mut Editor, slot: &mut Option<TileEditor>) {
+pub fn window(ctx: &egui::Context, ed: &mut Editor, slot: &mut Option<TileEditor>, area: Rect) {
     let Some(te) = slot.as_mut() else { return };
     let mut close = false;
     let mut save = false;
@@ -414,6 +414,7 @@ pub fn window(ctx: &egui::Context, ed: &mut Editor, slot: &mut Option<TileEditor
     te.save_button = None;
     let cell = 14.0_f32;
     egui::Window::new("Tile editor")
+        .constrain_to(area)
         .collapsible(false)
         .resizable(false)
         .default_pos(pos2(300.0, 60.0))

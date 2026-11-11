@@ -518,6 +518,7 @@ dependencies = [
 name = "depthmap"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "bytemuck",
  "depthmap-core",
  "dirs",

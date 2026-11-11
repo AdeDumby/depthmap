@@ -1429,3 +1429,46 @@ fn screenshots_of_header_and_tile_editor() {
     }
     save_png("ui_tile_editor", &read_back(&gpu));
 }
+
+#[test]
+fn hex_copy_button_puts_the_code_on_the_clipboard() {
+    let mut h = Harness::new();
+    h.ed.set_brush_rgb([0x12, 0xab, 0xef]);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let copy = h.st.layout.hex_copy.expect("Copy button next to the hex field");
+    assert!(h.st.layout.hex_paste.is_some());
+    let c = copy.center();
+    let button = |pressed| Event::PointerButton { pos: c, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+    h.frame(vec![Event::PointerMoved(c)]);
+    h.frame(vec![button(true)]);
+    let out = h.frame(vec![button(false)]);
+    let copied: Vec<String> = out
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied, vec!["#12abef".to_string()]);
+    assert_eq!(depthmap::gui::hex_string([1, 2, 255]), "#0102ff");
+}
+
+#[test]
+fn overlays_and_windows_stay_below_the_header_bar() {
+    let mut h = Harness::new();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let header = h.st.layout.tool_buttons[0];
+    let area = h.st.map_area;
+    assert!(area.min.y > header.max.y, "map area {area:?} starts below the header {header:?}");
+    assert!(area.max.y < H, "and above the status bar");
+    // A window dragged far above the screen is pulled back under the header.
+    h.ed.set_brush_rgb([1, 2, 3]);
+    let tools_top = h.ctx.memory(|m| m.area_rect(egui::Id::new("Tools"))).map(|r| r.min.y);
+    if let Some(top) = tools_top {
+        assert!(top >= area.min.y - 0.5, "Tools window top {top} vs {}", area.min.y);
+    }
+}

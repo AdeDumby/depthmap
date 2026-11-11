@@ -19,4 +19,5 @@ env_logger = "0.11"
 log = "0.4"
 rustc-hash.workspace = true
 png = "0.18"
+arboard = "3"
 
