@@ -165,9 +165,13 @@ pub fn faces(world: &World, camera: &Camera, size: (u32, u32), view: &View3d) ->
             faces.push(Face { pos, z: [h, h], kind: TOP, tex, color, shade: top });
             if view.mode == Mode3d::Isometric {
                 for (kind, di, dj) in [(SOUTH, 0, 1), (EAST, 1, 0), (NORTH, 0, -1), (WEST, -1, 0)] {
-                    let nh = height(at((i as i32 + di) as usize, (j as i32 + dj) as usize));
+                    let neighbour = at((i as i32 + di) as usize, (j as i32 + dj) as usize);
+                    let nh = height(neighbour);
                     if nh < h {
                         faces.push(Face { pos, z: [nh, h], kind, tex, color, shade: 1.0 });
+                    } else if h < 0.0 && matches!(neighbour, None | Some(EMPTY)) {
+                        // A pit beside bare ground: its inner wall, lit from inside.
+                        faces.push(Face { pos, z: [h, 0.0], kind, tex, color, shade: -1.0 });
                     }
                 }
             }
@@ -491,5 +495,18 @@ mod tests {
         let s = faces(&w, &cam, (800, 600), &View3d::default());
         assert_eq!(s.depth, 1);
         assert!(s.faces.iter().any(|f| f.kind == TOP && f.tex == 4), "the depth-0 bricks show at depth 1");
+    }
+
+    #[test]
+    fn pits_go_below_the_ground_and_get_inner_walls() {
+        let mut w = World::with_spec(MapSpec::new(16, 16, 1));
+        w.set_tile_height(9, -255);
+        w.set(0, 6, 6, make_cell(9, 0));
+        let s = scene(&w, &View3d { height_cells: 10.0, ..Default::default() });
+        let top = s.faces.iter().find(|f| f.kind == TOP).unwrap();
+        assert!((top.z[1] + 10.0).abs() < 1e-4, "255 below is the full height scale down: {:?}", top.z);
+        let walls: Vec<_> = s.faces.iter().filter(|f| f.kind != TOP).collect();
+        assert_eq!(walls.len(), 4, "one inner wall per side");
+        assert!(walls.iter().all(|f| f.shade < 0.0 && f.z[0] < f.z[1] && f.z[1] == 0.0));
     }
 }

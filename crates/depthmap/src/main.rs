@@ -425,7 +425,9 @@ impl App {
         let ctrl = self.mods.control_key() || self.mods.super_key();
         if let PhysicalKey::Code(code) = event.physical_key {
             // Only the arrow keys move the camera; letters are tool shortcuts.
+            let captured = self.gfx.as_ref().is_some_and(|g| g.gui.state.arrows_captured);
             match code {
+                KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::ArrowLeft | KeyCode::ArrowRight if captured && pressed => {}
                 KeyCode::ArrowUp => self.held.up = pressed,
                 KeyCode::ArrowDown => self.held.down = pressed,
                 KeyCode::ArrowLeft => self.held.left = pressed,

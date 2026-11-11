@@ -217,6 +217,8 @@ pub struct UiState {
     /// Opacity of the parent layer shown behind the layer being drawn.
     pub ghost_opacity: f32,
     pub show_tools: bool,
+    /// A height menu is open and is using the left and right arrow keys.
+    pub arrows_captured: bool,
     /// 2D editing or one of the 3D views.
     pub view_mode: ViewMode,
     /// Turn and height of the 3D views.
@@ -296,6 +298,7 @@ impl UiState {
             show_checker: false,
             ghost_opacity: 0.35,
             show_tools: true,
+            arrows_captured: false,
             view_mode: ViewMode::Edit,
             view3d: crate::iso::View3d::default(),
             show_colors: true,
@@ -661,6 +664,7 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     st.layout.tool_buttons.clear();
     st.layout.view_buttons.clear();
     st.layout.place_node = None;
+    st.arrows_captured = false;
     menu_bar(ui, ed, st);
     header_bar(ui, ed, st);
     status_bar(ui, ed, st);
@@ -842,14 +846,42 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     });
 }
 
-/// A height editor (0 to 255) for a right-click menu; true when it changed.
-fn height_menu(ui: &mut egui::Ui, title: &str, h: &mut u8) -> bool {
+/// A height editor (-255 to 255) for a right-click menu: arrow buttons step
+/// by 1 or 10 (the left and right arrow keys do too while it is open); true
+/// when the value changed.
+fn height_menu(ui: &mut egui::Ui, st: &mut UiState, title: &str, h: &mut i16) -> bool {
+    use depthmap_core::world::{MAX_HEIGHT, MIN_HEIGHT};
     ui.label(RichText::new(title).strong());
-    ui.label(RichText::new("Used by the 3D views. A cell is its tile's height plus its colour's.").weak().small());
+    ui.label(RichText::new("Used by the 3D views. A cell is its tile's height plus its colour's. Below zero is a pit.").weak().small());
     let before = *h;
-    ui.add(egui::Slider::new(h, 0..=255));
+    // The arrow keys belong to this menu while it is open (not the camera).
+    st.arrows_captured = true;
+    let mut step = 0i16;
+    ui.input_mut(|i| {
+        let big = i.modifiers.shift;
+        for (key, dir) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
+            if i.consume_key(egui::Modifiers::NONE, key) || i.consume_key(egui::Modifiers::SHIFT, key) {
+                step += dir * if big { 10 } else { 1 };
+            }
+        }
+    });
     ui.horizontal(|ui| {
-        for v in [0u8, 10, 40, 100, 255] {
+        for (label, d, tip) in [("<<", -10, "Down by 10"), ("<", -1, "Down by 1 (left arrow key)")] {
+            if ui.button(label).on_hover_text(tip).clicked() {
+                step += d;
+            }
+        }
+        ui.add(egui::DragValue::new(h).range(MIN_HEIGHT..=MAX_HEIGHT).speed(0.5));
+        for (label, d, tip) in [(">", 1, "Up by 1 (right arrow key)"), (">>", 10, "Up by 10")] {
+            if ui.button(label).on_hover_text(tip).clicked() {
+                step += d;
+            }
+        }
+    });
+    *h = (*h + step).clamp(MIN_HEIGHT, MAX_HEIGHT);
+    ui.add(egui::Slider::new(h, MIN_HEIGHT..=MAX_HEIGHT).show_value(false));
+    ui.horizontal(|ui| {
+        for v in [-255i16, -50, 0, 10, 50, 255] {
             if ui.small_button(v.to_string()).clicked() {
                 *h = v;
             }
@@ -1114,7 +1146,7 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                         let resp = resp.on_hover_text(tip);
                         resp.context_menu(|ui| {
                             let mut h = ed.world.tile_height(id);
-                            if height_menu(ui, &format!("Height of {}", tex_name(ed, id)), &mut h) {
+                            if height_menu(ui, st, &format!("Height of {}", tex_name(ed, id)), &mut h) {
                                 ed.world.set_tile_height(id, h);
                             }
                         });
@@ -1319,15 +1351,6 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
 
 /// Brush / Fill / Select buttons and the selection controls.
 fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
-    ui.label(RichText::new(match ed.tool {
-        ToolMode::Paint => "Brush",
-        ToolMode::Fill => "Fill",
-        ToolMode::Select => "Select",
-        ToolMode::Zone => "Region",
-        ToolMode::Route => "Route",
-        ToolMode::Pick => "Pick",
-        ToolMode::Measure => "Measure",
-    }).strong());
     match ed.tool {
         ToolMode::Fill => {
             ui.label(RichText::new("Click: fill the connected area of the same tile (Shift: erase)").weak().small());
@@ -1950,7 +1973,7 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                             let resp = resp.on_hover_text(tip);
                             resp.context_menu(|ui| {
                                 let mut h = ed.world.color_height(idx);
-                                if height_menu(ui, "Extra height of this colour", &mut h) {
+                                if height_menu(ui, st, "Extra height of this colour", &mut h) {
                                     ed.world.set_color_height(idx, h);
                                 }
                             });

@@ -186,7 +186,7 @@ layer (while hovered, and for a few seconds after the click).
 The bar under the menu holds the tools (Brush, Fill, Select, Region, Route, Pick, Measure, Add node), the view switch, zoom and depth. The strip at the bottom shows the cell under the mouse, the last message and the file name.
 
 - **Measure (M):** click points to lay out a path; the label shows its length in cells of the layer you started on (and in depth-0 cells), the last leg's dx/dy, and the number of board-game moves with and without diagonals. Right click removes the last point, Esc clears.
-- **2D / Isometric / Top-down:** the 3D views draw the map as a heightfield. A cell's height is its tile's height plus its colour's (0 to 255 each, capped at 255). **Right click a tile** in the Tools window, or a colour in *Map colors*, to set its height; water starts flat and brick walls tall. The *height* slider sets how many cells tall 255 is. Isometric can be turned with `<` `>` buttons or the `,` `.` keys; `V` cycles the views. The 3D views are for looking (pan and zoom as usual); empty cells show the parent layer through.
+- **2D / Isometric / Top-down:** the 3D views draw the map as a heightfield. A cell's height is its tile's height plus its colour's (-255 to 255 each; the sum is kept within that, and below zero is a pit). **Right click a tile** in the Tools window, or a colour in *Map colors*, to set its height; water starts flat and brick walls tall. The *height* slider sets how many cells tall 255 is. Isometric can be turned with `<` `>` buttons or the `,` `.` keys; `V` cycles the views. The 3D views are for looking (pan and zoom as usual); empty cells show the parent layer through.
 
 ## Undo and recovery
 

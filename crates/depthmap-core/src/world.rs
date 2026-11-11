@@ -60,12 +60,16 @@ pub struct World {
     zones: Vec<Zone>,
     routes: Vec<Route>,
     /// Height (0..=255) of each tile, indexed by texture id.
-    tile_heights: [u8; MAX_TEXTURES as usize + 1],
+    tile_heights: [i16; MAX_TEXTURES as usize + 1],
     /// Extra height of each colour index, added to the tile's.
-    color_heights: Vec<u8>,
+    color_heights: Vec<i16>,
     /// Bumped by every change to regions, routes, tiles and heights.
     meta_clock: u64,
 }
+
+/// Lowest and highest height a tile, a colour or a cell can have.
+pub const MIN_HEIGHT: i16 = -255;
+pub const MAX_HEIGHT: i16 = 255;
 
 /// Everything about a map that is not cells or nodes and is small enough to
 /// snapshot for undo: regions, routes, custom tiles and heights.
@@ -74,8 +78,8 @@ pub struct Meta {
     zones: Vec<Zone>,
     routes: Vec<Route>,
     tiles: Vec<Option<CustomTile>>,
-    tile_heights: [u8; MAX_TEXTURES as usize + 1],
-    color_heights: Vec<u8>,
+    tile_heights: [i16; MAX_TEXTURES as usize + 1],
+    color_heights: Vec<i16>,
 }
 
 impl Default for World {
@@ -117,15 +121,16 @@ impl World {
 
     // ---- heights (for the 3D view) ------------------------------------------------
 
-    pub fn tile_height(&self, id: u8) -> u8 {
+    pub fn tile_height(&self, id: u8) -> i16 {
         self.tile_heights.get(id as usize).copied().unwrap_or(0)
     }
 
-    pub fn color_height(&self, index: u8) -> u8 {
+    pub fn color_height(&self, index: u8) -> i16 {
         self.color_heights.get(index as usize).copied().unwrap_or(0)
     }
 
-    pub fn set_tile_height(&mut self, id: u8, h: u8) {
+    pub fn set_tile_height(&mut self, id: u8, h: i16) {
+        let h = h.clamp(MIN_HEIGHT, MAX_HEIGHT);
         if let Some(slot) = self.tile_heights.get_mut(id as usize) {
             if *slot != h {
                 *slot = h;
@@ -134,7 +139,8 @@ impl World {
         }
     }
 
-    pub fn set_color_height(&mut self, index: u8, h: u8) {
+    pub fn set_color_height(&mut self, index: u8, h: i16) {
+        let h = h.clamp(MIN_HEIGHT, MAX_HEIGHT);
         if let Some(slot) = self.color_heights.get_mut(index as usize) {
             if *slot != h {
                 *slot = h;
@@ -143,15 +149,14 @@ impl World {
         }
     }
 
-    /// Height of a cell: its tile's height plus its colour's, at most 255.
-    /// Empty cells are 0.
-    pub fn cell_height(&self, cell: Cell) -> u8 {
+    /// Height of a cell: its tile's height plus its colour's, kept within
+    /// -255 to 255 (below zero is a pit). Empty cells are 0.
+    pub fn cell_height(&self, cell: Cell) -> i16 {
         if cell == crate::EMPTY {
             return 0;
         }
-        let h = self.tile_height(crate::cell_texture(cell)) as u16
-            + self.color_height(crate::cell_color(cell)) as u16;
-        h.min(255) as u8
+        (self.tile_height(crate::cell_texture(cell)) + self.color_height(crate::cell_color(cell)))
+            .clamp(MIN_HEIGHT, MAX_HEIGHT)
     }
 
     // ---- snapshots for undo --------------------------------------------------------
@@ -918,6 +923,15 @@ mod height_tests {
         w.set_color_height(3, 100);
         assert_eq!(w.cell_height(make_cell(1, 3)), 255);
         assert_eq!(w.cell_height(make_cell(1, 0)), 200);
+        // Heights may go below zero, and never past the limits.
+        w.set_tile_height(1, -200);
+        w.set_color_height(3, -100);
+        assert_eq!(w.cell_height(make_cell(1, 3)), -255);
+        assert_eq!(w.cell_height(make_cell(1, 0)), -200);
+        w.set_tile_height(1, 5000);
+        assert_eq!(w.tile_height(1), 255);
+        w.set_tile_height(1, -5000);
+        assert_eq!(w.tile_height(1), -255);
     }
 
     #[test]

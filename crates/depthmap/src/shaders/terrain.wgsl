@@ -65,6 +65,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, f: Face) -> VOut {
     // Sides are lit by the turned normal; the top keeps its own shade.
     var shade = f.shade;
     if (f.kind != 0u) {
+        if (f.shade < 0.0) { n = -n; } // inner wall of a pit
         let nu = n.x * g.yaw.x - n.y * g.yaw.y;
         let nv = n.x * g.yaw.y + n.y * g.yaw.x;
         shade = 0.5 + 0.4 * clamp(dot(vec2<f32>(nu, nv), normalize(vec2<f32>(-0.6, 0.8))) * 0.5 + 0.5, 0.0, 1.0);
