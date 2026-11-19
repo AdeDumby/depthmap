@@ -164,7 +164,10 @@ The **Route** tool (T) draws a route between two nodes. Click the start node, th
 created on the depth you are viewing. Then click the map to add points: the route is a smooth curve that
 passes through every point, in order (a new point goes into the stretch of the route nearest to the click).
 Drag a point to move it, right click it to remove it. The Routes window (Pages menu, opens with the tool)
-lists routes and sets name, colour, width, solid / dashed / dotted, and can swap the ends or clear the points.
+lists routes in **folders** and sets name, width, solid / dashed / dotted, and can swap the ends or clear the points.
+Click a folder to open or close it. A folder has a colour (click its swatch) and every route in it is drawn in that
+colour. New routes go into the selected folder; pick another folder for a route in its editor. Deleting a folder
+moves its routes to a neighbouring folder. Older maps get one folder per route colour.
 
 A route is shown on the depth it was drawn on and every deeper depth, never on shallower ones. It follows its
 nodes when they move; if a node is deleted the route is hidden (it comes back if the node does). Routes are

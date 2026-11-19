@@ -13,7 +13,9 @@
 //!                      | art[2048] | overhang art[2048] if flagged }*   (version 6)
 //!         | zones u16 | { name_len u16 + name | rgb[3] | visible u8 | depth u8
 //!                     | rows u32 | { y i64 | spans u32 | { x0 i64, x1 i64 }* }* }*   (version 7)
+//!         | folders u8 | { name_len u16 + name | rgb[3] | open u8 }*   (version 11)
 //!         | routes u16 | { name_len u16 + name | rgb[3] | width u8 | style u8 | visible u8 | depth u8
+//!                      | folder u16 (version 11)
 //!                      | from u64 | to u64 | via u16 | { x f64, y f64 }* }*   (version 8)
 //!         | tile heights i16 * 32 | colour heights i16 * 256   (version 10; bytes in 9)
 //!         | color_count u16 | { r g b }*color_count
@@ -41,7 +43,7 @@ use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 10;
+const VERSION: u32 = 11;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -118,6 +120,12 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
             }
         }
     }
+    raw.push(world.route_folders().len() as u8);
+    for f in world.route_folders() {
+        put_str16(&mut raw, &f.name);
+        raw.extend(f.color);
+        raw.push(f.expanded as u8);
+    }
     raw.extend((world.routes().len() as u16).to_le_bytes());
     for r in world.routes() {
         put_str16(&mut raw, &r.name);
@@ -126,6 +134,7 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         raw.push(r.style.to_byte());
         raw.push(r.visible as u8);
         raw.push(r.depth);
+        raw.extend(r.folder.to_le_bytes());
         raw.extend(r.from.to_le_bytes());
         raw.extend(r.to.to_le_bytes());
         raw.extend((r.via.len() as u16).to_le_bytes());
@@ -331,6 +340,23 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
         }
     }
 
+    // Route folders (version 11).
+    let mut folder_list: Vec<crate::route::RouteFolder> = Vec::new();
+    if version >= 11 {
+        let count = cur.take(1)?[0] as usize;
+        if count == 0 || count > crate::route::MAX_FOLDERS {
+            return Err(invalid("bad route folders"));
+        }
+        for _ in 0..count {
+            let name = cur.string16()?;
+            let color: [u8; 3] = cur.take(3)?.try_into().unwrap();
+            let open = cur.take(1)?[0] != 0;
+            let mut f = crate::route::RouteFolder::new(&name, color);
+            f.expanded = open;
+            folder_list.push(f);
+        }
+    }
+
     // Routes (version 8).
     let mut route_list: Vec<Route> = Vec::new();
     if version >= 8 {
@@ -348,6 +374,15 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             if !(MIN_WIDTH..=MAX_WIDTH).contains(&width) || depth > spec.max_depth {
                 return Err(invalid("bad route"));
             }
+            let folder = if version >= 11 {
+                let f = u16::from_le_bytes(cur.take(2)?.try_into().unwrap());
+                if f as usize >= folder_list.len() {
+                    return Err(invalid("bad route folder"));
+                }
+                f
+            } else {
+                0
+            };
             let from = u64::from_le_bytes(cur.take(8)?.try_into().unwrap());
             let to = u64::from_le_bytes(cur.take(8)?.try_into().unwrap());
             let n = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
@@ -365,6 +400,7 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             }
             let mut r = Route::new(&name, color, depth, from, to);
             (r.width, r.style, r.visible, r.via) = (width, style, visible, via);
+            r.folder = folder;
             route_list.push(r);
         }
     }
@@ -451,6 +487,22 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             world.set_color_height(i as u8, h);
         }
     }
+    if version < 11 {
+        // Older maps: one folder per distinct route colour, in order.
+        for r in &mut route_list {
+            let at = folder_list.iter().position(|f| f.color == r.color).or_else(|| {
+                if folder_list.len() < crate::route::MAX_FOLDERS {
+                    let n = folder_list.len() + 1;
+                    folder_list.push(crate::route::RouteFolder::new(&format!("Routes {n}"), r.color));
+                    Some(folder_list.len() - 1)
+                } else {
+                    None
+                }
+            });
+            r.folder = at.unwrap_or(0) as u16;
+        }
+    }
+    world.set_route_folders(folder_list);
     for r in route_list {
         world.add_route(r).ok_or_else(|| invalid("too many routes"))?;
     }
@@ -840,7 +892,12 @@ mod tests {
     fn routes_round_trip() {
         use crate::route::{Route, RouteStyle};
         let mut w = World::new();
+        w.set_route_folders(vec![
+            crate::route::RouteFolder::new("Roads", [9, 9, 9]),
+            crate::route::RouteFolder::new("Rivers", [1, 2, 3]),
+        ]);
         let mut r = Route::new("King's Road", [1, 2, 3], 1, 4, 9);
+        r.folder = 1;
         r.via = vec![(10.5, 20.25), (-3.0, 7.0)];
         r.width = 7;
         r.style = RouteStyle::Dashed;
@@ -850,7 +907,25 @@ mod tests {
         write_world(&w, &mut bytes).unwrap();
         let back = read_world(&bytes[..]).unwrap();
         assert_eq!(back.routes(), &[r]);
+        assert_eq!(back.route_folders().len(), 2);
+        assert_eq!(back.route_folders()[1].name, "Rivers");
     }
+
+    #[test]
+    fn folder_ops() {
+        use crate::route::{Route, RouteFolder};
+        let mut w = World::new();
+        let b = w.add_route_folder("B", [5, 5, 5]).unwrap();
+        w.add_route(Route::new("a", [0, 0, 0], 1, 1, 2));
+        w.add_route(Route::new("b", [0, 0, 0], 1, 1, 2));
+        assert!(w.move_route(1, b));
+        assert_eq!(w.routes()[1].color, [5, 5, 5]);
+        w.edit_route_folder(b, |f| f.color = [7, 7, 7]);
+        assert_eq!(w.routes()[1].color, [7, 7, 7]);
+        assert!(w.remove_route_folder(b));
+        assert_eq!(w.routes()[1].folder, 0);
+        assert!(!w.remove_route_folder(0));
+        let _ = RouteFolder::new("x", [0; 3]);    }
 }
 
 #[cfg(test)]

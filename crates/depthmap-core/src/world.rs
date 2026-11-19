@@ -12,7 +12,7 @@ use crate::node::{Icon, Node, NodeId};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
 use crate::tile::CustomTile;
-use crate::route::Route;
+use crate::route::{MAX_FOLDERS, Route, RouteFolder};
 use crate::zone::Zone;
 use crate::{CHUNK_AREA, MAX_DEPTH};
 
@@ -59,6 +59,7 @@ pub struct World {
     tiles_version: u64,
     zones: Vec<Zone>,
     routes: Vec<Route>,
+    route_folders: Vec<RouteFolder>,
     /// Height (0..=255) of each tile, indexed by texture id.
     tile_heights: [i16; MAX_TEXTURES as usize + 1],
     /// Extra height of each colour index, added to the tile's.
@@ -77,6 +78,7 @@ pub const MAX_HEIGHT: i16 = 255;
 pub struct Meta {
     zones: Vec<Zone>,
     routes: Vec<Route>,
+    route_folders: Vec<RouteFolder>,
     tiles: Vec<Option<CustomTile>>,
     tile_heights: [i16; MAX_TEXTURES as usize + 1],
     color_heights: Vec<i16>,
@@ -108,6 +110,7 @@ impl World {
             tiles_version: crate::colors::next_version(),
             zones: Vec::new(),
             routes: Vec::new(),
+            route_folders: vec![RouteFolder::new("Routes", crate::route::ROUTE_COLORS[0])],
             tile_heights: crate::texture::default_heights(),
             color_heights: vec![0; 256],
             meta_clock: 0,
@@ -170,6 +173,7 @@ impl World {
         Meta {
             zones: self.zones.clone(),
             routes: self.routes.clone(),
+            route_folders: self.route_folders.clone(),
             tiles: self.tiles.clone(),
             tile_heights: self.tile_heights,
             color_heights: self.color_heights.clone(),
@@ -180,6 +184,12 @@ impl World {
     pub fn restore_meta(&mut self, m: &Meta) {
         self.zones = m.zones.clone();
         self.routes = m.routes.clone();
+        // Open or closed is not undone: keep what is showing.
+        let open: Vec<bool> = self.route_folders.iter().map(|f| f.expanded).collect();
+        self.route_folders = m.route_folders.clone();
+        for (f, o) in self.route_folders.iter_mut().zip(open) {
+            f.expanded = o;
+        }
         if self.tiles != m.tiles {
             self.tiles = m.tiles.clone();
             self.tiles_version = crate::colors::next_version();
@@ -195,11 +205,94 @@ impl World {
         &self.routes
     }
 
+    pub fn route_folders(&self) -> &[RouteFolder] {
+        &self.route_folders
+    }
+
+    /// Replaces the folder list (used when loading, before routes are added).
+    /// An empty list becomes the default single folder.
+    pub fn set_route_folders(&mut self, mut folders: Vec<RouteFolder>) {
+        folders.truncate(MAX_FOLDERS);
+        if folders.is_empty() {
+            folders.push(RouteFolder::new("Routes", crate::route::ROUTE_COLORS[0]));
+        }
+        self.route_folders = folders;
+        self.sync_route_colors();
+        self.touch_meta();
+    }
+
+    /// Makes every route take its folder's colour (and a valid folder).
+    fn sync_route_colors(&mut self) {
+        let last = (self.route_folders.len() - 1) as u16;
+        for r in &mut self.routes {
+            r.folder = r.folder.min(last);
+            r.color = self.route_folders[r.folder as usize].color;
+        }
+    }
+
+    /// Adds a folder; `None` when there are too many.
+    pub fn add_route_folder(&mut self, name: &str, color: [u8; 3]) -> Option<usize> {
+        if self.route_folders.len() >= MAX_FOLDERS {
+            return None;
+        }
+        self.route_folders.push(RouteFolder::new(name, color));
+        self.touch_meta();
+        Some(self.route_folders.len() - 1)
+    }
+
+    /// Changes a folder; its routes follow its colour.
+    pub fn edit_route_folder<R>(&mut self, index: usize, f: impl FnOnce(&mut RouteFolder) -> R) -> Option<R> {
+        let folder = self.route_folders.get_mut(index)?;
+        let out = f(folder);
+        folder.name = folder.name.chars().take(crate::route::MAX_FOLDER_NAME).collect();
+        self.sync_route_colors();
+        self.touch_meta();
+        Some(out)
+    }
+
+    /// Opens or closes a folder in the Routes window. Not an edit: it is not
+    /// an undo step.
+    pub fn set_route_folder_open(&mut self, index: usize, open: bool) {
+        if let Some(f) = self.route_folders.get_mut(index) {
+            f.expanded = open;
+        }
+    }
+
+    /// Removes a folder; its routes move to the folder before it (or the one
+    /// after, for the first). The last folder cannot be removed.
+    pub fn remove_route_folder(&mut self, index: usize) -> bool {
+        if self.route_folders.len() <= 1 || index >= self.route_folders.len() {
+            return false;
+        }
+        let target = if index > 0 { index - 1 } else { 1 };
+        for r in &mut self.routes {
+            let f = r.folder as usize;
+            let f = if f == index { target } else { f };
+            r.folder = if f > index { f - 1 } else { f } as u16;
+        }
+        self.route_folders.remove(index);
+        self.sync_route_colors();
+        self.touch_meta();
+        true
+    }
+
+    /// Puts a route in a folder (and in the folder's colour).
+    pub fn move_route(&mut self, route: usize, folder: usize) -> bool {
+        if route >= self.routes.len() || folder >= self.route_folders.len() {
+            return false;
+        }
+        self.routes[route].folder = folder as u16;
+        self.sync_route_colors();
+        self.touch_meta();
+        true
+    }
+
     pub fn add_route(&mut self, route: Route) -> Option<usize> {
         if self.routes.len() >= crate::route::MAX_ROUTES {
             return None;
         }
         self.routes.push(route);
+        self.sync_route_colors();
         self.touch_meta();
         Some(self.routes.len() - 1)
     }
@@ -207,6 +300,7 @@ impl World {
     pub fn edit_route<R>(&mut self, index: usize, f: impl FnOnce(&mut Route) -> R) -> Option<R> {
         let r = self.routes.get_mut(index)?;
         let out = f(r);
+        self.sync_route_colors();
         self.touch_meta();
         Some(out)
     }

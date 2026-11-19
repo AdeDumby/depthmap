@@ -1236,6 +1236,39 @@ fn routes_window_lists_selects_and_deletes_routes() {
 }
 
 #[test]
+fn route_folders_expand_collapse_and_colour_their_routes() {
+    use depthmap_core::node::{Icon, Node};
+    let mut h = Harness::new();
+    let (a, b) = (h.ed.world.alloc_node_id(), h.ed.world.alloc_node_id());
+    h.ed.world.put_node(Node::new(a, 0, 1, 1, Icon::Builtin(1)));
+    h.ed.world.put_node(Node::new(b, 0, 5, 1, Icon::Builtin(1)));
+    h.ed.new_route(a, b);
+    h.ed.world.edit_route_folder(0, |f| f.color = [10, 20, 30]);
+    assert_eq!(h.ed.world.routes()[0].color, [10, 20, 30]);
+    let f2 = h.ed.world.add_route_folder("Rivers", [1, 2, 3]).unwrap();
+    h.ed.route_folder = f2;
+    h.ed.new_route(b, a);
+    assert_eq!(h.ed.world.routes()[1].folder as usize, f2);
+    assert_eq!(h.ed.world.routes()[1].color, [1, 2, 3]);
+    h.ed.tool = ToolMode::Route;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.folder_heads.len(), 2);
+    assert_eq!(h.st.layout.route_names.len(), 2);
+    h.click(h.st.layout.folder_heads[0].center());
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.route_names.len(), 1, "closed folder hides its routes");
+    assert!(!h.ed.world.route_folders()[0].expanded);
+    h.click(h.st.layout.folder_heads[0].center());
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.route_names.len(), 2);
+    h.click(h.st.layout.folder_deletes[1].center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.route_folders().len(), 1);
+    assert_eq!(h.ed.world.routes()[1].color, [10, 20, 30]);
+}
+
+#[test]
 fn regions_window_creates_renames_recolours_and_deletes_regions() {
     let mut h = Harness::new();
     h.ed.tool = ToolMode::Zone;

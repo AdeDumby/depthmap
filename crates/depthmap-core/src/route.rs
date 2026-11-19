@@ -5,6 +5,8 @@
 use crate::node::NodeId;
 
 pub const MAX_ROUTES: usize = 128;
+pub const MAX_FOLDERS: usize = 32;
+pub const MAX_FOLDER_NAME: usize = 40;
 pub const MAX_VIA: usize = 256;
 pub const MAX_ROUTE_NAME: usize = 60;
 pub const MIN_WIDTH: u8 = 1;
@@ -18,6 +20,28 @@ pub const ROUTE_COLORS: [[u8; 3]; 6] = [
     [30, 150, 100],
     [60, 60, 60],
 ];
+
+/// A folder of routes. Every route in it is drawn in the folder's colour.
+#[derive(Clone, Debug)]
+pub struct RouteFolder {
+    pub name: String,
+    pub color: [u8; 3],
+    /// Open in the Routes window. Only a display state: it is saved with the
+    /// map but is not part of undo and is ignored when comparing.
+    pub expanded: bool,
+}
+
+impl PartialEq for RouteFolder {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.color == other.color
+    }
+}
+
+impl RouteFolder {
+    pub fn new(name: &str, color: [u8; 3]) -> Self {
+        Self { name: name.chars().take(MAX_FOLDER_NAME).collect(), color, expanded: true }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RouteStyle {
@@ -50,7 +74,10 @@ impl RouteStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Route {
     pub name: String,
+    /// The colour of the route's folder (the world keeps them in step).
     pub color: [u8; 3],
+    /// Index of the route's folder in the map's folder list.
+    pub folder: u16,
     /// Line width in screen points.
     pub width: u8,
     pub style: RouteStyle,
@@ -68,6 +95,7 @@ impl Route {
         Self {
             name: name.chars().take(MAX_ROUTE_NAME).collect(),
             color,
+            folder: 0,
             width: 4,
             style: RouteStyle::Solid,
             visible: true,

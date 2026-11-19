@@ -277,6 +277,8 @@ pub struct Editor {
     lasso: Option<LassoDrag>,
     /// The route the Route tool edits (index into `world.routes()`).
     pub route_active: Option<usize>,
+    /// Folder that new routes go into.
+    pub route_folder: usize,
     /// A route being started: the node it leaves from.
     pub route_start: Option<depthmap_core::node::NodeId>,
     /// A via point being dragged: (route, point).
@@ -414,6 +416,7 @@ impl Editor {
             zone_subtract: false,
             lasso: None,
             route_active: None,
+            route_folder: 0,
             route_start: None,
             route_drag: None,
             measure: Vec::new(),
@@ -1138,7 +1141,9 @@ impl Editor {
             }
             k += 1;
         };
-        let route = Route::new(&name, ROUTE_COLORS[n % ROUTE_COLORS.len()], self.camera.depth, from, to);
+        let folder = self.route_folder.min(self.world.route_folders().len() - 1);
+        let mut route = Route::new(&name, ROUTE_COLORS[n % ROUTE_COLORS.len()], self.camera.depth, from, to);
+        route.folder = folder as u16;
         match self.world.add_route(route) {
             Some(i) => {
                 self.route_active = Some(i);
