@@ -11,7 +11,7 @@ use depthmap_core::icons::{self, BUILTIN_COUNT};
 use depthmap_core::node::{MAX_DESCRIPTION_CHARS, MAX_NAME_CHARS, MAX_SCALE, MIN_SCALE};
 use depthmap_core::{Fill, Icon, MAX_DEPTH, MapSpec, Shape, World};
 use depthmap_core::texture::{self, TEXTURE_COUNT, TILE};
-use egui::{Align, Align2, Color32, Layout, RichText, Sense, Stroke, TextureOptions, vec2};
+use egui::{Align2, Color32, RichText, Sense, Stroke, TextureOptions, vec2};
 
 use crate::editor::{Editor, SelectKind, ToolMode, ZoneKind, format_zoom};
 use crate::palette::{self, Entry, Palettes};
@@ -904,7 +904,7 @@ fn height_menu(ui: &mut egui::Ui, st: &mut UiState, title: &str, h: &mut i16) ->
 }
 
 /// The row under the menu: tools, how the map is shown, zoom and depth.
-fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+fn header_bar(root: &mut egui::Ui, _ed: &mut Editor, st: &mut UiState) {
     egui::Panel::top("header").show(root, |ui| {
         ui.horizontal_wrapped(|ui| {
             for mode in ViewMode::ALL {
@@ -935,7 +935,14 @@ fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 )
                 .on_hover_text("How tall the highest tile is, in cells. Set tile and colour heights with a right click in the palettes.");
             }
-            ui.separator();
+        });
+    });
+}
+
+/// The strip at the bottom: cell under the mouse, last message, file name.
+fn status_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    egui::Panel::bottom("status").show(root, |ui| {
+        ui.horizontal(|ui| {
             let out = ui.small_button("-").on_hover_text("Zoom out");
             st.layout.zoom_out = Some(out.rect);
             if out.clicked() {
@@ -972,14 +979,7 @@ fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             if whole.clicked() {
                 ed.reset_view();
             }
-        });
-    });
-}
-
-/// The strip at the bottom: cell under the mouse, last message, file name.
-fn status_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
-    egui::Panel::bottom("status").show(root, |ui| {
-        ui.horizontal(|ui| {
+            ui.separator();
             if let (false, Some(info)) = (st.view_mode.is_3d(), ed.hover_info()) {
                 let mut text = RichText::new(info.text()).monospace();
                 if !info.inside {
@@ -993,10 +993,6 @@ fn status_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             if !ed.status.is_empty() {
                 ui.label(RichText::new(&ed.status).weak());
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let name = format!("{}{}", ed.file_name(), if ed.modified() { " *" } else { "" });
-                ui.label(RichText::new(name).strong());
-            });
         });
     });
 }

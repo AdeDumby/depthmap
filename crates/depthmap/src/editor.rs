@@ -439,9 +439,10 @@ impl Editor {
         let was_fit = self.camera.depth == 0 && self.camera.ppc <= self.camera.min_ppc * 1.0001;
         self.viewport = (w, h);
         if was_fit && self.spec().is_bounded() {
-            self.camera.ppc = self.min_ppc();
+            self.fit_view();
+        } else {
+            self.constrain();
         }
-        self.constrain();
     }
 
     /// Tells the editor how much of the viewport the interface covers.
@@ -452,9 +453,10 @@ impl Editor {
         let was_fit = self.camera.depth == 0 && self.camera.ppc <= self.camera.min_ppc * 1.0001;
         self.insets = insets;
         if was_fit && self.spec().is_bounded() {
-            self.camera.ppc = self.min_ppc();
+            self.fit_view();
+        } else {
+            self.constrain();
         }
-        self.constrain();
     }
 
     pub fn spec(&self) -> MapSpec {
@@ -657,6 +659,9 @@ impl Editor {
             cam.cell = (w / 2, h / 2);
             cam.frac = ((w % 2) as f64 * 0.5, (h % 2) as f64 * 0.5);
             cam.ppc = cam.min_ppc;
+            // Centre the map on the free area between the sidebars, not on the window.
+            let (l, t, r, b) = self.insets;
+            cam.pan_pixels((l - r) * 0.5, (t - b) * 0.5);
         }
         self.camera = cam;
         self.constrain();
@@ -1995,7 +2000,7 @@ impl Editor {
                 self.path = Some(path.to_path_buf());
                 self.saved_revision = self.world.revision();
                 self.touched = Some(path.to_path_buf());
-                self.status = format!("Opened {}", path.display());
+                self.status.clear();
                 self.fit_view();
             }
             Err(e) => self.status = format!("Open failed: {e}"),

@@ -173,7 +173,7 @@ fn panels_capture_the_pointer_but_the_canvas_does_not() {
     let thumb = h.st.layout.textures[0].center();
     h.hover(thumb);
     assert!(h.ctx.is_pointer_over_egui(), "over the texture panel");
-    h.hover(h.st.layout.zoom_in.unwrap().center());
+    h.hover(h.st.layout.view_buttons[0].center());
     assert!(h.ctx.is_pointer_over_egui(), "over the header bar");
     h.hover(Pos2::new(5.0, 5.0));
     assert!(h.ctx.is_pointer_over_egui(), "over the menu bar");
@@ -1525,7 +1525,7 @@ fn overlays_and_windows_stay_below_the_header_bar() {
     let mut h = Harness::new();
     h.frame(vec![]);
     h.frame(vec![]);
-    let header = h.st.layout.zoom_in.unwrap();
+    let header = h.st.layout.view_buttons[0];
     let area = h.st.map_area;
     assert!(area.min.y > header.max.y, "map area {area:?} starts below the header {header:?}");
     assert!(area.max.y < H, "and above the status bar");
@@ -1561,4 +1561,20 @@ fn zooming_out_fits_the_whole_map_between_the_sidebars() {
         assert!(h.ed.camera.ppc * w as f64 <= map.width() as f64 + 0.5, "map is wider than the free space");
         assert!(h.ed.camera.ppc * hh as f64 <= map.height() as f64 + 0.5);
     }
+}
+
+#[test]
+fn the_whole_map_view_is_centred_on_the_free_area() {
+    let mut h = Harness::new();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.ed.reset_view();
+    h.frame(vec![]);
+    let Some((w, hh)) = h.ed.spec().extent(0) else { return };
+    let map = h.st.map_area;
+    let (cx, cy) = (w as f64 / 2.0, hh as f64 / 2.0);
+    let (ax, ay) = (map.center().x as f64, map.center().y as f64);
+    let (wx, wy) = h.ed.camera.screen_to_world(ax, ay, h.ed.viewport.0, h.ed.viewport.1);
+    let tol = 2.0 / h.ed.camera.ppc;
+    assert!((wx - cx).abs() < tol && (wy - cy).abs() < tol, "free area centre is map cell {wx},{wy}, map centre {cx},{cy}");
 }
