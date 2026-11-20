@@ -1096,7 +1096,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             if ui.cursor().min.y > top {
                 ui.separator();
             }
-            egui::CollapsingHeader::new(RichText::new("Tiles").strong()).default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Tiles").strong()).default_open(true).show_unindented(ui, |ui| {
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
                 .show(ui, |ui| {
@@ -1150,7 +1150,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             tiles_section(ui, ed, st);
             });
             ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show_unindented(ui, |ui| {
             let mut half = ed.brush_half;
             ui.horizontal(|ui| {
                 ui.label("Brush");
@@ -1171,7 +1171,6 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             });
             if ed.brush_style == crate::editor::BrushStyle::PaletteMix {
                 ed.brush_mix = st.palettes.current().entries.iter().map(|e| (e.rgb, e.texture)).collect();
-                ui.label(RichText::new(format!("Mixing the {} entries of \"{}\"", ed.brush_mix.len(), st.palettes.current().name)).weak().small());
             }
             let eraser = ui
                 .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
@@ -1179,8 +1178,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             st.layout.eraser_toggle = Some(eraser.rect);
             });
             ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Shape").strong()).default_open(true).show(ui, |ui| {
-            ui.label(RichText::new("Right mouse drag").weak().small());
+            egui::CollapsingHeader::new(RichText::new("Shape").strong()).default_open(true).show_unindented(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for shape in Shape::ALL {
                     let r = ui.selectable_value(&mut ed.shape, shape, shape.name());
@@ -1189,7 +1187,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             });
             });
             ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Fill").strong()).default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Fill").strong()).default_open(true).show_unindented(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for fill in Fill::ALL {
                     let r = ui.selectable_value(&mut ed.fill, fill, fill.name());
@@ -1205,7 +1203,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             st.layout.border_toggle = Some(border.rect);
             });
             ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Nodes").strong()).default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Nodes").strong()).default_open(true).show_unindented(ui, |ui| {
             ui.horizontal(|ui| {
                 let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
                 let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
@@ -1340,9 +1338,7 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
 /// Brush / Fill / Select buttons and the selection controls.
 fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     match ed.tool {
-        ToolMode::Fill => {
-            ui.label(RichText::new("Click: fill the connected area of the same tile (Shift: erase)").weak().small());
-        }
+        ToolMode::Fill | ToolMode::Pick => {}
         ToolMode::Select => {
             ui.horizontal_wrapped(|ui| {
                 for kind in SelectKind::ALL {
@@ -1353,7 +1349,6 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     }
                 }
             });
-            ui.label(RichText::new(format!("{}. Right click inverts; new selections add.", ed.select_kind.hint())).weak().small());
             ui.horizontal(|ui| {
                 let all = ui.small_button("All").on_hover_text("Select everything (Ctrl+A)");
                 st.layout.select_all = Some(all.rect);
@@ -1372,31 +1367,21 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 }
             });
         }
-        ToolMode::Zone => {
-            ui.label(RichText::new(format!("{}. Shift flips add / remove. See the Regions window.", ed.zone_kind.hint())).weak().small());
-        }
+        ToolMode::Zone => {}
         ToolMode::Route => {
-            let hint = if ed.route_start.is_some() {
-                "Click the node the route ends at (Esc cancels)"
-            } else {
-                "Click a node, then another node: a route. Then click the map to add points it passes through; drag a point to move it, right click removes it."
-            };
-            ui.label(RichText::new(hint).weak().small());
+            if ed.route_start.is_some() {
+                ui.label(RichText::new("Click the node the route ends at (Esc cancels)").small());
+            }
         }
         ToolMode::Measure => {
             let text = ed.measure_text().unwrap_or_else(|| "Click to start measuring, click again to add legs".into());
             ui.label(RichText::new(text).small());
-            ui.label(RichText::new("Right click removes the last point, Esc clears.").weak().small());
-        }
-        ToolMode::Pick => {
-            ui.label(RichText::new("Click a cell: copies its tile and colour, then switches to the brush").weak().small());
         }
         ToolMode::Paint => {}
     }
     if let Some(summary) = ed.selection_summary() {
         ui.label(RichText::new(summary).color(Color32::from_rgb(90, 190, 255)));
         if ed.tool != ToolMode::Select {
-            ui.label(RichText::new("Painting is limited to it.").weak().small());
             let clear = ui.small_button("Clear selection  (Esc)");
             st.layout.select_clear = Some(clear.rect);
             if clear.clicked() {
@@ -1626,7 +1611,7 @@ fn routes_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
 fn routes_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     use depthmap_core::route::{MAX_ROUTE_NAME, MAX_WIDTH, MIN_WIDTH, RouteStyle};
     let mut open = true;
-    sidebar_title(ui, "Routes", "Back to colors", &mut open);
+    sidebar_title(ui, "Back to colors", &mut open);
     st.layout.route_names.clear();
     st.layout.route_deletes.clear();
     st.layout.folder_heads.clear();
@@ -1867,7 +1852,7 @@ fn zones_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
 fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     use depthmap_core::zone::MAX_ZONE_NAME;
     let mut open = true;
-    sidebar_title(ui, "Regions", "Back to colors", &mut open);
+    sidebar_title(ui, "Back to colors", &mut open);
     st.layout.zone_kinds.clear();
     st.layout.zone_names.clear();
     st.layout.zone_deletes.clear();
@@ -3257,9 +3242,8 @@ fn plain(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui)) {
 
 /// Title row of a panel that replaces the Colors sidebar; `open` turns false
 /// when the button is pressed.
-fn sidebar_title(ui: &mut egui::Ui, title: &str, back: &str, open: &mut bool) {
+fn sidebar_title(ui: &mut egui::Ui, back: &str, open: &mut bool) {
     ui.horizontal(|ui| {
-        ui.heading(title);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button(back).clicked() {
                 *open = false;
