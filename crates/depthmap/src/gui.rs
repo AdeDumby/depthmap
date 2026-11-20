@@ -273,6 +273,8 @@ pub struct UiState {
     recent: Vec<RecentEntry>,
     ready: Vec<Command>,
     thumbs: Vec<egui::TextureHandle>,
+    /// Toolbar icons, in the order of `TOOL_ICONS`.
+    tool_icons: Vec<egui::TextureHandle>,
     thumbs_rgb: Option<[u8; 3]>,
     icon_cache: std::collections::HashMap<IconKey, IconTex>,
     /// Icon files available in the Custom Icons folder or the map.
@@ -342,6 +344,7 @@ impl UiState {
             recent: Vec::new(),
             ready: Vec::new(),
             thumbs: Vec::new(),
+            tool_icons: Vec::new(),
             thumbs_rgb: None,
             icon_cache: Default::default(),
             icon_names: Vec::new(),
@@ -1052,6 +1055,35 @@ fn tiles_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     }
 }
 
+/// Toolbar icons (white on transparent, tinted when drawn), by tool label.
+const TOOL_ICONS: [(&str, &[u8]); 9] = [
+    ("Brush", include_bytes!("../assets/tools/brush.png")),
+    ("Bucket", include_bytes!("../assets/tools/bucket.png")),
+    ("Select", include_bytes!("../assets/tools/select.png")),
+    ("Shape", include_bytes!("../assets/tools/shape.png")),
+    ("Pick", include_bytes!("../assets/tools/pick.png")),
+    ("Measure", include_bytes!("../assets/tools/measure.png")),
+    ("Region", include_bytes!("../assets/tools/region.png")),
+    ("Route", include_bytes!("../assets/tools/route.png")),
+    ("Nodes", include_bytes!("../assets/tools/node.png")),
+];
+
+impl UiState {
+    fn load_tool_icons(&mut self, ctx: &egui::Context) {
+        if !self.tool_icons.is_empty() {
+            return;
+        }
+        for (name, bytes) in TOOL_ICONS {
+            let img = icons::decode_png(bytes).expect("built-in toolbar icon");
+            self.tool_icons.push(ctx.load_texture(
+                format!("tool-{name}"),
+                egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba),
+                TextureOptions::LINEAR,
+            ));
+        }
+    }
+}
+
 /// The vertical toolbar on the left: one button per tool.
 fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     // (tool, label, tooltip). A `None` tool is a divider.
@@ -1067,6 +1099,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         Some((ToolMode::Route, "Route", "Route (T): click two nodes to connect them, then click the map to bend the route")),
         Some((ToolMode::Node, "Nodes", "Nodes (N): click the map to place a node, click a node to edit it")),
     ];
+    st.load_tool_icons(&root.ctx().clone());
     st.layout.select_kinds.clear();
     st.layout.select_all = None;
     st.layout.select_invert = None;
@@ -1090,7 +1123,19 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         } else if resp.hovered() {
                             ui.painter().rect_filled(rect, 6.0, Color32::from_white_alpha(25));
                         }
-                        paint_tool_icon(ui.painter(), rect, label, ui.visuals().text_color());
+                        if let Some(i) = TOOL_ICONS.iter().position(|(n, _)| *n == label) {
+                            let tint = if ed.tool == tool || resp.hovered() {
+                                Color32::WHITE
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            ui.painter().image(
+                                st.tool_icons[i].id(),
+                                rect.shrink(7.0),
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                tint,
+                            );
+                        }
                         if resp.on_hover_text(tip).clicked() {
                             ed.tool = tool;
                         }
@@ -1098,13 +1143,6 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 });
             });
         });
-}
-
-/// Draws a tool's icon in `rect`. Until the icon images are added this is the
-/// tool's first letters.
-fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, label: &str, color: Color32) {
-    let short: String = label.chars().take(2).collect();
-    painter.text(rect.center(), Align2::CENTER_CENTER, short, egui::FontId::proportional(16.0), color);
 }
 
 /// Options of the chosen tool, at the top of the Colors sidebar: the brush,
