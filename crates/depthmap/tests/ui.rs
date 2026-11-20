@@ -80,6 +80,12 @@ impl Harness {
     }
 }
 
+/// Opens one of the header's mode menus (they stay open until clicked away).
+fn open_menu(h: &mut Harness, rect: Option<Rect>) {
+    h.click(rect.expect("menu button").center());
+    h.frame(vec![]);
+}
+
 #[test]
 fn clicking_a_texture_selects_it() {
     let mut h = Harness::new();
@@ -497,7 +503,7 @@ fn full_window_renders_map_and_interface() {
     // Menu bar: a solid UI-coloured strip across the top, not parchment.
     assert_ne!(px(600, 6), bg);
     // The texture panel and zoom panel sit over the map's empty corners.
-    let tex_panel = gui.state.layout.textures[0].center();
+    let tex_panel = gui.state.layout.folder_heads[0].center();
     assert_ne!(px(tex_panel.x as u32, tex_panel.y as u32), bg);
     let zoom_btn = gui.state.layout.zoom_in.unwrap().center();
     assert_ne!(px(zoom_btn.x as u32, zoom_btn.y as u32), bg);
@@ -628,12 +634,14 @@ fn creating_applies_to_the_editor() {
 fn clicking_shape_and_fill_buttons_selects_them() {
     use depthmap_core::{Fill, Shape};
     let mut h = Harness::new();
+    { let r = h.st.layout.shape_menu; open_menu(&mut h, r); }
     assert_eq!(h.st.layout.shapes.len(), Shape::ALL.len());
-    assert_eq!(h.st.layout.fills.len(), Fill::ALL.len());
     for (i, shape) in Shape::ALL.iter().enumerate() {
         h.click(h.st.layout.shapes[i].center());
         assert_eq!(h.ed.shape, *shape);
     }
+    { let r = h.st.layout.fill_menu; open_menu(&mut h, r); }
+    assert_eq!(h.st.layout.fills.len(), Fill::ALL.len());
     for (i, fill) in Fill::ALL.iter().enumerate() {
         h.click(h.st.layout.fills[i].center());
         assert_eq!(h.ed.fill, *fill);
@@ -647,6 +655,7 @@ fn border_toggle_only_applies_to_filled_shapes_and_eraser_toggles() {
     h.ed.shape = Shape::Rectangle;
     h.ed.fill = Fill::Outline;
     h.frame(vec![]);
+    { let r = h.st.layout.fill_menu; open_menu(&mut h, r); }
     h.click(h.st.layout.border_toggle.unwrap().center());
     assert!(!h.ed.border, "disabled for an outline");
 
@@ -662,6 +671,7 @@ fn border_toggle_only_applies_to_filled_shapes_and_eraser_toggles() {
     assert!(!h.ed.border, "lines have no fill");
 
     assert!(!h.ed.eraser);
+    { let r = h.st.layout.brush_menu; open_menu(&mut h, r); }
     h.click(h.st.layout.eraser_toggle.unwrap().center());
     assert!(h.ed.eraser);
 }
@@ -674,7 +684,7 @@ fn every_tool_control_is_reachable_in_a_short_window() {
     for _ in 0..3 {
         h.frame(vec![]);
     }
-    for r in [h.st.layout.eraser_toggle.unwrap(), h.st.layout.shapes[0]] {
+    for r in [h.st.layout.textures[0], *h.st.layout.swatches.first().unwrap_or(&h.st.layout.textures[0])] {
         h.hover(r.center());
         assert!(h.ctx.is_pointer_over_egui());
     }
@@ -1391,6 +1401,7 @@ fn quitting_with_unsaved_changes_does_not_ask_and_recovery_is_offered_at_startup
 fn brush_style_buttons_pick_the_style() {
     use depthmap::editor::BrushStyle;
     let mut h = Harness::new();
+    { let r = h.st.layout.brush_menu; open_menu(&mut h, r); }
     assert_eq!(h.st.layout.brush_styles.len(), 5);
     h.click(h.st.layout.brush_styles[3].center());
     assert_eq!(h.ed.brush_style, BrushStyle::Spray);

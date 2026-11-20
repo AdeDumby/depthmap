@@ -41,7 +41,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 * **Menu bar** (top): File (New, Open, Save, Save As, Quit), Edit (Undo, Redo),
   View (grid, panels, zoom actions), Help (controls, about). File also has
   *Open recent*. Destructive actions ask before discarding unsaved changes.
-* **Tools sidebar** (left, with sections Tiles, Brush, Shape, Fill and Nodes that open and close by clicking their titles): 14 textures (flagstone, cobblestone,
+* **Tiles** (top of the Colors sidebar on the right; the left sidebar holds the options of the Select and Measure tools): 14 textures (flagstone, cobblestone,
   brick, planks, dirt, grass, sand, water, hatch, ...). Every texture can be
   painted in **any color**: pick a swatch or use the color picker. Brush size
   slider below.
@@ -88,7 +88,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 
 ## Fill, selection and colours
 
-**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C), *Region* (R), *Route* (T). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors sidebar (right) is toggled with P. While the Region or Route tool is in use, its list covers the Colors sidebar; "Back to colors" or choosing another tool brings Colors back.
+**Tools** (top of the Tools panel): *Brush* (B), *Bucket* (F), *Select* (S), *Pick* (C), *Region* (R), *Route* (T). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors sidebar (right) is toggled with P. While the Region or Route tool is in use, its list covers the Colors sidebar; "Back to colors" or choosing another tool brings Colors back.
 
 * **Fill** - click to replace the whole connected area of identical cells (same
   texture and colour) with the current texture and colour; Shift erases it. One undo
@@ -186,7 +186,7 @@ layer (while hovered, and for a few seconds after the click).
 
 ## Header bar, measuring and 3D
 
-The bar under the menu holds the tools (Brush, Fill, Select, Region, Route, Pick, Measure, Add node), the view switch, zoom and depth. The strip at the bottom shows the cell under the mouse, the last message and the file name.
+The bar under the menu holds the tools (Brush, Bucket, Select, Region, Route, Pick, Measure, Add node), the view switch, zoom and depth. Next to them are three mode menus: **Brush** (style, size, eraser), **Shape** (line, rectangle, ellipse...) and **Fill** (how shapes are filled, solid border); each stays open until you click elsewhere. The strip at the bottom shows the cell under the mouse, the last message and the file name.
 
 - **Measure (M):** click points to lay out a path; the label shows its length in cells of the layer you started on (and in depth-0 cells), the last leg's dx/dy, and the number of board-game moves with and without diagonals. Right click removes the last point, Esc clears.
 - **2D / Isometric / Top-down:** the 3D views draw the map as a heightfield. A cell's height is its tile's height plus its colour's (-255 to 255 each; the sum is kept within that, and below zero is a pit). **Right click a tile** in the Tools window, or a colour in *Map colors*, to set its height; water starts flat and brick walls tall. The *height* slider sets how many cells tall 255 is. Isometric can be turned with `<` `>` buttons or the `,` `.` keys; `V` cycles the views. The 3D views are for looking (pan and zoom as usual); empty cells show the parent layer through.

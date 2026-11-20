@@ -145,6 +145,9 @@ pub struct UiLayout {
     pub route_names: Vec<egui::Rect>,
     pub route_deletes: Vec<egui::Rect>,
     /// Folder headers (click to open / close) and their delete buttons.
+    pub brush_menu: Option<egui::Rect>,
+    pub shape_menu: Option<egui::Rect>,
+    pub fill_menu: Option<egui::Rect>,
     pub folder_heads: Vec<egui::Rect>,
     pub folder_deletes: Vec<egui::Rect>,
     pub select_kinds: Vec<egui::Rect>,
@@ -891,7 +894,7 @@ fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             ui.add_enabled_ui(enabled, |ui| {
                 for (mode, label, tip) in [
                     (ToolMode::Paint, "Brush", "Paint with the brush (B). Right mouse drags shapes."),
-                    (ToolMode::Fill, "Fill", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
+                    (ToolMode::Fill, "Bucket", "Bucket (F): click to fill the connected area of identical cells. Shift erases it."),
                     (ToolMode::Select, "Select", "Selection (S): painting is limited to the selected cells"),
                     (ToolMode::Zone, "Region", "Region (R): mark out named places with a lasso or by clicking tiles"),
                     (ToolMode::Route, "Route", "Route (T): click two nodes to connect them, then click the map to bend the route"),
@@ -916,6 +919,8 @@ fn header_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         ed.start_placing_node();
                     }
                 }
+                ui.separator();
+                mode_menus(ui, ed, st);
             });
             ui.separator();
             for mode in ViewMode::ALL {
@@ -1067,35 +1072,24 @@ fn tiles_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
 }
 
 fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
-    let ctx = &root.ctx().clone();
-    st.refresh_thumbs(ctx, ed.brush_rgb);
-    st.refresh_custom_thumbs(ctx, ed);
-    st.layout.textures.clear();
-    st.layout.tile_new = None;
-    st.layout.shapes.clear();
     st.layout.select_kinds.clear();
-    st.layout.brush_styles.clear();
     st.layout.select_all = None;
     st.layout.select_invert = None;
     st.layout.select_clear = None;
-    st.layout.fills.clear();
-    st.layout.border_toggle = None;
-    st.layout.eraser_toggle = None;
-    st.layout.import_icons = None;
-    const COLUMNS: usize = 4;
-    const THUMB: f32 = 46.0;
     egui::Panel::left("tools")
         .resizable(false)
-        .exact_size(COLUMNS as f32 * (THUMB + 6.0) + 24.0)
+        .exact_size(232.0)
         .show(root, |ui| {
-          egui::ScrollArea::vertical()
-              .auto_shrink([false, false])
-              .show(ui, |ui| {
-            let top = ui.cursor().min.y;
-            tool_section(ui, ed, st);
-            if ui.cursor().min.y > top {
-                ui.separator();
-            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                tool_section(ui, ed, st);
+            });
+        });
+}
+
+/// The tile library (textures and custom tiles) at the top of the Colors sidebar.
+fn tiles_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    const COLUMNS: usize = 5;
+    const THUMB: f32 = 44.0;
             egui::CollapsingHeader::new(RichText::new("Tiles").strong()).default_open(true).show_unindented(ui, |ui| {
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
@@ -1149,91 +1143,75 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             ui.label(RichText::new(tex_name(ed, ed.texture)).strong());
             tiles_section(ui, ed, st);
             });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show_unindented(ui, |ui| {
-            let mut half = ed.brush_half;
-            ui.horizontal(|ui| {
-                ui.label("Brush");
-                ui.add(
-                    egui::Slider::new(&mut half, 0..=16)
-                        .custom_formatter(|v, _| format!("{0}x{0}", 2 * v as i64 + 1)),
-                );
-            });
-            ed.brush_half = half;
-            ui.horizontal_wrapped(|ui| {
-                for style in crate::editor::BrushStyle::ALL {
-                    let r = ui.selectable_label(ed.brush_style == style, style.name()).on_hover_text(style.tip());
-                    st.layout.brush_styles.push(r.rect);
-                    if r.clicked() {
-                        ed.brush_style = style;
-                    }
-                }
-            });
-            if ed.brush_style == crate::editor::BrushStyle::PaletteMix {
-                ed.brush_mix = st.palettes.current().entries.iter().map(|e| (e.rgb, e.texture)).collect();
-            }
-            let eraser = ui
-                .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
-                .on_hover_text("Brush and shapes remove cells instead of painting");
-            st.layout.eraser_toggle = Some(eraser.rect);
-            });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Shape").strong()).default_open(true).show_unindented(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for shape in Shape::ALL {
-                    let r = ui.selectable_value(&mut ed.shape, shape, shape.name());
-                    st.layout.shapes.push(r.rect);
-                }
-            });
-            });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Fill").strong()).default_open(true).show_unindented(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for fill in Fill::ALL {
-                    let r = ui.selectable_value(&mut ed.fill, fill, fill.name());
-                    st.layout.fills.push(r.rect);
-                }
-            });
-            let border = ui
-                .add_enabled(
-                    ed.fill != Fill::Outline && ed.shape != Shape::Line,
-                    egui::Checkbox::new(&mut ed.border, "Solid border around the fill"),
-                )
-                .on_hover_text("Brush size sets the border / outline thickness");
-            st.layout.border_toggle = Some(border.rect);
-            });
-            ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Nodes").strong()).default_open(true).show_unindented(ui, |ui| {
-            ui.horizontal(|ui| {
-                let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
-                let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-                ui.painter().image(
-                    tex.id(24.0),
-                    fit_rect(rect, tex.aspect),
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                let add = ui
-                    .selectable_label(ed.placing_node, "Add node  (N)")
-                    .on_hover_text("Then click the map. Click a node later to edit it, drag to move it.");
-                if add.clicked() {
-                    if ed.placing_node {
-                        ed.cancel_placing_node();
-                    } else {
-                        ed.start_placing_node();
-                    }
-                }
-            });
-            let import = ui
-                .button("Import PNG icons...")
-                .on_hover_text(format!("Copied to {}", ed.icons_dir.display()));
-            st.layout.import_icons = Some(import.rect);
-            if import.clicked() {
-                st.request(Command::ImportIcons, false);
-            }
-            });
-          });
+    ui.separator();
+}
+
+/// A button in the header that opens a panel of choices and stays open
+/// until the pointer clicks elsewhere. Returns the button's rectangle.
+fn mode_menu(ui: &mut egui::Ui, label: String, tip: &str, content: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
+    use egui::containers::menu::{MenuButton, MenuConfig};
+    let cfg = MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let (resp, _) = MenuButton::new(label).config(cfg).ui(ui, content);
+    resp.on_hover_text(tip).rect
+}
+
+/// Brush, Shape and Fill modes, as menus in the header.
+fn mode_menus(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    st.layout.brush_styles.clear();
+    st.layout.shapes.clear();
+    st.layout.fills.clear();
+    st.layout.border_toggle = None;
+    st.layout.eraser_toggle = None;
+    if ed.brush_style == crate::editor::BrushStyle::PaletteMix {
+        ed.brush_mix = st.palettes.current().entries.iter().map(|e| (e.rgb, e.texture)).collect();
+    }
+    let name = ed.brush_style.name();
+    let label = format!("Brush: {name} {s}x{s}{e}", s = 2 * ed.brush_half + 1, e = if ed.eraser { ", erase" } else { "" });
+    st.layout.brush_menu = Some(mode_menu(ui, label, "Brush style and size (left mouse drag)", |ui| {
+        let mut half = ed.brush_half;
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            ui.add(
+                egui::Slider::new(&mut half, 0..=16)
+                    .custom_formatter(|v, _| format!("{0}x{0}", 2 * v as i64 + 1)),
+            );
         });
+        ed.brush_half = half;
+        ui.horizontal_wrapped(|ui| {
+            for style in crate::editor::BrushStyle::ALL {
+                let r = ui.selectable_label(ed.brush_style == style, style.name()).on_hover_text(style.tip());
+                st.layout.brush_styles.push(r.rect);
+                if r.clicked() {
+                    ed.brush_style = style;
+                }
+            }
+        });
+        let eraser = ui
+            .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
+            .on_hover_text("Brush and shapes remove cells instead of painting");
+        st.layout.eraser_toggle = Some(eraser.rect);
+    }));
+    let label = format!("Shape: {}", ed.shape.name());
+    st.layout.shape_menu = Some(mode_menu(ui, label, "Shape drawn with the right mouse drag", |ui| {
+        for shape in Shape::ALL {
+            let r = ui.selectable_value(&mut ed.shape, shape, shape.name());
+            st.layout.shapes.push(r.rect);
+        }
+    }));
+    let label = format!("Fill: {}", ed.fill.name());
+    st.layout.fill_menu = Some(mode_menu(ui, label, "How shapes are filled", |ui| {
+        for fill in Fill::ALL {
+            let r = ui.selectable_value(&mut ed.fill, fill, fill.name());
+            st.layout.fills.push(r.rect);
+        }
+        let border = ui
+            .add_enabled(
+                ed.fill != Fill::Outline && ed.shape != Shape::Line,
+                egui::Checkbox::new(&mut ed.border, "Solid border around the fill"),
+            )
+            .on_hover_text("Brush size sets the border / outline thickness");
+        st.layout.border_toggle = Some(border.rect);
+    }));
 }
 
 /// Cell size of a depth relative to a depth-0 cell, e.g. `1/16 cell`.
@@ -1965,11 +1943,17 @@ fn colors_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     (l.palette_new, l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None, None);
     (l.palette_name_field, l.palette_rename_ok) = (None, None);
     st.follow_brush(ed.brush_rgb);
+    st.layout.textures.clear();
+    st.layout.tile_new = None;
+    st.layout.tile_edit = None;
+    st.refresh_thumbs(ctx, ed.brush_rgb);
+    st.refresh_custom_thumbs(ctx, ed);
 
     let mut acts: Vec<PaletteAct> = Vec::new();
     plain(ui, |ui| {
             plain(ui, |ui| {
                 {
+                    tiles_panel(ui, ed, st);
                     picker_section(ui, ed, st);
                     ui.separator();
                     ui.label(RichText::new("Map colors").strong());
@@ -3285,6 +3269,9 @@ fn side_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
 }
 
 fn clear_color_layout(st: &mut UiState) {
+    st.layout.textures.clear();
+    st.layout.tile_new = None;
+    st.layout.tile_edit = None;
     // Nothing is drawn, so nothing can be clicked.
     let l = &mut st.layout;
     (l.sv_square, l.hue_bar, l.hex_field, l.palette_new) = (None, None, None, None);
