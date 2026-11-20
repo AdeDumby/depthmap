@@ -664,6 +664,7 @@ pub fn setup_style(ctx: &egui::Context) {
         color: Color32::from_black_alpha(90),
     };
     style.spacing.item_spacing = vec2(6.0, 6.0);
+    style.visuals.indent_has_left_vline = false;
     ctx.set_global_style(style);
 }
 
@@ -691,6 +692,17 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     }
     side_panel(ui, ed, st);
     st.map_area = ui.available_rect_before_wrap();
+    {
+        let ppp = ctx.pixels_per_point() as f64;
+        let screen = ctx.content_rect();
+        let m = st.map_area;
+        ed.set_insets((
+            (m.left() - screen.left()) as f64 * ppp,
+            (m.top() - screen.top()) as f64 * ppp,
+            (screen.right() - m.right()) as f64 * ppp,
+            (screen.bottom() - m.bottom()) as f64 * ppp,
+        ));
+    }
     // Dialogs that ask for something block the Enter shortcut of the welcome screen.
     let modal = st.new_map.is_some() || st.confirm.is_some();
     if !st.view_mode.is_3d() {
@@ -811,12 +823,9 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                 )
                 .on_hover_text("Opacity of the layer behind the one you are drawing on");
-            });
-            ui.menu_button("Pages", |ui| {
-                ui.checkbox(&mut st.show_tools, "Tools");
-                ui.checkbox(&mut st.show_colors, "Colors");
-                ui.checkbox(&mut st.show_regions, "Regions");
-                ui.checkbox(&mut st.show_routes, "Routes");
+                ui.separator();
+                ui.checkbox(&mut st.show_tools, "Tools sidebar");
+                ui.checkbox(&mut st.show_colors, "Colors sidebar");
             });
             ui.menu_button("Help", |ui| {
                 if item(ui, "Controls", "F1") {
@@ -1082,8 +1091,11 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
           egui::ScrollArea::vertical()
               .auto_shrink([false, false])
               .show(ui, |ui| {
+            let top = ui.cursor().min.y;
             tool_section(ui, ed, st);
-            ui.separator();
+            if ui.cursor().min.y > top {
+                ui.separator();
+            }
             egui::CollapsingHeader::new(RichText::new("Tiles").strong()).default_open(true).show(ui, |ui| {
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
@@ -1137,7 +1149,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             ui.label(RichText::new(tex_name(ed, ed.texture)).strong());
             tiles_section(ui, ed, st);
             });
-
+            ui.separator();
             egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show(ui, |ui| {
             let mut half = ed.brush_half;
             ui.horizontal(|ui| {
@@ -1166,7 +1178,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 .on_hover_text("Brush and shapes remove cells instead of painting");
             st.layout.eraser_toggle = Some(eraser.rect);
             });
-
+            ui.separator();
             egui::CollapsingHeader::new(RichText::new("Shape").strong()).default_open(true).show(ui, |ui| {
             ui.label(RichText::new("Right mouse drag").weak().small());
             ui.horizontal_wrapped(|ui| {
@@ -1176,7 +1188,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 }
             });
             });
-
+            ui.separator();
             egui::CollapsingHeader::new(RichText::new("Fill").strong()).default_open(true).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for fill in Fill::ALL {
@@ -1192,7 +1204,7 @@ fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 .on_hover_text("Brush size sets the border / outline thickness");
             st.layout.border_toggle = Some(border.rect);
             });
-
+            ui.separator();
             egui::CollapsingHeader::new(RichText::new("Nodes").strong()).default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
@@ -1619,168 +1631,165 @@ fn routes_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     st.layout.route_deletes.clear();
     st.layout.folder_heads.clear();
     st.layout.folder_deletes.clear();
-    plain(ui, |ui| {
-            ui.checkbox(&mut st.show_route_lines, "Show routes on the map");
-            ui.label(
-                RichText::new("Route tool (T): click a start node, then an end node. Click the map to add points it must pass through. Routes show on their layer and the deeper ones.")
-                    .weak()
-                    .small(),
-            );
-            ui.separator();
-            if ed.world.routes().is_empty() {
-                ui.label(RichText::new("No routes yet.").weak());
+    ui.checkbox(&mut st.show_route_lines, "Show routes on the map");
+    ui.label(
+        RichText::new("Route tool (T): click a start node, then an end node. Click the map to add points it must pass through. Routes show on their layer and the deeper ones.")
+            .weak()
+            .small(),
+    );
+    if ui.button("New folder").clicked() {
+        let n = ed.world.route_folders().len() + 1;
+        let color = depthmap_core::route::ROUTE_COLORS[(n - 1) % depthmap_core::route::ROUTE_COLORS.len()];
+        if let Some(i) = ed.world.add_route_folder(&format!("Folder {n}"), color) {
+            ed.route_folder = i;
+        }
+    }
+    ui.separator();
+    if let Some(i) = ed.active_route() {
+        let (mut name, mut width, style, from, to, n, depth) = {
+            let r = &ed.world.routes()[i];
+            (r.name.clone(), r.width, r.style, r.from, r.to, r.via.len(), r.depth)
+        };
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
+                let nm: String = name.chars().take(MAX_ROUTE_NAME).collect();
+                ed.world.edit_route(i, |r| r.name = nm);
             }
-            let active = ed.active_route();
-            let mut remove = None;
-            let mut remove_folder = None;
-            let nfolders = ed.world.route_folders().len();
-            ed.route_folder = ed.route_folder.min(nfolders - 1);
-            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                for fi in 0..nfolders {
-                    let (fname, fcolor, open) = {
-                        let f = &ed.world.route_folders()[fi];
-                        (f.name.clone(), f.color, f.expanded)
-                    };
-                    let count = ed.world.routes().iter().filter(|r| r.folder as usize == fi).count();
-                    ui.horizontal(|ui| {
-                        let head = ui
-                            .selectable_label(
-                                ed.route_folder == fi,
-                                format!("{} {} ({})", if open { "v" } else { ">" }, fname, count),
-                            )
-                            .on_hover_text("Click to open / close. New routes go in the selected folder");
-                        st.layout.folder_heads.push(head.rect);
-                        if head.clicked() {
-                            ed.route_folder = fi;
-                            ed.world.set_route_folder_open(fi, !open);
-                        }
-                        let mut rgb = fcolor;
-                        if colour_button(ui, &mut rgb) {
-                            ed.world.edit_route_folder(fi, |f| f.color = rgb);
-                        }
-                        let del = ui
-                            .add_enabled(nfolders > 1, egui::Button::new("X").small())
-                            .on_hover_text("Delete this folder (its routes move to another folder)");
-                        st.layout.folder_deletes.push(del.rect);
-                        if del.clicked() {
-                            remove_folder = Some(fi);
-                        }
-                    });
-                    if !open {
-                        continue;
-                    }
-                    for i in 0..ed.world.routes().len() {
-                        let (name, visible, depth) = {
-                            let r = &ed.world.routes()[i];
-                            if r.folder as usize != fi {
-                                continue;
-                            }
-                            (r.name.clone(), r.visible, r.depth)
-                        };
-                        ui.horizontal(|ui| {
-                            ui.add_space(16.0);
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, rgb32(fcolor));
-                            let mut vis = visible;
-                            if ui.checkbox(&mut vis, "").on_hover_text("Show / hide").changed() {
-                                ed.world.edit_route(i, |r| r.visible = vis);
-                            }
-                            let label = ui
-                                .selectable_label(active == Some(i), &name)
-                                .on_hover_text(format!("Drawn on depth {depth}; click to edit"));
-                            st.layout.route_names.push(label.rect);
-                            if label.clicked() {
-                                ed.route_active = Some(i);
-                            }
-                            let del = ui.small_button("X").on_hover_text("Delete this route");
-                            st.layout.route_deletes.push(del.rect);
-                            if del.clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("New folder").clicked() {
-                    let n = nfolders + 1;
-                    let color = depthmap_core::route::ROUTE_COLORS[nfolders % depthmap_core::route::ROUTE_COLORS.len()];
-                    if let Some(i) = ed.world.add_route_folder(&format!("Folder {n}"), color) {
-                        ed.route_folder = i;
-                    }
-                }
-                let mut name = ed.world.route_folders()[ed.route_folder].name.clone();
-                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).on_hover_text("Rename the selected folder").changed() {
-                    let fi = ed.route_folder;
-                    ed.world.edit_route_folder(fi, |f| f.name = name);
-                }
-            });
-            if let Some(i) = remove {
-                ed.remove_route(i);
-            }
-            if let Some(fi) = remove_folder {
-                ed.world.remove_route_folder(fi);
-                ed.route_folder = ed.route_folder.min(ed.world.route_folders().len() - 1);
-            }
-            if let Some(i) = ed.active_route() {
-                ui.separator();
-                let (mut name, mut width, style, from, to, n, depth) = {
-                    let r = &ed.world.routes()[i];
-                    (r.name.clone(), r.width, r.style, r.from, r.to, r.via.len(), r.depth)
-                };
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
-                        let nm: String = name.chars().take(MAX_ROUTE_NAME).collect();
-                        ed.world.edit_route(i, |r| r.name = nm);
-                    }
-                });
-                if ui.add(egui::Slider::new(&mut width, MIN_WIDTH..=MAX_WIDTH).text("Width")).changed() {
-                    ed.world.edit_route(i, |r| r.width = width);
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Folder");
-                    let cur = ed.world.routes()[i].folder as usize;
-                    egui::ComboBox::from_id_salt("route_folder_pick")
-                        .selected_text(ed.world.route_folders()[cur].name.clone())
-                        .show_ui(ui, |ui| {
-                            for fi in 0..ed.world.route_folders().len() {
-                                let nm = ed.world.route_folders()[fi].name.clone();
-                                if ui.selectable_label(cur == fi, nm).clicked() {
-                                    ed.world.move_route(i, fi);
-                                }
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    for s in RouteStyle::ALL {
-                        if ui.selectable_label(style == s, s.name()).clicked() {
-                            ed.world.edit_route(i, |r| r.style = s);
+        });
+        if ui.add(egui::Slider::new(&mut width, MIN_WIDTH..=MAX_WIDTH).text("Width")).changed() {
+            ed.world.edit_route(i, |r| r.width = width);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Folder");
+            let cur = ed.world.routes()[i].folder as usize;
+            egui::ComboBox::from_id_salt("route_folder_pick")
+                .selected_text(ed.world.route_folders()[cur].name.clone())
+                .show_ui(ui, |ui| {
+                    for fi in 0..ed.world.route_folders().len() {
+                        let nm = ed.world.route_folders()[fi].name.clone();
+                        if ui.selectable_label(cur == fi, nm).clicked() {
+                            ed.world.move_route(i, fi);
                         }
                     }
                 });
-                ui.label(
-                    RichText::new(format!(
-                        "{} to {}",
-                        node_label(&ed.world, from),
-                        node_label(&ed.world, to)
-                    ))
-                    .small(),
-                );
-                ui.label(RichText::new(format!("{n} points, drawn on depth {depth}")).weak().small());
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(n > 0, egui::Button::new("Remove all points")).clicked() {
-                        ed.world.edit_route(i, |r| r.via.clear());
-                    }
-                    if ui.button("Swap ends").clicked() {
-                        ed.world.edit_route(i, |r| {
-                            std::mem::swap(&mut r.from, &mut r.to);
-                            r.via.reverse();
-                        });
-                    }
+        });
+        ui.horizontal(|ui| {
+            for s in RouteStyle::ALL {
+                if ui.selectable_label(style == s, s.name()).clicked() {
+                    ed.world.edit_route(i, |r| r.style = s);
+                }
+            }
+        });
+        ui.label(
+            RichText::new(format!("{} to {}", node_label(&ed.world, from), node_label(&ed.world, to))).small(),
+        );
+        ui.label(RichText::new(format!("{n} points, drawn on depth {depth}")).weak().small());
+        ui.horizontal(|ui| {
+            if ui.add_enabled(n > 0, egui::Button::new("Remove all points")).clicked() {
+                ed.world.edit_route(i, |r| r.via.clear());
+            }
+            if ui.button("Swap ends").clicked() {
+                ed.world.edit_route(i, |r| {
+                    std::mem::swap(&mut r.from, &mut r.to);
+                    r.via.reverse();
                 });
             }
         });
+        ui.separator();
+    }
+    let active = ed.active_route();
+    let mut remove = None;
+    let mut remove_folder = None;
+    let nfolders = ed.world.route_folders().len();
+    ed.route_folder = ed.route_folder.min(nfolders - 1);
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if ed.world.routes().is_empty() {
+            ui.label(RichText::new("No routes yet.").weak());
+        }
+        for fi in 0..nfolders {
+            let (fname, fcolor, folder_open) = {
+                let f = &ed.world.route_folders()[fi];
+                (f.name.clone(), f.color, f.expanded)
+            };
+            let count = ed.world.routes().iter().filter(|r| r.folder as usize == fi).count();
+            ui.horizontal(|ui| {
+                let head = ui
+                    .selectable_label(
+                        ed.route_folder == fi,
+                        format!("{} {} ({})", if folder_open { "v" } else { ">" }, fname, count),
+                    )
+                    .on_hover_text("Click to open / close. New routes go in the selected folder. Right click to rename");
+                st.layout.folder_heads.push(head.rect);
+                head.context_menu(|ui| {
+                    ui.label("Folder name");
+                    let mut name = fname.clone();
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(160.0)).changed() {
+                        ed.world.edit_route_folder(fi, |f| f.name = name);
+                    }
+                });
+                if head.clicked() {
+                    ed.route_folder = fi;
+                    ed.world.set_route_folder_open(fi, !folder_open);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let del = ui
+                        .add_enabled(nfolders > 1, egui::Button::new("X").small())
+                        .on_hover_text("Delete this folder (its routes move to another folder)");
+                    st.layout.folder_deletes.push(del.rect);
+                    if del.clicked() {
+                        remove_folder = Some(fi);
+                    }
+                    let mut rgb = fcolor;
+                    if colour_button(ui, &mut rgb) {
+                        ed.world.edit_route_folder(fi, |f| f.color = rgb);
+                    }
+                });
+            });
+            if !folder_open {
+                continue;
+            }
+            for i in 0..ed.world.routes().len() {
+                let (name, visible, depth) = {
+                    let r = &ed.world.routes()[i];
+                    if r.folder as usize != fi {
+                        continue;
+                    }
+                    (r.name.clone(), r.visible, r.depth)
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, rgb32(fcolor));
+                    let mut vis = visible;
+                    if ui.checkbox(&mut vis, "").on_hover_text("Show / hide").changed() {
+                        ed.world.edit_route(i, |r| r.visible = vis);
+                    }
+                    let label = ui
+                        .selectable_label(active == Some(i), &name)
+                        .on_hover_text(format!("Drawn on depth {depth}; click to edit"));
+                    st.layout.route_names.push(label.rect);
+                    if label.clicked() {
+                        ed.route_active = Some(i);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let del = ui.small_button("X").on_hover_text("Delete this route");
+                        st.layout.route_deletes.push(del.rect);
+                        if del.clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+        }
+    });
+    if let Some(i) = remove {
+        ed.remove_route(i);
+    }
+    if let Some(fi) = remove_folder {
+        ed.world.remove_route_folder(fi);
+        ed.route_folder = ed.route_folder.min(ed.world.route_folders().len() - 1);
+    }
     st.show_routes = open;
 }
 
@@ -1903,9 +1912,25 @@ fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             if ed.world.zones().is_empty() {
                 ui.label(RichText::new("No regions yet. Press + New region, or just drag a lasso.").weak());
             }
+            if let Some(i) = ed.active_zone() {
+                let mut name = ed.world.zones()[i].name.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
+                        let n: String = name.chars().take(MAX_ZONE_NAME).collect();
+                        ed.world.edit_zone(i, |z| z.name = n);
+                    }
+                });
+                let z = &ed.world.zones()[i];
+                let size = z.area().cell_count().map_or(String::new(), |n| {
+                    format!("{} cells at depth {}", grouped(n as i64), z.depth())
+                });
+                ui.label(RichText::new(size).weak().small());
+                ui.separator();
+            }
             let active = ed.active_zone();
             let mut remove = None;
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for i in 0..ed.world.zones().len() {
                     let (name, color, visible) = {
                         let z = &ed.world.zones()[i];
@@ -1925,32 +1950,18 @@ fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         if label.clicked() {
                             ed.zone_active = Some(i);
                         }
-                        let del = ui.small_button("X").on_hover_text("Delete this region");
-                        st.layout.zone_deletes.push(del.rect);
-                        if del.clicked() {
-                            remove = Some(i);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let del = ui.small_button("X").on_hover_text("Delete this region");
+                            st.layout.zone_deletes.push(del.rect);
+                            if del.clicked() {
+                                remove = Some(i);
+                            }
+                        });
                     });
                 }
             });
             if let Some(i) = remove {
                 ed.remove_zone(i);
-            }
-            if let Some(i) = ed.active_zone() {
-                ui.separator();
-                let mut name = ed.world.zones()[i].name.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
-                        let n: String = name.chars().take(MAX_ZONE_NAME).collect();
-                        ed.world.edit_zone(i, |z| z.name = n);
-                    }
-                });
-                let z = &ed.world.zones()[i];
-                let size = z.area().cell_count().map_or(String::new(), |n| {
-                    format!("{} cells at depth {}", grouped(n as i64), z.depth())
-                });
-                ui.label(RichText::new(size).weak().small());
             }
         });
     st.show_regions = open;
@@ -1959,6 +1970,7 @@ fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
 /// The colour wheel, hex field, map colours and palettes.
 fn colors_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     let ctx = &ui.ctx().clone();
+    ui.add_space(8.0);
     let l = &mut st.layout;
     l.swatches.clear();
     l.palette_entries.clear();
@@ -3270,21 +3282,21 @@ fn side_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         .resizable(false)
         .exact_size(280.0)
         .show(root, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                if st.show_regions {
-                    clear_color_layout(st);
-                    clear_route_layout(st);
-                    regions_window(ui, ed, st);
-                } else if st.show_routes {
-                    clear_color_layout(st);
-                    clear_region_layout(st);
-                    routes_window(ui, ed, st);
-                } else {
-                    clear_region_layout(st);
-                    clear_route_layout(st);
+            if st.show_regions {
+                clear_color_layout(st);
+                clear_route_layout(st);
+                regions_window(ui, ed, st);
+            } else if st.show_routes {
+                clear_color_layout(st);
+                clear_region_layout(st);
+                routes_window(ui, ed, st);
+            } else {
+                clear_region_layout(st);
+                clear_route_layout(st);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     colors_window(ui, ed, st);
-                }
-            });
+                });
+            }
         });
 }
 

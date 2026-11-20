@@ -163,7 +163,7 @@ depth they were drawn on (format v8). They are not part of undo/redo.
 The **Route** tool (T) draws a route between two nodes. Click the start node, then the end node; the route is
 created on the depth you are viewing. Then click the map to add points: the route is a smooth curve that
 passes through every point, in order (a new point goes into the stretch of the route nearest to the click).
-Drag a point to move it, right click it to remove it. The Routes window (Pages menu, opens with the tool)
+Drag a point to move it, right click it to remove it. The Routes sidebar (it opens with the tool; right click a folder to rename it)
 lists routes in **folders** and sets name, width, solid / dashed / dotted, and can swap the ends or clear the points.
 Click a folder to open or close it. A folder has a colour (click its swatch) and every route in it is drawn in that
 colour. New routes go into the selected folder; pick another folder for a route in its editor. Deleting a folder

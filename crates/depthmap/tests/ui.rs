@@ -1518,3 +1518,17 @@ fn sidebars_split_the_screen_and_regions_replace_colors() {
     h.frame(vec![]);
     assert!(!h.st.show_regions && h.st.layout.sv_square.is_some(), "colors come back");
 }
+
+#[test]
+fn zooming_out_fits_the_whole_map_between_the_sidebars() {
+    let mut h = Harness::new();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.ed.reset_view();
+    h.frame(vec![]);
+    if let Some((w, hh)) = h.ed.spec().extent(0) {
+        let map = h.st.map_area;
+        assert!(h.ed.camera.ppc * w as f64 <= map.width() as f64 + 0.5, "map is wider than the free space");
+        assert!(h.ed.camera.ppc * hh as f64 <= map.height() as f64 + 0.5);
+    }
+}

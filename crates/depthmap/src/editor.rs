@@ -245,6 +245,9 @@ pub struct Editor {
     /// Counts events that may change the tile library folder.
     pub tiles_revision: u64,
     pub viewport: (f64, f64),
+    /// Pixels at the (left, top, right, bottom) of the viewport that the
+    /// interface covers; zooming out fits the map in what is left.
+    pub insets: (f64, f64, f64, f64),
     pub cursor_px: Option<(f64, f64)>,
     /// File the map is saved to; `None` for an untitled map.
     pub path: Option<PathBuf>,
@@ -393,6 +396,7 @@ impl Editor {
             tiles_dir: crate::settings::custom_tiles_dir(),
             tiles_revision: 0,
             viewport: (1280.0, 720.0),
+            insets: (0.0, 0.0, 0.0, 0.0),
             cursor_px: None,
             path: None,
             status: String::new(),
@@ -430,6 +434,19 @@ impl Editor {
         // A view showing the whole map keeps showing the whole map.
         let was_fit = self.camera.depth == 0 && self.camera.ppc <= self.camera.min_ppc * 1.0001;
         self.viewport = (w, h);
+        if was_fit && self.spec().is_bounded() {
+            self.camera.ppc = self.min_ppc();
+        }
+        self.constrain();
+    }
+
+    /// Tells the editor how much of the viewport the interface covers.
+    pub fn set_insets(&mut self, insets: (f64, f64, f64, f64)) {
+        if insets == self.insets {
+            return;
+        }
+        let was_fit = self.camera.depth == 0 && self.camera.ppc <= self.camera.min_ppc * 1.0001;
+        self.insets = insets;
         if was_fit && self.spec().is_bounded() {
             self.camera.ppc = self.min_ppc();
         }
@@ -645,7 +662,10 @@ impl Editor {
     fn min_ppc(&self) -> f64 {
         match self.spec().extent(0) {
             Some((w, h)) => {
-                let fit = (self.viewport.0 / w as f64).min(self.viewport.1 / h as f64);
+                let (l, t, rt, b) = self.insets;
+                let vw = (self.viewport.0 - l - rt).max(1.0);
+                let vh = (self.viewport.1 - t - b).max(1.0);
+                let fit = (vw / w as f64).min(vh / h as f64);
                 (fit * FIT_MARGIN).clamp(MIN_FIT_PPC, BASE_PPC)
             }
             None => MIN_PPC,
