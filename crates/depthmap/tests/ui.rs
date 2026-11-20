@@ -1566,11 +1566,13 @@ fn zooming_out_fits_the_whole_map_between_the_sidebars() {
 #[test]
 fn the_whole_map_view_is_centred_on_the_free_area() {
     let mut h = Harness::new();
+    h.ed = Editor::with_spec(depthmap_core::MapSpec::new(200, 100, 3));
+    h.ed.resize(W as f64, H as f64);
     h.frame(vec![]);
     h.frame(vec![]);
     h.ed.reset_view();
     h.frame(vec![]);
-    let Some((w, hh)) = h.ed.spec().extent(0) else { return };
+    let (w, hh) = h.ed.spec().extent(0).expect("bounded map");
     let map = h.st.map_area;
     let (cx, cy) = (w as f64 / 2.0, hh as f64 / 2.0);
     let (ax, ay) = (map.center().x as f64, map.center().y as f64);

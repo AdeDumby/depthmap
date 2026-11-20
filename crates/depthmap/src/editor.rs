@@ -659,9 +659,6 @@ impl Editor {
             cam.cell = (w / 2, h / 2);
             cam.frac = ((w % 2) as f64 * 0.5, (h % 2) as f64 * 0.5);
             cam.ppc = cam.min_ppc;
-            // Centre the map on the free area between the sidebars, not on the window.
-            let (l, t, r, b) = self.insets;
-            cam.pan_pixels((l - r) * 0.5, (t - b) * 0.5);
         }
         self.camera = cam;
         self.constrain();
@@ -689,22 +686,26 @@ impl Editor {
         self.camera.normalize();
         let Some((w, h)) = self.spec().extent(self.camera.depth) else { return };
         let (vw, vh) = self.viewport;
+        let (l, t, r, bt) = self.insets;
         let ppc = self.camera.ppc;
         let cam = &mut self.camera;
-        for (extent, view_px, cell, frac) in [
-            (w, vw, &mut cam.cell.0, &mut cam.frac.0),
-            (h, vh, &mut cam.cell.1, &mut cam.frac.1),
+        for (extent, view_px, (before, after), cell, frac) in [
+            (w, vw, (l, r), &mut cam.cell.0, &mut cam.frac.0),
+            (h, vh, (t, bt), &mut cam.cell.1, &mut cam.frac.1),
         ] {
-            if view_px / ppc >= extent as f64 {
-                // The whole axis is on screen: keep the map centred.
+            // Only the part of the window the sidebars leave free counts.
+            let free_px = (view_px - before - after).max(1.0);
+            if free_px / ppc >= extent as f64 {
+                // The whole axis is on screen: keep the map centred in the free area.
                 *cell = extent / 2;
-                *frac = (extent % 2) as f64 * 0.5;
+                *frac = (extent % 2) as f64 * 0.5 - (before - after) * 0.5 / ppc;
             } else if *cell < 0 {
                 (*cell, *frac) = (0, 0.0);
             } else if *cell >= extent {
                 (*cell, *frac) = (extent - 1, 0.999_999);
             }
         }
+        self.camera.normalize();
     }
 
     pub fn pan_keys(&mut self, dx: f64, dy: f64) {
