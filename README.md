@@ -41,7 +41,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 * **Menu bar** (top): File (New, Open, Save, Save As, Quit), Edit (Undo, Redo),
   View (grid, panels, zoom actions), Help (controls, about). File also has
   *Open recent*. Destructive actions ask before discarding unsaved changes.
-* **Textures panel** (floating, left): 14 textures (flagstone, cobblestone,
+* **Tools sidebar** (left, with sections Tiles, Brush, Shape, Fill and Nodes that open and close by clicking their titles): 14 textures (flagstone, cobblestone,
   brick, planks, dirt, grass, sand, water, hatch, ...). Every texture can be
   painted in **any color**: pick a swatch or use the color picker. Brush size
   slider below.
@@ -67,7 +67,7 @@ cargo test                             # core + editor + UI + headless GPU rende
   *Stripes* and *Crosshatch*; *Solid border* adds a full edge around a patterned
   fill. The brush size is the edge thickness. Patterns are tied to the grid, so
   neighbouring shapes tile seamlessly; a *Line* with a pattern becomes dashed.
-* **Zoom panel** (floating, right): zoom readout, `−` / `1:1` / `+`, a zoom
+* **Zoom controls** (header bar): zoom readout, `−` / `1:1` / `+`, a zoom
   slider, jump one depth up/down, opacity of the parent-layer backdrop, grid
   toggle.
 
@@ -88,7 +88,7 @@ cargo test                             # core + editor + UI + headless GPU rende
 
 ## Fill, selection and colours
 
-**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C), *Region* (R), *Route* (T). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors window is toggled with P.
+**Tools** (top of the Tools panel): *Brush* (B), *Fill* (F), *Select* (S), *Pick* (C), *Region* (R), *Route* (T). Pick is an eyedropper: click a cell to copy its tile and colour, and the app returns to the brush. The Colors sidebar (right) is toggled with P. While the Region or Route tool is in use, its list covers the Colors sidebar; "Back to colors" or choosing another tool brings Colors back.
 
 * **Fill** - click to replace the whole connected area of identical cells (same
   texture and colour) with the current texture and colour; Shift erases it. One undo

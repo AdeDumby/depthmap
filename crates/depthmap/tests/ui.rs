@@ -165,6 +165,7 @@ fn panels_capture_the_pointer_but_the_canvas_does_not() {
 fn panels_can_be_hidden() {
     let mut h = Harness::new();
     h.st.show_tools = false;
+    h.st.show_colors = false;
     h.frame(vec![]);
     h.hover(Pos2::new(40.0, 100.0));
     assert!(!h.ctx.is_pointer_over_egui());
@@ -1498,10 +1499,22 @@ fn overlays_and_windows_stay_below_the_header_bar() {
     let area = h.st.map_area;
     assert!(area.min.y > header.max.y, "map area {area:?} starts below the header {header:?}");
     assert!(area.max.y < H, "and above the status bar");
-    // A window dragged far above the screen is pulled back under the header.
-    h.ed.set_brush_rgb([1, 2, 3]);
-    let tools_top = h.ctx.memory(|m| m.area_rect(egui::Id::new("Tools"))).map(|r| r.min.y);
-    if let Some(top) = tools_top {
-        assert!(top >= area.min.y - 0.5, "Tools window top {top} vs {}", area.min.y);
-    }
+}
+
+#[test]
+fn sidebars_split_the_screen_and_regions_replace_colors() {
+    let mut h = Harness::new();
+    h.frame(vec![]);
+    let map = h.st.map_area;
+    assert!(map.left() > 150.0 && map.right() < W - 150.0, "tools left, colors right: {map:?}");
+    assert!(h.st.layout.sv_square.is_some(), "colors visible");
+    h.ed.tool = ToolMode::Zone;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.show_regions && h.st.layout.sv_square.is_none(), "regions cover colors");
+    assert_eq!(h.st.map_area, map, "map area does not move");
+    h.ed.tool = ToolMode::Paint;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(!h.st.show_regions && h.st.layout.sv_square.is_some(), "colors come back");
 }

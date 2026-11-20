@@ -677,56 +677,28 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     menu_bar(ui, ed, st);
     header_bar(ui, ed, st);
     status_bar(ui, ed, st);
+    // Regions and Routes take over the right sidebar while their tool is in use.
+    if ed.tool != st.last_tool {
+        st.last_tool = ed.tool;
+        st.show_regions = ed.tool == ToolMode::Zone;
+        st.show_routes = ed.tool == ToolMode::Route;
+    }
+    if st.show_regions && st.show_routes {
+        st.show_routes = false;
+    }
+    if st.show_tools {
+        tools_panel(ui, ed, st);
+    }
+    side_panel(ui, ed, st);
     st.map_area = ui.available_rect_before_wrap();
     // Dialogs that ask for something block the Enter shortcut of the welcome screen.
     let modal = st.new_map.is_some() || st.confirm.is_some();
-    if st.show_tools {
-        tools_panel(ctx, ed, st);
-    }
-    if st.show_colors {
-        colors_window(ctx, ed, st);
-    } else {
-        // Nothing is drawn, so nothing can be clicked.
-        let l = &mut st.layout;
-        (l.sv_square, l.hue_bar, l.hex_field, l.palette_new) = (None, None, None, None);
-        (l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None);
-        (l.palette_name_field, l.palette_rename_ok) = (None, None);
-        l.rgb_fields.clear();
-        l.swatches.clear();
-        l.palette_entries.clear();
-    }
-    if ed.tool != st.last_tool {
-        st.last_tool = ed.tool;
-        if ed.tool == ToolMode::Zone {
-            st.show_regions = true;
-        }
-        if ed.tool == ToolMode::Route {
-            st.show_routes = true;
-        }
-    }
     if !st.view_mode.is_3d() {
         zones_layer(ctx, ed, st);
         routes_layer(ctx, ed, st);
         highlight_layer(ctx, ed, st);
         selection_layer(ctx, ed, st.map_area);
         measure_layer(ctx, ed, st.map_area);
-    }
-    if st.show_regions {
-        regions_window(ctx, ed, st);
-    } else {
-        let l = &mut st.layout;
-        (l.zone_new, l.zone_from_selection) = (None, None);
-        l.zone_kinds.clear();
-        l.zone_names.clear();
-        l.zone_deletes.clear();
-    }
-    if st.show_routes {
-        routes_window(ctx, ed, st);
-    } else {
-        st.layout.route_names.clear();
-        st.layout.route_deletes.clear();
-        st.layout.folder_heads.clear();
-        st.layout.folder_deletes.clear();
     }
     if !st.view_mode.is_3d() {
         nodes_layer(ctx, ed, st);
@@ -841,7 +813,7 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 .on_hover_text("Opacity of the layer behind the one you are drawing on");
             });
             ui.menu_button("Pages", |ui| {
-                ui.checkbox(&mut st.show_tools, "Textures & tools");
+                ui.checkbox(&mut st.show_tools, "Tools");
                 ui.checkbox(&mut st.show_colors, "Colors");
                 ui.checkbox(&mut st.show_regions, "Regions");
                 ui.checkbox(&mut st.show_routes, "Routes");
@@ -1085,7 +1057,8 @@ fn tiles_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     }
 }
 
-fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+fn tools_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    let ctx = &root.ctx().clone();
     st.refresh_thumbs(ctx, ed.brush_rgb);
     st.refresh_custom_thumbs(ctx, ed);
     st.layout.textures.clear();
@@ -1100,28 +1073,18 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     st.layout.border_toggle = None;
     st.layout.eraser_toggle = None;
     st.layout.import_icons = None;
-    // Below the header (76 px) and above the status bar, title bar included.
-    let max_height = (st.map_area.height() - 40.0).max(240.0);
-    egui::Window::new("Tools")
-        .constrain_to(st.map_area)
-        .anchor(Align2::LEFT_TOP, [10.0, 76.0])
-        .max_width(260.0)
+    const COLUMNS: usize = 4;
+    const THUMB: f32 = 46.0;
+    egui::Panel::left("tools")
         .resizable(false)
-        .collapsible(true)
-        .show(ctx, |ui| {
+        .exact_size(COLUMNS as f32 * (THUMB + 6.0) + 24.0)
+        .show(root, |ui| {
           egui::ScrollArea::vertical()
-              .min_scrolled_height(max_height)
-              .max_height(max_height)
-              .auto_shrink([false, true])
+              .auto_shrink([false, false])
               .show(ui, |ui| {
-            const COLUMNS: usize = 4;
-            const THUMB: f32 = 46.0;
-            ui.set_width(COLUMNS as f32 * (THUMB + 6.0));
-            ui.set_max_width(COLUMNS as f32 * (THUMB + 6.0));
-
             tool_section(ui, ed, st);
             ui.separator();
-            ui.label(RichText::new("Texture").strong());
+            egui::CollapsingHeader::new(RichText::new("Tiles").strong()).default_open(true).show(ui, |ui| {
             egui::Grid::new("texture_grid")
                 .spacing([6.0, 6.0])
                 .show(ui, |ui| {
@@ -1173,8 +1136,9 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 });
             ui.label(RichText::new(tex_name(ed, ed.texture)).strong());
             tiles_section(ui, ed, st);
+            });
 
-            ui.separator();
+            egui::CollapsingHeader::new(RichText::new("Brush").strong()).default_open(true).show(ui, |ui| {
             let mut half = ed.brush_half;
             ui.horizontal(|ui| {
                 ui.label("Brush");
@@ -1201,26 +1165,23 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 .checkbox(&mut ed.eraser, "Eraser  (E, or hold Shift)")
                 .on_hover_text("Brush and shapes remove cells instead of painting");
             st.layout.eraser_toggle = Some(eraser.rect);
+            });
 
-            ui.separator();
-            ui.label(RichText::new("Shape  (right mouse drag)").strong());
-            egui::Grid::new("shape_grid").spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, shape) in Shape::ALL.into_iter().enumerate() {
+            egui::CollapsingHeader::new(RichText::new("Shape").strong()).default_open(true).show(ui, |ui| {
+            ui.label(RichText::new("Right mouse drag").weak().small());
+            ui.horizontal_wrapped(|ui| {
+                for shape in Shape::ALL {
                     let r = ui.selectable_value(&mut ed.shape, shape, shape.name());
                     st.layout.shapes.push(r.rect);
-                    if i % 3 == 2 {
-                        ui.end_row();
-                    }
                 }
             });
-            ui.label(RichText::new("Fill").strong());
-            egui::Grid::new("fill_grid").spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, fill) in Fill::ALL.into_iter().enumerate() {
+            });
+
+            egui::CollapsingHeader::new(RichText::new("Fill").strong()).default_open(true).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for fill in Fill::ALL {
                     let r = ui.selectable_value(&mut ed.fill, fill, fill.name());
                     st.layout.fills.push(r.rect);
-                    if i % 3 == 2 {
-                        ui.end_row();
-                    }
                 }
             });
             let border = ui
@@ -1230,9 +1191,9 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                 )
                 .on_hover_text("Brush size sets the border / outline thickness");
             st.layout.border_toggle = Some(border.rect);
+            });
 
-            ui.separator();
-            ui.label(RichText::new("Nodes").strong());
+            egui::CollapsingHeader::new(RichText::new("Nodes").strong()).default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let tex = st.icon_tex(ctx, &ed.world, &ed.default_icon);
                 let (rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
@@ -1260,6 +1221,7 @@ fn tools_panel(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             if import.clicked() {
                 st.request(Command::ImportIcons, false);
             }
+            });
           });
         });
 }
@@ -1649,19 +1611,15 @@ fn routes_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
 }
 
 /// The Routes window: the list, and the look of the active route.
-fn routes_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+fn routes_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     use depthmap_core::route::{MAX_ROUTE_NAME, MAX_WIDTH, MIN_WIDTH, RouteStyle};
     let mut open = true;
+    sidebar_title(ui, "Routes", "Back to colors", &mut open);
     st.layout.route_names.clear();
     st.layout.route_deletes.clear();
     st.layout.folder_heads.clear();
     st.layout.folder_deletes.clear();
-    egui::Window::new("Routes")
-        .constrain_to(st.map_area)
-        .open(&mut open)
-        .default_pos(egui::pos2(290.0, 420.0))
-        .default_width(260.0)
-        .show(ctx, |ui| {
+    plain(ui, |ui| {
             ui.checkbox(&mut st.show_route_lines, "Show routes on the map");
             ui.label(
                 RichText::new("Route tool (T): click a start node, then an end node. Click the map to add points it must pass through. Routes show on their layer and the deeper ones.")
@@ -1897,20 +1855,16 @@ fn zones_layer(ctx: &egui::Context, ed: &Editor, st: &UiState) {
 }
 
 /// The Regions window: how to mark cells, and the list of regions.
-fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     use depthmap_core::zone::MAX_ZONE_NAME;
     let mut open = true;
+    sidebar_title(ui, "Regions", "Back to colors", &mut open);
     st.layout.zone_kinds.clear();
     st.layout.zone_names.clear();
     st.layout.zone_deletes.clear();
     st.layout.zone_new = None;
     st.layout.zone_from_selection = None;
-    egui::Window::new("Regions")
-        .constrain_to(st.map_area)
-        .open(&mut open)
-        .default_pos(egui::pos2(290.0, 80.0))
-        .default_width(260.0)
-        .show(ctx, |ui| {
+    plain(ui, |ui| {
             ui.checkbox(&mut st.show_zones, "Show regions on the map");
             ui.separator();
             ui.label(RichText::new("Mark with").strong());
@@ -2003,7 +1957,8 @@ fn regions_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
 }
 
 /// The colour wheel, hex field, map colours and palettes.
-fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+fn colors_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    let ctx = &ui.ctx().clone();
     let l = &mut st.layout;
     l.swatches.clear();
     l.palette_entries.clear();
@@ -2014,26 +1969,10 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     (l.palette_name_field, l.palette_rename_ok) = (None, None);
     st.follow_brush(ed.brush_rgb);
 
-    let screen = ctx.content_rect();
-    // A Window does not grow around a ScrollArea by itself, so give it the
-    // height it needs (or what the screen has).
-    let max_height = (screen.height() - 90.0).clamp(260.0, 620.0);
-    let mut open = st.show_colors;
     let mut acts: Vec<PaletteAct> = Vec::new();
-    egui::Window::new("Colors")
-        .constrain_to(st.map_area)
-        // Left of the zoom panel, so the two do not cover each other.
-        .default_pos(egui::pos2((screen.right() - 500.0).max(290.0), 80.0))
-        .resizable(false)
-        .collapsible(true)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .min_scrolled_height(max_height)
-                .max_height(max_height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.set_width(250.0);
+    plain(ui, |ui| {
+            plain(ui, |ui| {
+                {
                     picker_section(ui, ed, st);
                     ui.separator();
                     ui.label(RichText::new("Map colors").strong());
@@ -2085,9 +2024,9 @@ fn colors_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     });
                     ui.separator();
                     palette_section(ui, ctx, ed, st, &mut acts);
-                });
+                }
+            });
         });
-    st.show_colors = open;
 
     let mut changed = false;
     for act in acts {
@@ -3297,4 +3236,80 @@ mod tests {
         st.request(Command::SaveAs, true);
         assert_eq!(st.take_commands(), vec![Command::SaveAs]);
     }
+}
+
+/// Runs `f` on `ui` (lets a block keep the shape it had inside a window).
+fn plain(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui)) {
+    f(ui);
+}
+
+/// Title row of a panel that replaces the Colors sidebar; `open` turns false
+/// when the button is pressed.
+fn sidebar_title(ui: &mut egui::Ui, title: &str, back: &str, open: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.heading(title);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button(back).clicked() {
+                *open = false;
+            }
+        });
+    });
+    ui.separator();
+}
+
+/// The right sidebar: Colors, or Regions / Routes on top of it while their
+/// tool is in use.
+fn side_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    if !(st.show_colors || st.show_regions || st.show_routes) {
+        clear_color_layout(st);
+        clear_region_layout(st);
+        clear_route_layout(st);
+        return;
+    }
+    egui::Panel::right("side")
+        .resizable(false)
+        .exact_size(280.0)
+        .show(root, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if st.show_regions {
+                    clear_color_layout(st);
+                    clear_route_layout(st);
+                    regions_window(ui, ed, st);
+                } else if st.show_routes {
+                    clear_color_layout(st);
+                    clear_region_layout(st);
+                    routes_window(ui, ed, st);
+                } else {
+                    clear_region_layout(st);
+                    clear_route_layout(st);
+                    colors_window(ui, ed, st);
+                }
+            });
+        });
+}
+
+fn clear_color_layout(st: &mut UiState) {
+    // Nothing is drawn, so nothing can be clicked.
+    let l = &mut st.layout;
+    (l.sv_square, l.hue_bar, l.hex_field, l.palette_new) = (None, None, None, None);
+    (l.palette_rename, l.palette_delete, l.palette_add) = (None, None, None);
+    (l.palette_name_field, l.palette_rename_ok) = (None, None);
+    l.rgb_fields.clear();
+    l.swatches.clear();
+    l.palette_entries.clear();
+}
+
+fn clear_region_layout(st: &mut UiState) {
+    let l = &mut st.layout;
+    (l.zone_new, l.zone_from_selection) = (None, None);
+    l.zone_kinds.clear();
+    l.zone_names.clear();
+    l.zone_deletes.clear();
+}
+
+fn clear_route_layout(st: &mut UiState) {
+    st.layout.route_names.clear();
+    st.layout.route_deletes.clear();
+    st.layout.folder_heads.clear();
+    st.layout.folder_deletes.clear();
 }
