@@ -80,9 +80,23 @@ impl Harness {
     }
 }
 
-/// Opens one of the header's mode menus (they stay open until clicked away).
-fn open_menu(h: &mut Harness, rect: Option<Rect>) {
-    h.click(rect.expect("menu button").center());
+/// Scrolls the right sidebar to its end (the palettes are at the bottom).
+fn scroll_sidebar_down(h: &mut Harness) {
+    h.frame(vec![Event::PointerMoved(Pos2::new(W - 60.0, 300.0))]);
+    h.frame(vec![Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, -3000.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: Default::default(),
+    }]);
+    h.frame(vec![]);
+}
+
+/// Chooses a tool and lets the sidebar show its options.
+fn use_tool(h: &mut Harness, tool: ToolMode) {
+    h.ed.tool = tool;
+    h.frame(vec![]);
     h.frame(vec![]);
 }
 
@@ -634,13 +648,13 @@ fn creating_applies_to_the_editor() {
 fn clicking_shape_and_fill_buttons_selects_them() {
     use depthmap_core::{Fill, Shape};
     let mut h = Harness::new();
-    { let r = h.st.layout.shape_menu; open_menu(&mut h, r); }
+    use_tool(&mut h, ToolMode::Shape);
     assert_eq!(h.st.layout.shapes.len(), Shape::ALL.len());
     for (i, shape) in Shape::ALL.iter().enumerate() {
         h.click(h.st.layout.shapes[i].center());
         assert_eq!(h.ed.shape, *shape);
     }
-    { let r = h.st.layout.fill_menu; open_menu(&mut h, r); }
+    use_tool(&mut h, ToolMode::Shape);
     assert_eq!(h.st.layout.fills.len(), Fill::ALL.len());
     for (i, fill) in Fill::ALL.iter().enumerate() {
         h.click(h.st.layout.fills[i].center());
@@ -655,7 +669,7 @@ fn border_toggle_only_applies_to_filled_shapes_and_eraser_toggles() {
     h.ed.shape = Shape::Rectangle;
     h.ed.fill = Fill::Outline;
     h.frame(vec![]);
-    { let r = h.st.layout.fill_menu; open_menu(&mut h, r); }
+    use_tool(&mut h, ToolMode::Shape);
     h.click(h.st.layout.border_toggle.unwrap().center());
     assert!(!h.ed.border, "disabled for an outline");
 
@@ -671,7 +685,7 @@ fn border_toggle_only_applies_to_filled_shapes_and_eraser_toggles() {
     assert!(!h.ed.border, "lines have no fill");
 
     assert!(!h.ed.eraser);
-    { let r = h.st.layout.brush_menu; open_menu(&mut h, r); }
+    use_tool(&mut h, ToolMode::Paint);
     h.click(h.st.layout.eraser_toggle.unwrap().center());
     assert!(h.ed.eraser);
 }
@@ -763,8 +777,6 @@ fn node_popup_edits_the_node_and_its_buttons_work() {
     let mut h = Harness::new();
     h.ed.icons_dir = std::env::temp_dir().join(format!("depthmap-ui-icons-{}", std::process::id()));
     h.frame(vec![]);
-    h.click(h.st.layout.place_node.unwrap().center());
-    assert!(h.ed.placing_node);
     h.ed.mouse_moved(500.0, 400.0);
     let id = h.ed.place_node_at_cursor().unwrap();
     h.frame(vec![]);
@@ -812,7 +824,7 @@ fn key(k: egui::Key, pressed: bool) -> Event {
 fn tool_buttons_switch_tools_and_select_controls_work() {
     use depthmap::editor::{SelectKind, ToolMode};
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.tool_buttons.len(), 7);
+    assert_eq!(h.st.layout.tool_buttons.len(), 9);
     assert_eq!(h.ed.tool, ToolMode::Paint);
     assert!(h.st.layout.select_kinds.is_empty(), "select options only show for the select tool");
 
@@ -952,6 +964,7 @@ fn palettes_save_colour_and_texture_and_can_be_renamed_and_deleted() {
     h.frame(vec![]);
 
     // Start from a fresh palette.
+    scroll_sidebar_down(&mut h);
     h.click(h.st.layout.palette_new.unwrap().center());
     assert_eq!(h.st.palettes().list().len(), 2);
     assert!(h.st.palettes().current().entries.is_empty());
@@ -1010,11 +1023,12 @@ fn palettes_save_colour_and_texture_and_can_be_renamed_and_deleted() {
 #[test]
 fn palette_entries_can_be_removed_from_their_context_menu() {
     let mut h = Harness::new();
+    scroll_sidebar_down(&mut h);
     h.click(h.st.layout.palette_new.unwrap().center());
     h.ed.set_brush_rgb([1, 2, 3]);
     h.frame(vec![]);
     h.click(h.st.layout.palette_add.unwrap().center());
-    h.frame(vec![]);
+    scroll_sidebar_down(&mut h);
     let at = h.st.layout.palette_entries[0].center();
     let button = |pressed| Event::PointerButton {
         pos: at,
@@ -1028,8 +1042,13 @@ fn palette_entries_can_be_removed_from_their_context_menu() {
     h.frame(vec![]);
     h.frame(vec![]);
     // The menu has opened: find its only button by clicking just below-right of the pointer.
-    let remove = at + vec2(40.0, 14.0);
-    h.click(remove);
+    // (Near the bottom of the screen the menu opens above the pointer instead.)
+    for off in [vec2(40.0, 14.0), vec2(40.0, -14.0), vec2(40.0, -30.0)] {
+        if h.st.palettes().current().entries.is_empty() {
+            break;
+        }
+        h.click(at + off);
+    }
     assert!(h.st.palettes().current().entries.is_empty(), "entry removed");
 }
 
@@ -1401,7 +1420,7 @@ fn quitting_with_unsaved_changes_does_not_ask_and_recovery_is_offered_at_startup
 fn brush_style_buttons_pick_the_style() {
     use depthmap::editor::BrushStyle;
     let mut h = Harness::new();
-    { let r = h.st.layout.brush_menu; open_menu(&mut h, r); }
+    use_tool(&mut h, ToolMode::Paint);
     assert_eq!(h.st.layout.brush_styles.len(), 5);
     h.click(h.st.layout.brush_styles[3].center());
     assert_eq!(h.ed.brush_style, BrushStyle::Spray);
@@ -1506,7 +1525,7 @@ fn overlays_and_windows_stay_below_the_header_bar() {
     let mut h = Harness::new();
     h.frame(vec![]);
     h.frame(vec![]);
-    let header = h.st.layout.tool_buttons[0];
+    let header = h.st.layout.zoom_in.unwrap();
     let area = h.st.map_area;
     assert!(area.min.y > header.max.y, "map area {area:?} starts below the header {header:?}");
     assert!(area.max.y < H, "and above the status bar");
@@ -1517,7 +1536,7 @@ fn sidebars_split_the_screen_and_regions_replace_colors() {
     let mut h = Harness::new();
     h.frame(vec![]);
     let map = h.st.map_area;
-    assert!(map.left() > 150.0 && map.right() < W - 150.0, "tools left, colors right: {map:?}");
+    assert!(map.left() > 40.0 && map.left() < 100.0 && map.right() < W - 150.0, "tools left, colors right: {map:?}");
     assert!(h.st.layout.sv_square.is_some(), "colors visible");
     h.ed.tool = ToolMode::Zone;
     h.frame(vec![]);

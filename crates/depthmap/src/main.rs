@@ -520,6 +520,7 @@ impl App {
                 "r" | "R" => self.editor.tool = ToolMode::Zone,
                 "t" | "T" => self.editor.tool = ToolMode::Route,
                 "m" | "M" => self.editor.tool = ToolMode::Measure,
+                "h" | "H" => self.editor.tool = ToolMode::Shape,
                 "v" | "V" => {
                     if let Some(g) = self.gfx.as_mut() {
                         g.gui.state.view_mode = g.gui.state.view_mode.next();
@@ -532,11 +533,8 @@ impl App {
                     }
                 }
                 "n" | "N" => {
-                    if self.editor.placing_node {
-                        self.editor.cancel_placing_node();
-                    } else {
-                        self.editor.start_placing_node();
-                    }
+                    self.editor.cancel_placing_node();
+                    self.editor.tool = ToolMode::Node;
                 }
                 "[" => self.editor.change_brush(-1),
                 "]" => self.editor.change_brush(1),

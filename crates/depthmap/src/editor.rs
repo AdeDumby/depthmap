@@ -124,6 +124,10 @@ pub enum ToolMode {
     Route,
     /// Click points to measure distances in cells.
     Measure,
+    /// Drag out the chosen shape (the right mouse button always does).
+    Shape,
+    /// Click the map to place a node, click a node to edit it.
+    Node,
 }
 
 /// How Select picks cells.
@@ -1488,12 +1492,17 @@ impl Editor {
             ToolMode::Zone => self.begin_zone(shift),
             ToolMode::Route => self.begin_route(),
             ToolMode::Measure => self.measure_click(),
+            ToolMode::Shape => self.begin_shape(shift),
+            ToolMode::Node => {
+                self.place_node_at_cursor();
+            }
         }
     }
 
     /// Left button released.
     pub fn primary_release(&mut self) {
         self.end_stroke();
+        self.end_shape();
         self.end_select();
         self.end_zone();
         self.route_drag = None;
