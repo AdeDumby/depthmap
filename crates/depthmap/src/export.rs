@@ -22,16 +22,20 @@ pub enum ExportArea {
     Selection,
     /// What is on screen now.
     View,
+    /// The bounding box of one region ([`ExportOptions::region`]).
+    Region,
 }
 
 impl ExportArea {
-    pub const ALL: [ExportArea; 3] = [ExportArea::WholeMap, ExportArea::Selection, ExportArea::View];
+    pub const ALL: [ExportArea; 4] =
+        [ExportArea::WholeMap, ExportArea::Selection, ExportArea::View, ExportArea::Region];
 
     pub fn name(self) -> &'static str {
         match self {
             ExportArea::WholeMap => "Whole map",
             ExportArea::Selection => "Selection",
             ExportArea::View => "Visible view",
+            ExportArea::Region => "One region",
         }
     }
 }
@@ -48,6 +52,10 @@ pub struct ExportOptions {
     pub nodes: bool,
     /// Show the faded layer above, as on screen.
     pub parent_layer: bool,
+    /// Which region (index in the map's list) for [`ExportArea::Region`].
+    pub region: usize,
+    /// Leave everything outside that region transparent.
+    pub mask_to_region: bool,
 }
 
 impl ExportOptions {
@@ -61,6 +69,8 @@ impl ExportOptions {
             routes: true,
             nodes: true,
             parent_layer: false,
+            region: 0,
+            mask_to_region: false,
         }
     }
 }
@@ -111,6 +121,11 @@ pub fn plan(ed: &Editor, opts: &ExportOptions) -> Result<Plan, String> {
             let sel = ed.selection().ok_or("Select something first (Select tool)")?;
             let b = sel.bounds().ok_or("An \"everything but...\" selection cannot be exported")?;
             rebase(b, sel.depth(), d)
+        }
+        ExportArea::Region => {
+            let zone = ed.world.zones().get(opts.region).ok_or("Pick a region to export")?;
+            let b = zone.area().bounds().ok_or("That region is empty")?;
+            rebase(b, zone.depth(), d)
         }
         ExportArea::View => {
             let (min, max) = ed.camera.at_depth(d).visible_cells(ed.viewport.0, ed.viewport.1);
@@ -272,6 +287,133 @@ fn render_inner(
     Ok(out)
 }
 
+/// Makes every pixel whose cell is not in the chosen region transparent.
+pub fn mask_outside_region(ed: &Editor, opts: &ExportOptions, rgba: &mut [u8]) -> Result<(), String> {
+    let plan = plan(ed, opts)?;
+    let zone = ed.world.zones().get(opts.region).ok_or("Pick a region to export")?;
+    let (w, _) = plan.size_px;
+    let ppc = opts.px_per_cell as usize;
+    for cy in 0..plan.cells.1 {
+        for cx in 0..plan.cells.0 {
+            if zone.area().contains(opts.depth, plan.origin.0 + cx, plan.origin.1 + cy) {
+                continue;
+            }
+            for py in 0..ppc {
+                let row = (cy as usize * ppc + py) * w as usize;
+                let start = (row + cx as usize * ppc) * 4;
+                rgba[start..start + ppc * 4].fill(0);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- presets -----------------------------------------------------------------
+
+/// A named, saved set of export choices. The region is remembered by name,
+/// so a preset keeps working in any map with a region of that name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preset {
+    pub name: String,
+    pub area: ExportArea,
+    pub region_name: String,
+    pub depth: u8,
+    pub px_per_cell: u32,
+    pub grid: bool,
+    pub regions: bool,
+    pub routes: bool,
+    pub nodes: bool,
+    pub parent_layer: bool,
+    pub mask_to_region: bool,
+}
+
+impl Preset {
+    pub fn from_options(name: &str, o: &ExportOptions, ed: &Editor) -> Preset {
+        Preset {
+            name: name.trim().chars().filter(|c| !c.is_control() && *c != '|').take(40).collect(),
+            area: o.area,
+            region_name: ed.world.zones().get(o.region).map(|z| z.name.clone()).unwrap_or_default(),
+            depth: o.depth,
+            px_per_cell: o.px_per_cell,
+            grid: o.grid,
+            regions: o.regions,
+            routes: o.routes,
+            nodes: o.nodes,
+            parent_layer: o.parent_layer,
+            mask_to_region: o.mask_to_region,
+        }
+    }
+
+    /// The options for this map: the region is looked up by name, and the
+    /// depth is limited to what the map has.
+    pub fn options(&self, ed: &Editor) -> Result<ExportOptions, String> {
+        let mut o = ExportOptions::new(self.depth.min(ed.spec().max_depth));
+        o.area = self.area;
+        o.px_per_cell = self.px_per_cell.clamp(MIN_PX_PER_CELL, MAX_PX_PER_CELL);
+        (o.grid, o.regions, o.routes, o.nodes) = (self.grid, self.regions, self.routes, self.nodes);
+        o.parent_layer = self.parent_layer;
+        o.mask_to_region = self.mask_to_region;
+        if self.area == ExportArea::Region || self.mask_to_region {
+            o.region = ed
+                .world
+                .zones()
+                .iter()
+                .position(|z| z.name == self.region_name)
+                .ok_or_else(|| format!("This map has no region called \"{}\"", self.region_name))?;
+        }
+        Ok(o)
+    }
+}
+
+const AREA_KEYS: [(&str, ExportArea); 4] = [
+    ("whole", ExportArea::WholeMap),
+    ("selection", ExportArea::Selection),
+    ("view", ExportArea::View),
+    ("region", ExportArea::Region),
+];
+
+/// One preset per line, fields separated by `|`.
+pub fn presets_to_text(presets: &[Preset]) -> String {
+    let mut out = String::new();
+    for p in presets {
+        let area = AREA_KEYS.iter().find(|(_, a)| *a == p.area).map_or("whole", |(k, _)| k);
+        let region: String = p.region_name.chars().filter(|c| !c.is_control() && *c != '|').collect();
+        let flags = [p.grid, p.regions, p.routes, p.nodes, p.parent_layer, p.mask_to_region]
+            .map(|b| if b { '1' } else { '0' })
+            .iter()
+            .collect::<String>();
+        out.push_str(&format!("{}|{}|{}|{}|{}|{}\n", p.name, area, region, p.depth, p.px_per_cell, flags));
+    }
+    out
+}
+
+/// Reads [`presets_to_text`] output, skipping lines that make no sense.
+pub fn presets_from_text(text: &str) -> Vec<Preset> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('|').collect();
+            let [name, area, region, depth, px, flags] = f[..] else { return None };
+            let flags: Vec<bool> = flags.chars().map(|c| c == '1').collect();
+            if name.trim().is_empty() || flags.len() != 6 {
+                return None;
+            }
+            Some(Preset {
+                name: name.to_string(),
+                area: AREA_KEYS.iter().find(|(k, _)| *k == area)?.1,
+                region_name: region.to_string(),
+                depth: depth.parse().ok()?,
+                px_per_cell: px.parse::<u32>().ok()?.clamp(MIN_PX_PER_CELL, MAX_PX_PER_CELL),
+                grid: flags[0],
+                regions: flags[1],
+                routes: flags[2],
+                nodes: flags[3],
+                parent_layer: flags[4],
+                mask_to_region: flags[5],
+            })
+        })
+        .collect()
+}
+
 /// Encodes RGBA pixels as a PNG file.
 pub fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
@@ -292,7 +434,10 @@ pub fn export_png(
     queue: &wgpu::Queue,
     path: &Path,
 ) -> Result<String, String> {
-    let (w, h, rgba) = render(ed, opts, ghost_opacity, device, queue)?;
+    let (w, h, mut rgba) = render(ed, opts, ghost_opacity, device, queue)?;
+    if opts.mask_to_region {
+        mask_outside_region(ed, opts, &mut rgba)?;
+    }
     write_png(path, w, h, &rgba)?;
     Ok(format!("Exported {w} \u{d7} {h} px to {}", path.display()))
 }
@@ -307,6 +452,63 @@ mod tests {
         let mut e = Editor::with_spec(MapSpec::new(w, h, depth));
         e.resize(800.0, 600.0);
         e
+    }
+
+    #[test]
+    fn a_region_can_be_exported_alone_and_the_rest_masked() {
+        let mut e = editor(64, 64, 1);
+        let z = depthmap_core::zone::Zone::from_area("Keep", [200, 50, 50], true, Selection::rect(0, (10, 20), (13, 22)));
+        e.world.add_zone(z);
+        let mut o = ExportOptions::new(0);
+        o.px_per_cell = 4;
+        o.area = ExportArea::Region;
+        let p = plan(&e, &o).unwrap();
+        assert_eq!((p.origin, p.cells, p.size_px), ((10, 20), (4, 3), (16, 12)));
+        o.depth = 1;
+        assert_eq!(plan(&e, &o).unwrap().cells, (16, 12), "finer layers cover the same area");
+        o.region = 5;
+        assert!(plan(&e, &o).is_err());
+
+        // Mask: an L-shaped region keeps only its own cells opaque.
+        let rows = [(0, vec![(0, 1)]), (1, vec![(0, 0)])].into_iter().collect();
+        let l = depthmap_core::zone::Zone::from_area("L", [1, 2, 3], true, Selection::from_rows(0, rows));
+        e.world.remove_zone(0);
+        e.world.add_zone(l);
+        let mut o = ExportOptions::new(0);
+        o.px_per_cell = 2;
+        o.area = ExportArea::Region;
+        o.mask_to_region = true;
+        let mut rgba = vec![255u8; 4 * 4 * 4];
+        mask_outside_region(&e, &o, &mut rgba).unwrap();
+        let alpha = |x: usize, y: usize| rgba[(y * 4 + x) * 4 + 3];
+        assert_eq!((alpha(0, 0), alpha(3, 1), alpha(0, 3)), (255, 255, 255));
+        assert_eq!((alpha(2, 2), alpha(3, 3)), (0, 0), "the cell outside the L is cleared");
+    }
+
+    #[test]
+    fn presets_round_trip_and_follow_regions_by_name() {
+        let mut e = editor(64, 64, 2);
+        let z = depthmap_core::zone::Zone::from_area("Castle", [9, 9, 9], true, Selection::rect(0, (1, 1), (3, 3)));
+        e.world.add_zone(depthmap_core::zone::Zone::new("Other", [1, 1, 1], 0));
+        e.world.add_zone(z);
+        let mut o = ExportOptions::new(1);
+        o.area = ExportArea::Region;
+        o.region = 1;
+        o.px_per_cell = 64;
+        o.grid = true;
+        o.mask_to_region = true;
+        let p = Preset::from_options("  Castle | print ", &o, &e);
+        assert_eq!(p.name, "Castle  print");
+        let text = presets_to_text(&[p.clone()]);
+        assert_eq!(presets_from_text(&text), vec![p.clone()]);
+        assert_eq!(p.options(&e).unwrap(), o);
+        // Another map: the region is found by name wherever it sits in the list...
+        e.world.remove_zone(0);
+        assert_eq!(p.options(&e).unwrap().region, 0);
+        // ...and reported when it is missing.
+        e.world.remove_zone(0);
+        assert!(p.options(&e).unwrap_err().contains("Castle"));
+        assert!(presets_from_text("junk\n|whole||0|32|000000\nx|nope||0|32|000000\n").is_empty());
     }
 
     #[test]

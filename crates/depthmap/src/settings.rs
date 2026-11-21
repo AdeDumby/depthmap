@@ -30,6 +30,15 @@ pub fn custom_tiles_dir() -> PathBuf {
         .join("Custom Tiles")
 }
 
+/// Where saved stamps are kept: `Documents/Depthmap/Stamps`.
+pub fn stamps_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
+        .join("Depthmap")
+        .join("Stamps")
+}
+
 /// Where the "import PNG" dialog starts.
 pub fn icon_import_start_dir() -> Option<PathBuf> {
     dirs::picture_dir().or_else(dirs::document_dir)

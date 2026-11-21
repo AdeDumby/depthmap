@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use depthmap_core::camera::{BASE_PPC, MIN_PPC};
 use depthmap_core::colors::DEFAULT_COLORS;
 use depthmap_core::raster::{line_cells, square_cells};
+use depthmap_core::stamp::Stamp;
 use depthmap_core::selection::{
     RegionError, Rows, Selection, MAX_REGION_CELLS, region_of_same, region_of_same_everywhere,
     rows_cell_count,
@@ -276,6 +277,14 @@ pub struct Editor {
     /// What the left mouse button does.
     pub tool: ToolMode,
     pub select_kind: SelectKind,
+    /// The last copied area, and whether it is being placed (a preview
+    /// follows the mouse; a click pastes it).
+    pub clipboard: Option<Stamp>,
+    pub pasting: bool,
+    /// Saved stamps, kept as files in `stamps_dir`.
+    pub stamps: Vec<Stamp>,
+    pub stamps_dir: PathBuf,
+    stamps_loaded: bool,
     /// The region the Region tool edits (index into `world.zones()`).
     pub zone_active: Option<usize>,
     pub zone_kind: ZoneKind,
@@ -286,6 +295,8 @@ pub struct Editor {
     pub route_active: Option<usize>,
     /// Folder that new routes go into.
     pub route_folder: usize,
+    /// Id of the folder new nodes are listed in.
+    pub node_folder: u32,
     /// A route being started: the node it leaves from.
     pub route_start: Option<depthmap_core::node::NodeId>,
     /// A via point being dragged: (route, point).
@@ -419,12 +430,18 @@ impl Editor {
             node_drag: None,
             tool: ToolMode::Paint,
             select_kind: SelectKind::Rectangle,
+            clipboard: None,
+            pasting: false,
+            stamps: Vec::new(),
+            stamps_dir: crate::settings::stamps_dir(),
+            stamps_loaded: false,
             zone_active: None,
             zone_kind: ZoneKind::Lasso,
             zone_subtract: false,
             lasso: None,
             route_active: None,
             route_folder: 0,
+            node_folder: depthmap_core::node::DEFAULT_FOLDER,
             route_start: None,
             route_drag: None,
             measure: Vec::new(),
@@ -839,6 +856,11 @@ impl Editor {
         let depth = self.camera.depth;
         let (fx, fy) = self.point_at_depth(depth, sx, sy);
         let mut node = Node::new(0, depth, 0, 0, self.default_icon.clone());
+        node.folder = if self.world.node_folders().iter().any(|f| f.id == self.node_folder) {
+            self.node_folder
+        } else {
+            depthmap_core::node::DEFAULT_FOLDER
+        };
         node.snap = self.node_snap;
         node.place_at(fx, fy);
         if !self.world.in_bounds(depth, node.x, node.y) {
@@ -855,6 +877,17 @@ impl Editor {
         self.status.clear();
         self.icons_revision += 1;
         Some(id)
+    }
+
+    /// Moves the view onto a node, at the depth it sits on.
+    pub fn centre_on_node(&mut self, id: NodeId) {
+        let Some(n) = self.world.node(id) else { return };
+        let (fx, fy) = n.position();
+        let depth = n.depth.min(self.spec().max_depth);
+        self.camera.depth = depth;
+        self.camera.cell = (fx.floor() as i64, fy.floor() as i64);
+        self.camera.frac = (fx - fx.floor(), fy - fy.floor());
+        self.constrain();
     }
 
     /// The node whose popup is open.
@@ -1576,6 +1609,160 @@ impl Editor {
         }
     }
 
+    // ---- copy, paste and stamps ----------------------------------------------
+
+    /// Copies the selected cells; false (with a message) when that is not possible.
+    pub fn copy_selection(&mut self) -> bool {
+        let Some(sel) = self.selection.as_ref() else {
+            self.status = "Select an area first, then copy".into();
+            return false;
+        };
+        match Stamp::capture(&self.world, self.camera.depth, sel) {
+            Ok(stamp) => {
+                self.status = format!("Copied {} x {} cells (Ctrl+V to paste)", stamp.width(), stamp.height());
+                self.clipboard = Some(stamp);
+                true
+            }
+            Err(e) => {
+                self.status = e.message();
+                false
+            }
+        }
+    }
+
+    /// Copies the selection and clears it from the map (one undo step).
+    pub fn cut_selection(&mut self) -> bool {
+        if !self.copy_selection() {
+            return false;
+        }
+        let depth = self.camera.depth;
+        let Some(((x0, y0), (x1, y1))) = self.selection.as_ref().and_then(|s| s.rebased(depth).unwrap_or_else(|| s.clone()).bounds())
+        else {
+            return false;
+        };
+        let mut edits = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if self.selected(depth, x, y) {
+                    let old = self.world.set(depth, x, y, EMPTY);
+                    if old != EMPTY {
+                        edits.push(CellEdit { depth, x, y, old, new: EMPTY });
+                    }
+                }
+            }
+        }
+        self.history.record_applied(edits);
+        true
+    }
+
+    /// Starts placing the clipboard: a preview follows the mouse.
+    pub fn start_paste(&mut self) -> bool {
+        if self.clipboard.is_none() {
+            self.status = "Nothing copied yet: select an area and press Ctrl+C".into();
+            return false;
+        }
+        self.tool = ToolMode::Select;
+        self.pasting = true;
+        self.status = "Click to paste, X / Y flip, R rotates, Esc stops".into();
+        true
+    }
+
+    /// Top-left cell of the paste preview: the clipboard is centred on the mouse.
+    pub fn paste_origin(&self) -> Option<(i64, i64)> {
+        let c = self.clipboard.as_ref()?;
+        let cell = self.cursor_cell()?;
+        Some((cell.0 - (c.width() / 2) as i64, cell.1 - (c.height() / 2) as i64))
+    }
+
+    pub fn paste_at_cursor(&mut self) -> bool {
+        let (Some(origin), Some(stamp)) = (self.paste_origin(), self.clipboard.clone()) else {
+            return false;
+        };
+        let depth = self.camera.depth;
+        let edits = stamp.apply(&mut self.world, depth, origin);
+        if edits.is_empty() {
+            self.status = "Nothing changed (outside the map, or the same tiles)".into();
+            return false;
+        }
+        self.history.record_applied(edits);
+        true
+    }
+
+    pub fn flip_clipboard(&mut self, horizontal: bool) {
+        if let Some(c) = self.clipboard.as_mut() {
+            if horizontal { c.flip_horizontal() } else { c.flip_vertical() }
+        }
+    }
+
+    pub fn rotate_clipboard(&mut self, clockwise: bool) {
+        if let Some(c) = self.clipboard.as_mut() {
+            if clockwise { c.rotate_clockwise() } else { c.rotate_counter_clockwise() }
+        }
+    }
+
+    /// Loads the saved stamps once.
+    pub fn ensure_stamps(&mut self) {
+        if !self.stamps_loaded {
+            self.stamps_loaded = true;
+            self.reload_stamps();
+        }
+    }
+
+    pub fn reload_stamps(&mut self) {
+        self.stamps.clear();
+        let Ok(dir) = std::fs::read_dir(&self.stamps_dir) else { return };
+        let mut found: Vec<(std::path::PathBuf, Stamp)> = dir
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "dstamp"))
+            .filter_map(|p| std::fs::read(&p).ok().and_then(|b| Stamp::from_bytes(&b)).map(|s| (p, s)))
+            .collect();
+        found.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+        self.stamps = found.into_iter().map(|(_, s)| s).collect();
+    }
+
+    fn stamp_path(&self, name: &str) -> PathBuf {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.stamps_dir.join(format!("{}.dstamp", safe.trim()))
+    }
+
+    /// Saves the clipboard as a named stamp (replacing one of that name).
+    pub fn save_stamp(&mut self, name: &str) -> Result<(), String> {
+        self.ensure_stamps();
+        let Some(mut stamp) = self.clipboard.clone() else {
+            return Err("Copy an area first".into());
+        };
+        let name: String = name.chars().filter(|c| !c.is_control()).collect();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Give the stamp a name".into());
+        }
+        stamp.name = name.chars().take(depthmap_core::stamp::MAX_NAME).collect();
+        std::fs::create_dir_all(&self.stamps_dir).map_err(|e| format!("cannot create {}: {e}", self.stamps_dir.display()))?;
+        std::fs::write(self.stamp_path(&stamp.name), stamp.to_bytes()).map_err(|e| format!("cannot save the stamp: {e}"))?;
+        self.reload_stamps();
+        self.status = format!("Saved stamp \"{}\"", stamp.name);
+        Ok(())
+    }
+
+    /// Makes a saved stamp the clipboard and starts placing it.
+    pub fn use_stamp(&mut self, index: usize) {
+        if let Some(s) = self.stamps.get(index).cloned() {
+            self.clipboard = Some(s);
+            self.start_paste();
+        }
+    }
+
+    pub fn delete_stamp(&mut self, index: usize) {
+        if let Some(s) = self.stamps.get(index) {
+            let _ = std::fs::remove_file(self.stamp_path(&s.name));
+            self.reload_stamps();
+        }
+    }
+
     /// Adds to the selection (OR).
     fn add_selection(&mut self, sel: Selection) {
         if sel.is_empty() {
@@ -1594,6 +1781,10 @@ impl Editor {
     /// Starts a selection at the mouse: a rectangle drag, or an immediate
     /// region pick, depending on [`SelectKind`].
     pub fn begin_select(&mut self) {
+        if self.pasting {
+            self.paste_at_cursor();
+            return;
+        }
         let Some(cell) = self.cursor_cell() else { return };
         let depth = self.camera.depth;
         match self.select_kind {
@@ -1708,7 +1899,10 @@ impl Editor {
     /// Escape: backs out of whatever is going on, innermost first, and
     /// finally drops the selection.
     pub fn escape(&mut self) {
-        if self.placing_node {
+        if self.pasting {
+            self.pasting = false;
+            self.status.clear();
+        } else if self.placing_node {
             self.cancel_placing_node();
         } else if self.open_node_id().is_some() {
             self.close_node(true);
@@ -2808,6 +3002,66 @@ mod tests {
         e.primary_release();
         assert!(e.lasso_screen().is_none());
         assert_eq!(e.world.zones()[0].area().cell_count(), Some(n));
+    }
+
+    #[test]
+    fn copy_paste_cut_and_saved_stamps_work_through_the_select_tool() {
+        let mut e = walled();
+        e.stamps_dir = std::env::temp_dir().join(format!("depthmap-stamps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&e.stamps_dir);
+        e.tool = ToolMode::Select;
+        let red = e.world.colors.index_of([250, 0, 0]);
+        for (x, y) in [(2, 2), (3, 2), (2, 3)] {
+            e.world.set(0, x, y, make_cell(4, red));
+        }
+        assert!(!e.copy_selection(), "no selection yet");
+        e.set_selection(Some(Selection::rect(0, (2, 2), (3, 3))));
+        assert!(e.copy_selection());
+        assert_eq!(e.clipboard.as_ref().unwrap().filled(), 3);
+
+        // Paste, rotated, at another spot; undo removes it in one step.
+        assert!(e.start_paste());
+        e.rotate_clipboard(true);
+        let (x, y) = centre_of(&e, (9, 9));
+        e.mouse_moved(x, y);
+        let origin = e.paste_origin().unwrap();
+        assert!(e.paste_at_cursor());
+        let placed = (0..2).flat_map(|dy| (0..2).map(move |dx| (origin.0 + dx, origin.1 + dy)))
+            .filter(|&(x, y)| e.world.get(0, x, y) != EMPTY)
+            .count();
+        assert_eq!(placed, 3);
+        e.undo();
+        assert_eq!(e.world.get(0, origin.0, origin.1), EMPTY);
+        assert_eq!(e.world.get(0, 2, 2), make_cell(4, red), "the original stays");
+
+        // Esc stops placing; a click while placing pastes instead of selecting.
+        e.escape();
+        assert!(!e.pasting);
+        e.start_paste();
+        e.begin_select();
+        assert!(e.world.get(0, origin.0, origin.1) != EMPTY || e.world.get(0, origin.0 + 1, origin.1) != EMPTY);
+        e.escape();
+
+        // Cut clears the cells and can be undone.
+        assert!(e.cut_selection());
+        assert_eq!(e.world.get(0, 2, 2), EMPTY);
+        e.undo();
+        assert_eq!(e.world.get(0, 2, 2), make_cell(4, red));
+
+        // Stamps are files that reload.
+        assert!(e.save_stamp("  ").is_err());
+        e.save_stamp("Corner").unwrap();
+        assert_eq!(e.stamps.len(), 1);
+        e.stamps.clear();
+        e.stamps_loaded = false;
+        e.clipboard = None;
+        e.ensure_stamps();
+        assert_eq!(e.stamps[0].name, "Corner");
+        e.use_stamp(0);
+        assert!(e.pasting && e.clipboard.is_some());
+        e.delete_stamp(0);
+        assert!(e.stamps.is_empty());
+        let _ = std::fs::remove_dir_all(&e.stamps_dir);
     }
 
     #[test]

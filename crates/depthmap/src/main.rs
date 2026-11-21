@@ -83,7 +83,8 @@ impl Gfx {
         surface.configure(&device, &config);
 
         let renderer = Renderer::new(device.clone(), queue.clone(), format);
-        let gui = Gui::new(&device, format);
+        let mut gui = Gui::new(&device, format);
+        gui.state.load_presets(dirs::config_dir().map(|d| d.join("depthmap").join("export_presets.txt")));
         let egui_state = egui_winit::State::new(
             gui.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -478,6 +479,15 @@ impl App {
             if let Key::Character(c) = event.key_without_modifiers() {
                 match c.as_str() {
                     "a" => self.editor.select_all(),
+                    "c" => {
+                        self.editor.copy_selection();
+                    }
+                    "x" => {
+                        self.editor.cut_selection();
+                    }
+                    "v" => {
+                        self.editor.start_paste();
+                    }
                     "d" => self.editor.clear_selection(),
                     "i" => self.editor.invert_selection(),
                     // While the tile editor is open, undo applies to the tile.
@@ -506,6 +516,17 @@ impl App {
                 }
             }
             return;
+        }
+        if self.editor.pasting {
+            if let Key::Character(c) = &event.logical_key {
+                match c.as_str() {
+                    "x" | "X" => return self.editor.flip_clipboard(true),
+                    "y" | "Y" => return self.editor.flip_clipboard(false),
+                    "r" => return self.editor.rotate_clipboard(true),
+                    "R" => return self.editor.rotate_clipboard(false),
+                    _ => {}
+                }
+            }
         }
         if let Key::Character(c) = &event.logical_key {
             match c.as_str() {

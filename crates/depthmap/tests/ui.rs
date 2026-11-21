@@ -173,8 +173,8 @@ fn panels_capture_the_pointer_but_the_canvas_does_not() {
     let thumb = h.st.layout.textures[0].center();
     h.hover(thumb);
     assert!(h.ctx.is_pointer_over_egui(), "over the texture panel");
-    h.hover(h.st.layout.view_buttons[0].center());
-    assert!(h.ctx.is_pointer_over_egui(), "over the header bar");
+    h.hover(h.st.layout.mode_menu.unwrap().center());
+    assert!(h.ctx.is_pointer_over_egui(), "over the menu bar");
     h.hover(Pos2::new(5.0, 5.0));
     assert!(h.ctx.is_pointer_over_egui(), "over the menu bar");
     h.hover(Pos2::new(W * 0.5, H * 0.6));
@@ -1362,20 +1362,26 @@ fn export_window_opens_and_sends_the_export_command() {
 }
 
 #[test]
-fn header_switches_between_the_flat_map_and_the_3d_views() {
+fn mode_menu_switches_between_the_flat_map_and_the_3d_views() {
     use depthmap::gui::ViewMode;
     let mut h = Harness::new();
-    assert_eq!(h.st.layout.view_buttons.len(), 3);
+    let pick = |h: &mut Harness, i: usize| {
+        h.click(h.st.layout.mode_menu.unwrap().center());
+        h.frame(vec![]);
+        assert_eq!(h.st.layout.view_buttons.len(), 3);
+        h.click(h.st.layout.view_buttons[i].center());
+        h.frame(vec![]);
+    };
     assert_eq!(h.st.view_mode, ViewMode::Edit);
-    h.click(h.st.layout.view_buttons[1].center());
+    pick(&mut h, 1);
     assert_eq!(h.st.view_mode, ViewMode::Isometric);
     // Tools cannot be changed in 3D (the buttons are disabled), the views can.
     let tool = h.ed.tool;
     h.click(h.st.layout.tool_buttons[1].center());
     assert_eq!(h.ed.tool, tool);
-    h.click(h.st.layout.view_buttons[2].center());
+    pick(&mut h, 2);
     assert_eq!(h.st.view_mode, ViewMode::TopDown);
-    h.click(h.st.layout.view_buttons[0].center());
+    pick(&mut h, 0);
     assert_eq!(h.st.view_mode, ViewMode::Edit);
     h.click(h.st.layout.tool_buttons[1].center());
     assert_eq!(h.ed.tool, ToolMode::Fill);
@@ -1525,9 +1531,9 @@ fn overlays_and_windows_stay_below_the_header_bar() {
     let mut h = Harness::new();
     h.frame(vec![]);
     h.frame(vec![]);
-    let header = h.st.layout.view_buttons[0];
+    let header = h.st.layout.mode_menu.unwrap();
     let area = h.st.map_area;
-    assert!(area.min.y > header.max.y, "map area {area:?} starts below the header {header:?}");
+    assert!(area.min.y > header.max.y, "map area {area:?} starts below the menu bar {header:?}");
     assert!(area.max.y < H, "and above the status bar");
 }
 
@@ -1579,4 +1585,129 @@ fn the_whole_map_view_is_centred_on_the_free_area() {
     let (wx, wy) = h.ed.camera.screen_to_world(ax, ay, h.ed.viewport.0, h.ed.viewport.1);
     let tol = 2.0 / h.ed.camera.ppc;
     assert!((wx - cx).abs() < tol && (wy - cy).abs() < tol, "free area centre is map cell {wx},{wy}, map centre {cx},{cy}");
+}
+
+#[test]
+fn nodes_list_groups_by_folder_and_node_panel_edits_folder_and_tags() {
+    let mut h = Harness::new();
+    use_tool(&mut h, ToolMode::Node);
+    h.frame(vec![]);
+    assert!(h.st.layout.node_new_folder.is_some());
+    h.click(h.st.layout.node_new_folder.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.node_folders().len(), 2);
+    let second = h.ed.world.node_folders()[1].id;
+    assert_eq!(h.ed.node_folder, second);
+    // A node placed now lands in the selected folder.
+    h.ed.mouse_moved(500.0, 400.0);
+    let id = h.ed.place_node_at_cursor().unwrap();
+    assert_eq!(h.ed.world.node(id).unwrap().folder, second);
+    // Tags typed into the panel are added.
+    h.frame(vec![]);
+    let input = h.st.layout.node_tag_input.expect("tag field");
+    h.click(input.center());
+    h.st.tag_input = "Inn".into();
+    h.click(h.st.layout.node_tag_add.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.world.node(id).unwrap().tags, vec!["Inn".to_string()]);
+}
+
+#[test]
+fn select_tool_buttons_copy_flip_rotate_and_save_stamps() {
+    use depthmap_core::{Selection, make_cell};
+    let mut h = Harness::new();
+    h.ed.stamps_dir = std::env::temp_dir().join(format!("depthmap-ui-stamps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&h.ed.stamps_dir);
+    use_tool(&mut h, ToolMode::Select);
+    h.frame(vec![]);
+    assert!(h.st.layout.clip_paste.is_some());
+    for (x, y) in [(1, 1), (2, 1)] {
+        h.ed.world.set(0, x, y, make_cell(3, 0));
+    }
+    h.ed.set_selection(Some(Selection::rect(0, (1, 1), (2, 1))));
+    h.frame(vec![]);
+    h.click(h.st.layout.clip_copy.unwrap().center());
+    let c = h.ed.clipboard.clone().expect("copied");
+    assert_eq!((c.width(), c.height()), (2, 1));
+    h.frame(vec![]);
+    h.click(h.st.layout.clip_rot_cw.unwrap().center());
+    let c = h.ed.clipboard.clone().unwrap();
+    assert_eq!((c.width(), c.height()), (1, 2), "rotated a quarter turn");
+    h.click(h.st.layout.clip_flip_h.unwrap().center());
+    h.click(h.st.layout.clip_flip_v.unwrap().center());
+    h.click(h.st.layout.clip_rot_ccw.unwrap().center());
+    h.click(h.st.layout.clip_paste.unwrap().center());
+    assert!(h.ed.pasting);
+    h.ed.escape();
+    h.st.stamp_name = "Pair".into();
+    h.frame(vec![]);
+    h.click(h.st.layout.clip_save.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.ed.stamps.len(), 1);
+    assert_eq!(h.st.layout.stamp_rows.len(), 1);
+    h.click(h.st.layout.stamp_rows[0].center());
+    assert!(h.ed.pasting);
+    h.ed.escape();
+    h.frame(vec![]);
+    h.click(h.st.layout.stamp_deletes[0].center());
+    assert!(h.ed.stamps.is_empty());
+    let _ = std::fs::remove_dir_all(&h.ed.stamps_dir);
+}
+
+#[test]
+fn export_dialog_offers_one_region_and_saves_presets() {
+    use depthmap::export::ExportArea;
+    use depthmap_core::{Selection, zone::Zone};
+    let mut h = Harness::new();
+    h.ed.world.add_zone(Zone::from_area("Keep", [200, 50, 50], true, Selection::rect(0, (2, 2), (5, 4))));
+    h.st.presets_file = None;
+    h.st.open_export(&h.ed);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.export_areas.len(), ExportArea::ALL.len());
+    h.click(h.st.layout.export_areas[3].center());
+    assert_eq!(h.st.export_dialog.unwrap().area, ExportArea::Region);
+    h.frame(vec![]);
+    h.click(h.st.layout.export_mask.unwrap().center());
+    assert!(h.st.export_dialog.unwrap().mask_to_region);
+
+    // Save the settings as a preset, change them, then apply the preset.
+    h.st.preset_name = "Keep only".into();
+    h.frame(vec![]);
+    h.click(h.st.layout.preset_save.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.st.export_presets.len(), 1);
+    let mut o = h.st.export_dialog.unwrap();
+    o.area = ExportArea::View;
+    o.mask_to_region = false;
+    h.st.export_dialog = Some(o);
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    h.click(h.st.layout.preset_rows[0].center());
+    let o = h.st.export_dialog.unwrap();
+    assert_eq!((o.area, o.mask_to_region, o.region), (ExportArea::Region, true, 0));
+    for _ in 0..3 {
+        h.frame(vec![]);
+    }
+    h.click(h.st.layout.preset_deletes[0].center());
+    assert!(h.st.export_presets.is_empty());
+}
+
+#[test]
+fn help_lists_every_shortcut_section_once() {
+    let mut h = Harness::new();
+    h.st.toggle_help();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(depthmap::gui::SHORTCUTS.iter().any(|(s, _)| *s == "Selection and clipboard"));
+    let total: usize = depthmap::gui::SHORTCUTS.iter().map(|(_, r)| r.len()).sum();
+    assert!(total > 40, "{total} shortcuts listed");
+    // No key is listed twice within a section.
+    for (s, rows) in depthmap::gui::SHORTCUTS {
+        let mut keys: Vec<&str> = rows.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), rows.len(), "duplicate key in {s}");
+    }
 }

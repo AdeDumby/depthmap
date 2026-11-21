@@ -6,6 +6,53 @@ pub type NodeId = u64;
 
 pub const MAX_NAME_CHARS: usize = 80;
 pub const MAX_DESCRIPTION_CHARS: usize = 4000;
+pub const MAX_TAGS: usize = 16;
+pub const MAX_TAG_CHARS: usize = 32;
+pub const MAX_NODE_FOLDERS: usize = 64;
+pub const MAX_NODE_FOLDER_NAME: usize = 40;
+
+/// Id of the folder every map starts with (and where nodes of a deleted
+/// folder show up).
+pub const DEFAULT_FOLDER: u32 = 0;
+
+/// A folder of nodes, shown in the Nodes sidebar.
+#[derive(Clone, Debug)]
+pub struct NodeFolder {
+    /// Never reused inside a map, so a node can name its folder.
+    pub id: u32,
+    pub name: String,
+    /// Open in the sidebar. Display state only: not compared, not undone.
+    pub expanded: bool,
+}
+
+impl PartialEq for NodeFolder {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.name == other.name
+    }
+}
+
+impl NodeFolder {
+    pub fn new(id: u32, name: &str) -> Self {
+        Self { id, name: name.chars().filter(|c| !c.is_control()).take(MAX_NODE_FOLDER_NAME).collect(), expanded: true }
+    }
+}
+
+/// Cleans a tag list: trimmed, no control characters or `#`, no empty or
+/// repeated (ignoring case) tags, within the limits.
+pub fn clean_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t: String = t.chars().filter(|c| !c.is_control() && *c != '#').collect();
+        let t: String = t.trim().chars().take(MAX_TAG_CHARS).collect();
+        if !t.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&t) || o.to_lowercase() == t.to_lowercase()) {
+            out.push(t);
+        }
+        if out.len() >= MAX_TAGS {
+            break;
+        }
+    }
+    out
+}
 /// Icon size multiplier range (1.0 = one cell of the node's depth wide).
 pub const MIN_SCALE: f32 = 0.1;
 pub const MAX_SCALE: f32 = 10.0;
@@ -101,11 +148,14 @@ pub struct Node {
     /// The icon sits on the grid corner at the bottom-right of cell `x, y`
     /// instead of at the centre of it (see [`Snap`]).
     pub edge: bool,
+    /// Id of the folder it is listed in (see `World::node_folders`).
+    pub folder: u32,
+    pub tags: Vec<String>,
 }
 
 impl Node {
     pub fn new(id: NodeId, depth: u8, x: i64, y: i64, icon: Icon) -> Self {
-        Self { id, depth, x, y, name: String::new(), description: String::new(), icon, scale: 1.0, snap: Snap::Auto, edge: false }
+        Self { id, depth, x, y, name: String::new(), description: String::new(), icon, scale: 1.0, snap: Snap::Auto, edge: false, folder: DEFAULT_FOLDER, tags: Vec::new() }
     }
 
     /// Where the icon's centre is, in cells of `depth`.
@@ -153,6 +203,7 @@ impl Node {
             1.0
         };
         self.depth = self.depth.min(MAX_DEPTH);
+        self.tags = clean_tags(&self.tags);
         self
     }
 }

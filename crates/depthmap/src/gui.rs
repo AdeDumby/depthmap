@@ -106,6 +106,7 @@ pub struct UiLayout {
     pub brush_styles: Vec<egui::Rect>,
     pub recovery_discard: Option<egui::Rect>,
     pub view_buttons: Vec<egui::Rect>,
+    pub mode_menu: Option<egui::Rect>,
     pub depth_up: Option<egui::Rect>,
     pub depth_down: Option<egui::Rect>,
     pub export_button: Option<egui::Rect>,
@@ -118,6 +119,7 @@ pub struct UiLayout {
     pub zoom_reset: Option<egui::Rect>,
     pub startup_continue: Option<egui::Rect>,
     pub startup_open: Option<egui::Rect>,
+    pub startup_shortcuts: Option<egui::Rect>,
     pub startup_new: Option<egui::Rect>,
     pub startup_recent: Vec<egui::Rect>,
     pub shapes: Vec<egui::Rect>,
@@ -135,6 +137,13 @@ pub struct UiLayout {
     pub node_delete: Option<egui::Rect>,
     pub node_cancel: Option<egui::Rect>,
     pub node_import: Option<egui::Rect>,
+    pub node_folder_heads: Vec<egui::Rect>,
+    pub node_folder_deletes: Vec<egui::Rect>,
+    pub node_rows: Vec<egui::Rect>,
+    pub node_new_folder: Option<egui::Rect>,
+    pub node_tag_chips: Vec<egui::Rect>,
+    pub node_tag_input: Option<egui::Rect>,
+    pub node_tag_add: Option<egui::Rect>,
     /// Brush, Fill, Select.
     pub tool_buttons: Vec<egui::Rect>,
     pub zone_kinds: Vec<egui::Rect>,
@@ -151,6 +160,21 @@ pub struct UiLayout {
     pub folder_heads: Vec<egui::Rect>,
     pub folder_deletes: Vec<egui::Rect>,
     pub select_kinds: Vec<egui::Rect>,
+    pub export_areas: Vec<egui::Rect>,
+    pub export_mask: Option<egui::Rect>,
+    pub preset_save: Option<egui::Rect>,
+    pub preset_rows: Vec<egui::Rect>,
+    pub preset_deletes: Vec<egui::Rect>,
+    pub clip_copy: Option<egui::Rect>,
+    pub clip_cut: Option<egui::Rect>,
+    pub clip_paste: Option<egui::Rect>,
+    pub clip_flip_h: Option<egui::Rect>,
+    pub clip_flip_v: Option<egui::Rect>,
+    pub clip_rot_cw: Option<egui::Rect>,
+    pub clip_rot_ccw: Option<egui::Rect>,
+    pub clip_save: Option<egui::Rect>,
+    pub stamp_rows: Vec<egui::Rect>,
+    pub stamp_deletes: Vec<egui::Rect>,
     pub select_all: Option<egui::Rect>,
     pub select_invert: Option<egui::Rect>,
     pub select_clear: Option<egui::Rect>,
@@ -263,6 +287,7 @@ pub struct UiState {
     hl_hover: Option<u8>,
     hl_click: Option<(u8, f64)>,
     show_help: bool,
+    help_filter: String,
     show_about: bool,
     /// A command waiting for the "unsaved changes" answer.
     confirm: Option<Command>,
@@ -288,6 +313,14 @@ pub struct UiState {
     seen_tiles_rev: u64,
     /// Node whose name field should grab the keyboard when its popup opens.
     focus_node: Option<depthmap_core::NodeId>,
+    /// Text typed in the Nodes list filter and the new-tag field.
+    pub node_filter: String,
+    pub tag_input: String,
+    pub stamp_name: String,
+    pub export_presets: Vec<crate::export::Preset>,
+    pub preset_name: String,
+    /// Where export presets are saved (`None`: kept in memory only).
+    pub presets_file: Option<std::path::PathBuf>,
     palettes: Palettes,
     /// The Map depth dialog: the depth being typed.
     depth_dialog: Option<u8>,
@@ -337,6 +370,7 @@ impl UiState {
             hl_hover: None,
             hl_click: None,
             show_help: false,
+            help_filter: String::new(),
             show_about: false,
             confirm: None,
             startup: false,
@@ -355,6 +389,12 @@ impl UiState {
             tile_lib: Vec::new(),
             seen_tiles_rev: u64::MAX,
             focus_node: None,
+            node_filter: String::new(),
+            tag_input: String::new(),
+            stamp_name: String::new(),
+            export_presets: Vec::new(),
+            preset_name: String::new(),
+            presets_file: None,
             palettes: Palettes::in_memory(),
             depth_dialog: None,
             hsv: [0.0, 0.0, 1.0],
@@ -603,6 +643,24 @@ impl UiState {
         &self.recent
     }
 
+    /// Reads the saved export presets from `file` and keeps saving there.
+    pub fn load_presets(&mut self, file: Option<std::path::PathBuf>) {
+        self.export_presets = file
+            .as_deref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| crate::export::presets_from_text(&t))
+            .unwrap_or_default();
+        self.presets_file = file;
+    }
+
+    fn save_presets(&self) {
+        let Some(file) = &self.presets_file else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, crate::export::presets_to_text(&self.export_presets));
+    }
+
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
     }
@@ -708,10 +766,14 @@ pub fn draw(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     if st.show_regions && st.show_routes {
         st.show_routes = false;
     }
-    if st.show_tools {
+    // The welcome page takes the whole area; the sidebars come back with the map.
+    let welcome = st.startup && st.new_map.is_none();
+    if st.show_tools && !welcome {
         tools_panel(ui, ed, st);
     }
-    side_panel(ui, ed, st);
+    if !welcome {
+        side_panel(ui, ed, st);
+    }
     st.map_area = ui.available_rect_before_wrap();
     {
         let ppp = ctx.pixels_per_point() as f64;
@@ -847,8 +909,24 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 ui.checkbox(&mut st.show_tools, "Tools sidebar");
                 ui.checkbox(&mut st.show_colors, "Colors sidebar");
             });
+            let mode = ui.menu_button("Mode", |ui| {
+                for mode in ViewMode::ALL {
+                    let tip = match mode {
+                        ViewMode::Edit => "The flat map you draw on (V cycles the views)",
+                        ViewMode::Isometric => "See the map as a 3D heightfield from an angle (view only)",
+                        ViewMode::TopDown => "See the map from above with relief shading (view only)",
+                    };
+                    let r = ui.selectable_label(st.view_mode == mode, mode.name()).on_hover_text(tip);
+                    st.layout.view_buttons.push(r.rect);
+                    if r.clicked() {
+                        st.view_mode = mode;
+                        ui.close();
+                    }
+                }
+            });
+            st.layout.mode_menu = Some(mode.response.rect);
             ui.menu_button("Help", |ui| {
-                if item(ui, "Controls", "F1") {
+                if item(ui, "Keyboard shortcuts", "F1") {
                     st.show_help = true;
                 }
                 if item(ui, "About", "") {
@@ -903,23 +981,14 @@ fn height_menu(ui: &mut egui::Ui, st: &mut UiState, title: &str, h: &mut i16) ->
     *h != before
 }
 
-/// The row under the menu: tools, how the map is shown, zoom and depth.
+/// The row under the menu, only in the 3D modes: turn and height controls.
 fn header_bar(root: &mut egui::Ui, _ed: &mut Editor, st: &mut UiState) {
+    if !st.view_mode.is_3d() {
+        return;
+    }
     egui::Panel::top("header").show(root, |ui| {
         ui.horizontal_wrapped(|ui| {
-            for mode in ViewMode::ALL {
-                let tip = match mode {
-                    ViewMode::Edit => "The flat map you draw on (V cycles the views)",
-                    ViewMode::Isometric => "See the map as a 3D heightfield from an angle (view only)",
-                    ViewMode::TopDown => "See the map from above with relief shading (view only)",
-                };
-                let r = ui.selectable_label(st.view_mode == mode, mode.name()).on_hover_text(tip);
-                st.layout.view_buttons.push(r.rect);
-                if r.clicked() {
-                    st.view_mode = mode;
-                }
-            }
-            if st.view_mode.is_3d() {
+            {
                 if st.view_mode == ViewMode::Isometric {
                     if ui.small_button("<").on_hover_text("Turn the map left ( , )").clicked() {
                         st.view3d.yaw -= std::f32::consts::FRAC_PI_4;
@@ -1289,12 +1358,14 @@ fn depth_subdiv() -> i64 {
     depthmap_core::SUBDIV
 }
 
+/// The welcome page: the whole area below the menu, until a map is chosen.
 fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     st.layout.startup_continue = None;
     st.layout.startup_open = None;
     st.layout.startup_new = None;
+    st.layout.startup_shortcuts = None;
     st.layout.startup_recent.clear();
-    // The New Map dialog takes over; the welcome screen returns if it is cancelled.
+    // The New Map dialog takes over; the welcome page returns if it is cancelled.
     if !st.startup || st.new_map.is_some() {
         return;
     }
@@ -1302,81 +1373,198 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
     let last = recent.iter().find(|e| e.exists).cloned();
     let enter = !modal && ctx.input(|i| i.key_pressed(egui::Key::Enter));
     let mut chosen: Option<Command> = None;
+    let mut show_help = false;
+    let area = st.map_area;
+    let fill = ctx.global_style().visuals.panel_fill;
 
-    egui::Window::new("Welcome to depthmap")
-        .constrain_to(st.map_area)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+    egui::Area::new(egui::Id::unique("welcome_page"))
+        .order(egui::Order::Background)
+        .fixed_pos(area.min)
+        .constrain(false)
         .show(ctx, |ui| {
-            ui.set_width(430.0);
-            ui.label("Pick up where you left off, open a map, or start a new one.");
-            ui.add_space(6.0);
-
-            if let Some(entry) = &last {
-                let fill = ui.visuals().selection.bg_fill;
-                let button = egui::Button::new(
-                    RichText::new(format!("Continue with  {}", entry.name())).size(17.0).strong(),
-                )
-                .fill(fill);
-                let resp = ui.add_sized([ui.available_width(), 44.0], button);
-                st.layout.startup_continue = Some(resp.rect);
-                ui.label(RichText::new(entry.folder()).weak().small());
-                if resp.clicked() || enter {
-                    chosen = Some(Command::OpenPath(entry.path.clone()));
-                }
-                ui.add_space(4.0);
-            }
-
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 6.0) / 2.0;
-                let open = ui.add_sized([w, 32.0], egui::Button::new("Open map..."));
-                st.layout.startup_open = Some(open.rect);
-                if open.clicked() {
-                    chosen = Some(Command::Open);
-                }
-                let new = ui.add_sized([w, 32.0], egui::Button::new("New map"));
-                st.layout.startup_new = Some(new.rect);
-                if new.clicked() {
-                    chosen = Some(Command::New);
-                }
+            ui.set_clip_rect(area);
+            egui::Frame::NONE.fill(fill).show(ui, |ui| {
+                ui.set_min_size(area.size());
+                ui.set_max_size(area.size());
+                let width = 760.0f32.min(area.width() - 48.0).max(320.0);
+                let side = ((area.width() - width) / 2.0).max(0.0);
+                ui.add_space((area.height() * 0.12).min(90.0));
+                ui.horizontal(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.label(RichText::new("depthmap").size(44.0).strong());
+                        ui.label(
+                            RichText::new(format!(
+                                "Draw a map, then zoom \u{d7}{} into any cell and keep drawing.",
+                                depthmap_core::SUBDIV
+                            ))
+                            .size(16.0)
+                            .weak(),
+                        );
+                        ui.add_space(22.0);
+                        let columns = width >= 560.0;
+                        ui.horizontal_top(|ui| {
+                            let left = if columns { 300.0 } else { width };
+                            ui.vertical(|ui| {
+                                ui.set_width(left);
+                                ui.label(RichText::new("Start").strong().size(18.0));
+                                ui.add_space(4.0);
+                                if let Some(entry) = &last {
+                                    let button = egui::Button::new(
+                                        RichText::new(format!("Continue with  {}", entry.name())).size(15.0).strong(),
+                                    )
+                                    .fill(ui.visuals().selection.bg_fill)
+                                    .truncate();
+                                    let resp = ui.add_sized([left, 48.0], button);
+                                    st.layout.startup_continue = Some(resp.rect);
+                                    ui.label(RichText::new(entry.folder()).weak().small());
+                                    if resp.clicked() || enter {
+                                        chosen = Some(Command::OpenPath(entry.path.clone()));
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                                let new = ui.add_sized([left, 36.0], egui::Button::new(RichText::new("New map").size(15.0)));
+                                st.layout.startup_new = Some(new.rect);
+                                if new.clicked() {
+                                    chosen = Some(Command::New);
+                                }
+                                let open = ui.add_sized([left, 36.0], egui::Button::new(RichText::new("Open map...").size(15.0)));
+                                st.layout.startup_open = Some(open.rect);
+                                if open.clicked() {
+                                    chosen = Some(Command::Open);
+                                }
+                                ui.add_space(10.0);
+                                let keys = ui.add(egui::Button::new("Keyboard shortcuts").frame(false));
+                                st.layout.startup_shortcuts = Some(keys.rect);
+                                show_help = keys.clicked();
+                            });
+                            if columns {
+                                ui.add_space(30.0);
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Recent maps").strong().size(18.0));
+                                ui.add_space(4.0);
+                                if recent.is_empty() {
+                                    ui.label(RichText::new("Maps you open or save show up here.").weak());
+                                }
+                                for entry in recent.iter().take(8) {
+                                    let text = if entry.exists {
+                                        format!("{}    {}", entry.name(), entry.folder())
+                                    } else {
+                                        format!("{}    (file not found)", entry.name())
+                                    };
+                                    let resp = ui.add_enabled(
+                                        entry.exists,
+                                        egui::Button::new(text).frame(false).min_size(vec2(ui.available_width().min(width - 330.0).max(200.0), 24.0)),
+                                    );
+                                    st.layout.startup_recent.push(resp.rect);
+                                    if resp.clicked() {
+                                        chosen = Some(Command::OpenPath(entry.path.clone()));
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(26.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Good to know").strong());
+                        for tip in [
+                            "A map is one .dmap file. Save writes to the open map; a new map asks where to save the first time.",
+                            "Scroll to zoom in: past a cell's size you draw on the next, finer layer. Nodes, routes and regions show on every layer.",
+                            "Select an area, Ctrl+C, then Ctrl+V to stamp it again; Save stamp keeps it for other maps.",
+                        ] {
+                            ui.label(RichText::new(tip).weak().small());
+                        }
+                    });
+                });
             });
-
-            if !recent.is_empty() {
-                ui.separator();
-                ui.label(RichText::new("Recent maps").strong());
-                for entry in recent.iter().take(8) {
-                    let text = if entry.exists {
-                        format!("{}    {}", entry.name(), entry.folder())
-                    } else {
-                        format!("{}    (file not found)", entry.name())
-                    };
-                    let resp = ui.add_enabled(
-                        entry.exists,
-                        egui::Button::new(text).frame(false).min_size(vec2(ui.available_width(), 24.0)),
-                    );
-                    st.layout.startup_recent.push(resp.rect);
-                    if resp.clicked() {
-                        chosen = Some(Command::OpenPath(entry.path.clone()));
-                    }
-                }
-            }
-
-            ui.separator();
-            ui.label(
-                RichText::new(
-                    "A map is one .dmap file. Save writes to the open map; \
-                     a new map asks where to save the first time.",
-                )
-                .weak()
-                .small(),
-            );
         });
 
+    if show_help {
+        st.show_help = true;
+    }
     if let Some(cmd) = chosen {
         st.dispatch(cmd);
     }
 }
+
+/// Every keyboard and mouse shortcut, by section (the Help window lists them).
+pub const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Files",
+        &[
+            ("Ctrl+N", "New map"),
+            ("Ctrl+O", "Open a map"),
+            ("Ctrl+S", "Save"),
+            ("Ctrl+Shift+S", "Save as"),
+            ("Ctrl+E", "Export image"),
+        ],
+    ),
+    (
+        "Tools",
+        &[
+            ("B", "Brush"),
+            ("F", "Bucket (fill a connected area; Shift erases it)"),
+            ("S", "Select"),
+            ("H", "Shapes"),
+            ("C", "Pick a colour and tile from the map"),
+            ("M", "Measure"),
+            ("R", "Regions"),
+            ("T", "Routes"),
+            ("N", "Nodes"),
+            ("E", "Toggle the eraser"),
+            ("1 - 9, 0", "Pick a texture"),
+            ("[   ]", "Smaller / larger brush"),
+            ("P", "Show or hide the Colors sidebar"),
+        ],
+    ),
+    (
+        "Editing",
+        &[
+            ("Ctrl+Z", "Undo"),
+            ("Ctrl+Y / Ctrl+Shift+Z", "Redo"),
+            ("Esc", "Back out: placing, node panel, shape, lasso, paste, then the selection"),
+            ("Delete", "Delete the node whose panel is open"),
+        ],
+    ),
+    (
+        "Selection and clipboard",
+        &[
+            ("Ctrl+A", "Select all"),
+            ("Ctrl+D", "Deselect"),
+            ("Ctrl+I", "Invert the selection"),
+            ("Ctrl+C", "Copy the selected cells"),
+            ("Ctrl+X", "Cut the selected cells"),
+            ("Ctrl+V", "Paste: a preview follows the mouse, click to place"),
+            ("X / Y (while pasting)", "Flip the copy left-right / top-bottom"),
+            ("R / Shift+R (while pasting)", "Turn the copy clockwise / counter-clockwise"),
+            ("Esc (while pasting)", "Stop pasting"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("V", "Cycle 2D, Isometric and Top-down"),
+            (",   .", "Turn the isometric view left / right"),
+            ("Arrow keys", "Pan"),
+            ("Mouse wheel", "Zoom (deeper zoom is a finer layer)"),
+            ("Middle mouse / Space + drag", "Pan"),
+            ("F1", "This list"),
+        ],
+    ),
+    (
+        "Mouse",
+        &[
+            ("Left button", "Use the tool: paint, select, place, pick..."),
+            ("Right button (drag)", "Draw the chosen shape and fill (Select tool: invert the selection)"),
+            ("Shift + left button", "Erase instead"),
+            ("Click a node", "Open it; drag to move it"),
+            ("Right click a folder or route", "Rename it"),
+            ("Right click a palette tile or colour", "Set its height for the 3D views"),
+        ],
+    ),
+];
 
 /// Brush / Fill / Select buttons and the selection controls.
 fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
@@ -1409,6 +1597,7 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     ed.clear_selection();
                 }
             });
+            clipboard_section(ui, ed, st);
         }
         ToolMode::Zone => {}
         ToolMode::Route => {
@@ -1430,6 +1619,108 @@ fn tool_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             if clear.clicked() {
                 ed.clear_selection();
             }
+        }
+    }
+}
+
+/// Copy / cut / paste, flip and rotate, and the saved stamps (Select tool).
+fn clipboard_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    ed.ensure_stamps();
+    let l = &mut st.layout;
+    (l.clip_copy, l.clip_cut, l.clip_paste, l.clip_flip_h, l.clip_flip_v) = (None, None, None, None, None);
+    (l.clip_rot_cw, l.clip_rot_ccw, l.clip_save) = (None, None, None);
+    l.stamp_rows.clear();
+    l.stamp_deletes.clear();
+    ui.separator();
+    ui.label(RichText::new("Copy and paste").strong());
+    let has_sel = ed.has_selection();
+    let has_clip = ed.clipboard.is_some();
+    ui.horizontal_wrapped(|ui| {
+        let b = ui.add_enabled(has_sel, egui::Button::new("Copy").small()).on_hover_text("Copy the selected cells (Ctrl+C)");
+        st.layout.clip_copy = Some(b.rect);
+        if b.clicked() {
+            ed.copy_selection();
+        }
+        let b = ui.add_enabled(has_sel, egui::Button::new("Cut").small()).on_hover_text("Copy and clear the selected cells (Ctrl+X)");
+        st.layout.clip_cut = Some(b.rect);
+        if b.clicked() {
+            ed.cut_selection();
+        }
+        let b = ui
+            .add_enabled(has_clip, egui::Button::new("Paste").small().selected(ed.pasting))
+            .on_hover_text("Place the copy: a preview follows the mouse, click to paste (Ctrl+V)");
+        st.layout.clip_paste = Some(b.rect);
+        if b.clicked() {
+            ed.start_paste();
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.add_enabled_ui(has_clip, |ui| {
+            for (label, tip, kind) in [
+                ("Flip H", "Mirror left to right (X)", 0),
+                ("Flip V", "Mirror top to bottom (Y)", 1),
+                ("Rot \u{21bb}", "Turn a quarter clockwise (R)", 2),
+                ("Rot \u{21ba}", "Turn a quarter counter-clockwise (Shift+R)", 3),
+            ] {
+                let b = ui.add(egui::Button::new(label).small()).on_hover_text(tip);
+                match kind {
+                    0 => st.layout.clip_flip_h = Some(b.rect),
+                    1 => st.layout.clip_flip_v = Some(b.rect),
+                    2 => st.layout.clip_rot_cw = Some(b.rect),
+                    _ => st.layout.clip_rot_ccw = Some(b.rect),
+                }
+                if b.clicked() {
+                    match kind {
+                        0 => ed.flip_clipboard(true),
+                        1 => ed.flip_clipboard(false),
+                        2 => ed.rotate_clipboard(true),
+                        _ => ed.rotate_clipboard(false),
+                    }
+                }
+            }
+        });
+    });
+    if let Some(c) = &ed.clipboard {
+        ui.label(RichText::new(format!("Clipboard: {} x {} cells", c.width(), c.height())).weak().small());
+    }
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut st.stamp_name).hint_text("Stamp name").desired_width(120.0));
+        let b = ui.add_enabled(has_clip, egui::Button::new("Save stamp").small()).on_hover_text("Keep the copy as a stamp you can use in any map");
+        st.layout.clip_save = Some(b.rect);
+        if b.clicked() {
+            match ed.save_stamp(&st.stamp_name) {
+                Ok(()) => st.stamp_name.clear(),
+                Err(e) => ed.status = e,
+            }
+        }
+    });
+    if !ed.stamps.is_empty() {
+        ui.label(RichText::new("Stamps").strong());
+        let mut use_it = None;
+        let mut delete = None;
+        for (i, s) in ed.stamps.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let r = ui
+                    .selectable_label(false, format!("{}  ({} x {})", s.name, s.width(), s.height()))
+                    .on_hover_text("Click to place this stamp");
+                st.layout.stamp_rows.push(r.rect);
+                if r.clicked() {
+                    use_it = Some(i);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let d = ui.add(egui::Button::new("X").small()).on_hover_text("Delete this stamp");
+                    st.layout.stamp_deletes.push(d.rect);
+                    if d.clicked() {
+                        delete = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(i) = use_it {
+            ed.use_stamp(i);
+        }
+        if let Some(i) = delete {
+            ed.delete_stamp(i);
         }
     }
 }
@@ -1496,6 +1787,9 @@ fn selection_layer(ctx: &egui::Context, ed: &Editor, area: egui::Rect) {
             4.0,
         ));
     }
+    if ed.pasting {
+        draw_paste_preview(&painter, ed, ppp);
+    }
     if ed.selection().is_none() && preview.is_none() {
         return;
     }
@@ -1505,6 +1799,33 @@ fn selection_layer(ctx: &egui::Context, ed: &Editor, area: egui::Rect) {
     if let Some(s) = &preview {
         draw_selection(&painter, ed, s, ppp, Color32::from_rgb(255, 214, 90), 56);
     }
+}
+
+/// The clipboard under the mouse: its tiles as flat colours, and an outline.
+fn draw_paste_preview(painter: &egui::Painter, ed: &Editor, ppp: f32) {
+    /// More cells than this on screen are shown as the outline only.
+    const MAX_CELLS: usize = 6000;
+    let (Some(c), Some((ox, oy))) = (ed.clipboard.as_ref(), ed.paste_origin()) else { return };
+    let depth = ed.camera.depth;
+    let pt = |x: i64, y: i64| {
+        let (px, py) = ed.route_point_px(depth, (x as f64, y as f64));
+        egui::pos2(px as f32 / ppp, py as f32 / ppp)
+    };
+    if c.filled() <= MAX_CELLS {
+        for y in 0..c.height() {
+            for x in 0..c.width() {
+                let cell = c.at(x, y);
+                if cell.texture == 0 {
+                    continue;
+                }
+                let (cx, cy) = (ox + x as i64, oy + y as i64);
+                let rect = egui::Rect::from_two_pos(pt(cx, cy), pt(cx + 1, cy + 1));
+                painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(cell.rgb[0], cell.rgb[1], cell.rgb[2], 170));
+            }
+        }
+    }
+    let outline = egui::Rect::from_two_pos(pt(ox, oy), pt(ox + c.width() as i64, oy + c.height() as i64));
+    painter.rect_stroke(outline, 0.0, Stroke::new(2.0, Color32::from_rgb(255, 214, 90)), egui::StrokeKind::Outside);
 }
 
 fn draw_selection(
@@ -2532,6 +2853,125 @@ fn nodes_layer(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     }
 }
 
+/// The Nodes tool without an open node: nodes listed in folders.
+fn node_list_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
+    let ctx = &ui.ctx().clone();
+    st.layout.node_folder_heads.clear();
+    st.layout.node_folder_deletes.clear();
+    st.layout.node_rows.clear();
+    let mut open = true;
+    sidebar_title(ui, "Back to colors", &mut open);
+    if !open {
+        st.show_node = false;
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut st.node_filter)
+                .hint_text("Filter by name or tag")
+                .desired_width(150.0),
+        );
+        let new = ui.button("New folder");
+        st.layout.node_new_folder = Some(new.rect);
+        if new.clicked() {
+            let n = ed.world.node_folders().len() + 1;
+            if let Some(id) = ed.world.add_node_folder(&format!("Folder {n}")) {
+                ed.node_folder = id;
+            }
+        }
+    });
+    ui.separator();
+    let filter = st.node_filter.trim().trim_start_matches('#').to_lowercase();
+    let matches = |n: &depthmap_core::Node| {
+        filter.is_empty()
+            || n.name.to_lowercase().contains(&filter)
+            || n.tags.iter().any(|t| t.to_lowercase().contains(&filter))
+    };
+    let folders: Vec<(u32, String, bool)> =
+        ed.world.node_folders().iter().map(|f| (f.id, f.name.clone(), f.expanded)).collect();
+    let mut remove_folder = None;
+    let mut open_node = None;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for (fi, (fid, fname, expanded)) in folders.iter().enumerate() {
+            let rows: Vec<(depthmap_core::NodeId, String, Vec<String>, Icon)> = ed
+                .world
+                .nodes()
+                .iter()
+                .filter(|n| ed.world.node_folder_index(n) == fi && matches(n))
+                .map(|n| (n.id, n.name.clone(), n.tags.clone(), n.icon.clone()))
+                .collect();
+            if !filter.is_empty() && rows.is_empty() {
+                continue;
+            }
+            let shown = *expanded || !filter.is_empty();
+            ui.horizontal(|ui| {
+                let head = ui
+                    .selectable_label(
+                        ed.node_folder == *fid,
+                        format!("{} {} ({})", if shown { "v" } else { ">" }, fname, rows.len()),
+                    )
+                    .on_hover_text("Click to open / close. New nodes go in the selected folder. Right click to rename");
+                st.layout.node_folder_heads.push(head.rect);
+                head.context_menu(|ui| {
+                    ui.label("Folder name");
+                    let mut name = fname.clone();
+                    if ui.add(egui::TextEdit::singleline(&mut name).desired_width(160.0)).changed() {
+                        ed.world.rename_node_folder(*fid, &name);
+                    }
+                });
+                if head.clicked() {
+                    ed.node_folder = *fid;
+                    ed.world.set_node_folder_open(*fid, !expanded);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let del = ui
+                        .add_enabled(fi > 0, egui::Button::new("X").small())
+                        .on_hover_text("Delete this folder (its nodes move to the first folder)");
+                    st.layout.node_folder_deletes.push(del.rect);
+                    if del.clicked() {
+                        remove_folder = Some(*fid);
+                    }
+                });
+            });
+            if !shown {
+                continue;
+            }
+            for (id, name, tags, icon) in rows {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    let tex = st.icon_tex(ctx, &ed.world, &icon);
+                    let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    ui.painter().image(
+                        tex.id(18.0),
+                        fit_rect(rect, tex.aspect),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    let label = if name.is_empty() { "(unnamed)".to_string() } else { name };
+                    let r = ui.selectable_label(false, label).on_hover_text("Click to open it and go there");
+                    st.layout.node_rows.push(r.rect);
+                    if r.clicked() {
+                        open_node = Some(id);
+                    }
+                    if !tags.is_empty() {
+                        let list: Vec<String> = tags.iter().map(|t| format!("#{t}")).collect();
+                        ui.label(RichText::new(list.join(" ")).weak().small());
+                    }
+                });
+            }
+        }
+    });
+    if let Some(id) = remove_folder {
+        ed.world.remove_node_folder(id);
+        if ed.node_folder == id {
+            ed.node_folder = depthmap_core::node::DEFAULT_FOLDER;
+        }
+    }
+    if let Some(id) = open_node {
+        ed.open_node(id);
+        ed.centre_on_node(id);
+    }
+}
+
 /// The open node, edited in the right sidebar.
 fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     let ctx = &ui.ctx().clone();
@@ -2541,6 +2981,9 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     st.layout.node_cancel = None;
     st.layout.node_import = None;
     st.layout.node_snaps.clear();
+    st.layout.node_tag_chips.clear();
+    st.layout.node_tag_input = None;
+    st.layout.node_tag_add = None;
     let Some(id) = ed.open_node_id() else {
         st.focus_node = None;
         return;
@@ -2597,6 +3040,56 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     .desired_rows(14)
                     .desired_width(f32::INFINITY),
             );
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Folder").strong());
+                let cur = ed
+                    .world
+                    .node_folders()
+                    .iter()
+                    .find(|f| f.id == node.folder)
+                    .map_or("Nodes".to_string(), |f| f.name.clone());
+                egui::ComboBox::from_id_salt("node_folder_pick").selected_text(cur).show_ui(ui, |ui| {
+                    for f in ed.world.node_folders() {
+                        if ui.selectable_label(node.folder == f.id, &f.name).clicked() {
+                            node.folder = f.id;
+                        }
+                    }
+                });
+            });
+            ui.label(RichText::new("Tags").strong());
+            ui.horizontal_wrapped(|ui| {
+                let mut remove = None;
+                for (i, t) in node.tags.iter().enumerate() {
+                    let chip = ui.small_button(format!("{t}  x")).on_hover_text("Remove this tag");
+                    st.layout.node_tag_chips.push(chip.rect);
+                    if chip.clicked() {
+                        remove = Some(i);
+                    }
+                }
+                if let Some(i) = remove {
+                    node.tags.remove(i);
+                }
+            });
+            ui.horizontal(|ui| {
+                let input = ui.add(
+                    egui::TextEdit::singleline(&mut st.tag_input)
+                        .hint_text("Add a tag")
+                        .char_limit(depthmap_core::node::MAX_TAG_CHARS)
+                        .desired_width(140.0),
+                );
+                st.layout.node_tag_input = Some(input.rect);
+                let add = ui.button("Add");
+                st.layout.node_tag_add = Some(add.rect);
+                let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (add.clicked() || enter) && !st.tag_input.trim().is_empty() {
+                    node.tags.push(std::mem::take(&mut st.tag_input));
+                    if enter {
+                        input.request_focus();
+                    }
+                }
+            });
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -2749,10 +3242,37 @@ fn export_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
         .show(ctx, |ui| {
             ui.set_width(340.0);
             ui.label("Area");
+            st.layout.export_areas.clear();
             for a in ExportArea::ALL {
-                let enabled = a != ExportArea::WholeMap || bounded;
-                ui.add_enabled_ui(enabled, |ui| ui.radio_value(&mut o.area, a, a.name()));
+                let enabled = match a {
+                    ExportArea::WholeMap => bounded,
+                    ExportArea::Region => !ed.world.zones().is_empty(),
+                    _ => true,
+                };
+                let r = ui.add_enabled_ui(enabled, |ui| ui.radio_value(&mut o.area, a, a.name())).inner;
+                st.layout.export_areas.push(r.rect);
             }
+            let zones: Vec<String> = ed.world.zones().iter().map(|z| z.name.clone()).collect();
+            if o.region >= zones.len() {
+                o.region = 0;
+            }
+            if o.area == ExportArea::Region || o.mask_to_region {
+                ui.horizontal(|ui| {
+                    ui.label("Region");
+                    egui::ComboBox::from_id_salt("export_region")
+                        .selected_text(zones.get(o.region).cloned().unwrap_or_default())
+                        .show_ui(ui, |ui| {
+                            for (i, n) in zones.iter().enumerate() {
+                                ui.selectable_value(&mut o.region, i, n);
+                            }
+                        });
+                });
+            }
+            st.layout.export_mask = None;
+            ui.add_enabled_ui(!zones.is_empty(), |ui| {
+                let r = ui.checkbox(&mut o.mask_to_region, "Transparent outside the region");
+                st.layout.export_mask = Some(r.rect);
+            });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Layer (depth)");
@@ -2779,7 +3299,56 @@ fn export_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
             ui.checkbox(&mut o.nodes, "Nodes (icons and names)");
             ui.checkbox(&mut o.grid, "Grid lines");
             ui.checkbox(&mut o.parent_layer, "Faded layer above");
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(RichText::new("Presets").strong());
+            st.layout.preset_rows.clear();
+            st.layout.preset_deletes.clear();
+            let mut apply = None;
+            let mut delete = None;
+            for (i, p) in st.export_presets.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let r = ui.selectable_label(false, &p.name).on_hover_text("Use these settings");
+                    st.layout.preset_rows.push(r.rect);
+                    if r.clicked() {
+                        apply = Some(i);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let d = ui.add(egui::Button::new("X").small()).on_hover_text("Delete this preset");
+                        st.layout.preset_deletes.push(d.rect);
+                        if d.clicked() {
+                            delete = Some(i);
+                        }
+                    });
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut st.preset_name).hint_text("Preset name").desired_width(150.0));
+                let b = ui
+                    .add_enabled(!st.preset_name.trim().is_empty(), egui::Button::new("Save preset"))
+                    .on_hover_text("Keep these settings under that name");
+                st.layout.preset_save = Some(b.rect);
+                if b.clicked() {
+                    let p = crate::export::Preset::from_options(&st.preset_name, &o, ed);
+                    if !p.name.is_empty() {
+                        st.export_presets.retain(|q| q.name != p.name);
+                        st.export_presets.push(p);
+                        st.preset_name.clear();
+                        st.save_presets();
+                    }
+                }
+            });
+            if let Some(i) = apply {
+                match st.export_presets[i].options(ed) {
+                    Ok(opts) => o = opts,
+                    Err(e) => ed.status = e,
+                }
+            }
+            if let Some(i) = delete {
+                st.export_presets.remove(i);
+                st.save_presets();
+            }
+            ui.separator();
             let result = plan(ed, &o);
             match &result {
                 Ok(p) => {
@@ -3076,42 +3645,47 @@ fn dialogs(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
     }
 
     if st.show_help {
-        egui::Window::new("Controls")
-        .constrain_to(st.map_area)
+        let filter = st.help_filter.trim().to_lowercase();
+        let mut shown = 0;
+        egui::Window::new("Keyboard shortcuts")
+            .constrain_to(st.map_area)
             .open(&mut st.show_help)
-            .resizable(false)
+            .resizable(true)
+            .default_size([560.0, 520.0])
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                egui::Grid::new("help").striped(true).show(ui, |ui| {
-                    for (k, v) in [
-                        ("Left mouse", "Paint with the selected texture and color"),
-                        ("Right mouse (drag)", "Draw the chosen shape and fill at the current depth"),
-                        ("Shift + mouse", "Erase instead (also E to toggle the eraser)"),
-                        ("B / F / S / C / R / T", "Brush / Fill / Select / Pick / Region / Route tool"),
-                        ("Route tool", "Click two nodes to connect them, click the map to bend the route; shown on its layer and deeper ones"),
-                        ("Region tool", "Lasso a place (or click tiles) to mark it; Shift removes; regions show on every depth"),
-                        ("Pick tool (click)", "Copy the tile and colour of the clicked cell, then switch to the brush"),
-                        ("Fill tool (click)", "Fill the connected area of identical cells (Shift erases it)"),
-                        ("Select tool", "Drag a rectangle, or click to pick connected / same tiles; each new selection adds"),
-                        ("Right mouse (Select)", "Invert the selection"),
-                        ("Ctrl+A / Ctrl+D / Ctrl+I", "Select all / deselect / invert selection"),
-                        ("P", "Show or hide the Colors window"),
-                        ("Esc", "Cancel the shape / node placing / node popup, then clear the selection"),
-                        ("N", "Add a node: then click the map"),
-                        ("Click / drag a node", "Edit it / move it"),
-                        ("Delete", "Delete the node whose popup is open"),
-                        ("Middle mouse / Space + drag", "Pan"),
-                        ("Mouse wheel", "Zoom (deeper zoom = finer layer)"),
-                        ("Arrow keys", "Pan"),
-                        ("1 - 9, 0", "Pick texture"),
-                        ("[  ]", "Brush size"),
-                        ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
-                        ("Ctrl+N / O / S", "New / open / save"),
-                        ("Ctrl+Shift+S", "Save as"),
-                    ] {
-                        ui.label(RichText::new(k).strong());
-                        ui.label(v);
-                        ui.end_row();
+                ui.horizontal(|ui| {
+                    ui.label("Find");
+                    ui.add(egui::TextEdit::singleline(&mut st.help_filter).hint_text("a key or an action").desired_width(220.0));
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).min_scrolled_height(300.0).show(ui, |ui| {
+                    for (section, rows) in SHORTCUTS {
+                        let rows: Vec<&(&str, &str)> = rows
+                            .iter()
+                            .filter(|(k, v)| {
+                                filter.is_empty()
+                                    || k.to_lowercase().contains(&filter)
+                                    || v.to_lowercase().contains(&filter)
+                                    || section.to_lowercase().contains(&filter)
+                            })
+                            .collect();
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        shown += rows.len();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(*section).strong().size(15.0));
+                        egui::Grid::new(*section).striped(true).num_columns(2).show(ui, |ui| {
+                            for (k, v) in rows {
+                                ui.label(RichText::new(*k).monospace());
+                                ui.label(*v);
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    if shown == 0 {
+                        ui.label("No shortcut matches.");
                     }
                 });
             });
@@ -3335,12 +3909,7 @@ fn side_panel(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                             node_panel(ui, ed, st);
                         });
                     } else {
-                        let mut open = true;
-                        sidebar_title(ui, "Back to colors", &mut open);
-                        ui.label("Click the map to place a node, or click a node to edit it.");
-                        if !open {
-                            st.show_node = false;
-                        }
+                        node_list_panel(ui, ed, st);
                     }
                 }
                 1 => shape_panel(ui, ed, st),
@@ -3363,6 +3932,12 @@ fn clear_shape_layout(st: &mut UiState) {
 
 fn clear_node_layout(st: &mut UiState) {
     let l = &mut st.layout;
+    l.node_folder_heads.clear();
+    l.node_folder_deletes.clear();
+    l.node_rows.clear();
+    l.node_new_folder = None;
+    l.node_tag_chips.clear();
+    (l.node_tag_input, l.node_tag_add) = (None, None);
     l.node_icons.clear();
     l.node_snaps.clear();
     (l.node_done, l.node_delete, l.node_cancel, l.node_import) = (None, None, None, None);

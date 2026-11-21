@@ -43,7 +43,7 @@ use crate::tile::{CustomTile, TILE_PIXELS, TileArt};
 use crate::{CHUNK_AREA, MAX_DEPTH, World};
 
 const MAGIC: &[u8; 4] = b"DMAP";
-const VERSION: u32 = 11;
+const VERSION: u32 = 12;
 /// Oldest version that can still be read.
 const OLDEST: u32 = 2;
 
@@ -70,6 +70,13 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         raw.extend((icon.png.len() as u32).to_le_bytes());
         raw.extend(icon.png.iter());
     }
+    raw.extend(world.node_folder_seq().to_le_bytes());
+    raw.extend((world.node_folders().len() as u16).to_le_bytes());
+    for f in world.node_folders() {
+        raw.extend(f.id.to_le_bytes());
+        put_str16(&mut raw, &f.name);
+        raw.push(f.expanded as u8);
+    }
     raw.extend((world.nodes().len() as u32).to_le_bytes());
     for n in world.nodes() {
         raw.extend(n.id.to_le_bytes());
@@ -92,6 +99,11 @@ pub fn write_world<W: Write>(world: &World, mut out: W) -> io::Result<()> {
         put_str16(&mut raw, &n.name);
         raw.extend((n.description.len() as u32).to_le_bytes());
         raw.extend(n.description.as_bytes());
+        raw.extend(n.folder.to_le_bytes());
+        raw.push(n.tags.len() as u8);
+        for t in &n.tags {
+            put_str16(&mut raw, t);
+        }
     }
     let tiles: Vec<_> = world.tiles().collect();
     raw.push(tiles.len() as u8);
@@ -232,6 +244,8 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
     // Imported icons and nodes (version 4).
     let mut icon_blobs: Vec<(String, Vec<u8>)> = Vec::new();
     let mut node_list: Vec<Node> = Vec::new();
+    let mut node_folder_list: Vec<crate::node::NodeFolder> = Vec::new();
+    let mut node_folder_seq = 1u32;
     if version >= 4 {
         let count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
         for _ in 0..count {
@@ -242,6 +256,24 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
                 return Err(invalid("bad embedded icon"));
             }
             icon_blobs.push((name, bytes));
+        }
+        if version >= 12 {
+            node_folder_seq = u32::from_le_bytes(cur.take(4)?.try_into().unwrap());
+            let count = u16::from_le_bytes(cur.take(2)?.try_into().unwrap()) as usize;
+            if count == 0 || count > crate::node::MAX_NODE_FOLDERS {
+                return Err(invalid("bad node folders"));
+            }
+            for _ in 0..count {
+                let id = u32::from_le_bytes(cur.take(4)?.try_into().unwrap());
+                let name = cur.string16()?;
+                let open = cur.take(1)?[0] != 0;
+                if node_folder_list.iter().any(|f| f.id == id) {
+                    return Err(invalid("repeated node folder"));
+                }
+                let mut f = crate::node::NodeFolder::new(id, &name);
+                f.expanded = open;
+                node_folder_list.push(f);
+            }
         }
         let count = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
         for _ in 0..count {
@@ -272,7 +304,18 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
             let len = u32::from_le_bytes(cur.take(4)?.try_into().unwrap()) as usize;
             let description = String::from_utf8(cur.take(len)?.to_vec())
                 .map_err(|_| invalid("text is not valid UTF-8"))?;
-            node_list.push(Node { id, depth, x, y, name, description, icon, scale, snap, edge });
+            let (folder, tags) = if version >= 12 {
+                let folder = u32::from_le_bytes(cur.take(4)?.try_into().unwrap());
+                let n = cur.take(1)?[0] as usize;
+                let mut tags = Vec::new();
+                for _ in 0..n {
+                    tags.push(cur.string16()?);
+                }
+                (folder, tags)
+            } else {
+                (crate::node::DEFAULT_FOLDER, Vec::new())
+            };
+            node_list.push(Node { id, depth, x, y, name, description, icon, scale, snap, edge, folder, tags });
         }
     }
 
@@ -516,6 +559,7 @@ pub fn read_world<R: Read>(mut input: R) -> io::Result<World> {
     for (name, bytes) in icon_blobs {
         world.add_custom_icon(&name, bytes).map_err(|e| invalid(&e))?;
     }
+    world.set_node_folders(node_folder_list, node_folder_seq);
     // Nodes outside the map or with a repeated id are dropped.
     for node in node_list {
         if world.node(node.id).is_none() {
@@ -909,6 +953,35 @@ mod tests {
         assert_eq!(back.routes(), &[r]);
         assert_eq!(back.route_folders().len(), 2);
         assert_eq!(back.route_folders()[1].name, "Rivers");
+    }
+
+    #[test]
+    fn node_folders_and_tags_round_trip_and_orphans_fall_back() {
+        let mut w = World::with_spec(MapSpec::new(8, 8, 1));
+        let towns = w.add_node_folder("Towns").unwrap();
+        let ruins = w.add_node_folder("Ruins").unwrap();
+        let id = w.alloc_node_id();
+        let mut n = Node::new(id, 0, 2, 2, Icon::Builtin(2));
+        n.folder = ruins;
+        n.tags = vec!["haunted".into(), "Haunted".into(), "  coast ".into(), "#x".into(), "".into()];
+        assert!(w.put_node(n));
+        assert_eq!(w.node(id).unwrap().tags, ["haunted", "coast", "x"], "cleaned: no repeats, trimmed, no #");
+        w.set_node_folder_open(towns, false);
+        let mut bytes = Vec::new();
+        write_world(&w, &mut bytes).unwrap();
+        let r = read_world(&bytes[..]).unwrap();
+        assert_eq!(r.node_folders().len(), 3);
+        assert!(!r.node_folders()[1].expanded);
+        assert_eq!(r.node(id).unwrap().folder, ruins);
+        assert_eq!(r.node(id).unwrap().tags, w.node(id).unwrap().tags);
+        let mut r = r;
+        assert!(r.remove_node_folder(ruins));
+        let node = r.node(id).unwrap().clone();
+        assert_eq!(r.node_folder_index(&node), 0, "listed in the first folder");
+        assert_eq!(r.node(id).unwrap().folder, ruins, "the node itself is untouched");
+        assert!(!r.remove_node_folder(0), "the first folder stays");
+        let again = r.add_node_folder("New").unwrap();
+        assert!(again > ruins, "ids are not reused");
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod raster;
 pub mod selection;
 pub mod shape;
 pub mod spec;
+pub mod stamp;
 pub mod texture;
 pub mod route;
 pub mod tile;

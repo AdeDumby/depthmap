@@ -17,7 +17,7 @@ cargo test                             # core + editor + UI + headless GPU rende
   and chunks; the layout is documented at the top of
   `crates/depthmap-core/src/io.rs`). You choose where it lives; the app never
   copies it anywhere else.
-* On launch a **welcome screen** offers *Continue with <last map>* (also bound
+* On launch a full-page **welcome screen** (sidebars hidden until you pick a map) offers *Continue with <last map>* (also bound
   to Enter), *Open map...*, *New map* and the recent list. Launching with a file
   (`depthmap my.dmap`) skips it.
 * **New map** asks for a **size** (cells across the whole map at depth 0,
@@ -121,6 +121,15 @@ discards the popup's changes (a new node is removed), *Delete* removes it.
 Click a node to edit it again, drag it to move it, **Delete** deletes the open node.
 Everything is undoable. *View > Show nodes* hides them.
 
+**Folders and tags:** with the Nodes tool and no node open, the right sidebar lists every
+node in **folders**, like routes: click a folder to fold it (and make it the folder new
+nodes go into), right click to rename, **X** deletes it (its nodes move to the first
+folder, which cannot be deleted), *New folder* adds one. Click a node row to open it and
+jump to it. A node has a **Folder** dropdown and a list of **tags** (up to 16 of 32
+characters, no `#`, case-insensitive) in its panel; the *Filter* box above the list matches
+names and tags. Stored in the `.dmap` file (format v12; older files open with all nodes in
+the first folder).
+
 **Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies
 PNGs into `Documents/Depthmap/Custom Icons`. They scale to the node size. Icons a map
 uses are also stored inside the `.dmap` file (format v8), so shared maps keep them.
@@ -176,20 +185,37 @@ saved in the map (format v8) and are not part of undo/redo.
 Clicking a colour in **Colors > Map colors** now also flashes every cell drawn with that colour on the current
 layer (while hovered, and for a few seconds after the click).
 
+## Copy, paste and stamps
+
+With the Select tool: **Ctrl+C** copies the selected cells (up to 256 x 256, the selection's
+bounding box; unselected and empty cells stay transparent), **Ctrl+X** cuts, **Ctrl+V**
+(or *Paste*) shows the copy under the mouse and each click pastes it, centred on the mouse,
+at the layer you are on, as one undo step; Esc stops. While pasting, **X** / **Y** flip it,
+**R** / **Shift+R** turn it a quarter, also as *Flip H / Flip V / rotate* buttons. Copies keep
+tile and *colour* (not colour numbers), so they paste correctly into another map. *Save
+stamp* keeps the copy under a name as a file in `Documents/Depthmap/Stamps`; click a stamp in
+the list to place it, **X** deletes it.
+
 ## Exporting an image
 
 **File > Export image...** (Ctrl+E) saves the map as a PNG, drawn by the same renderer as the screen, so it uses your tiles and forest edges.
 
 - **Area**: the whole map, the current selection's bounding box, or what is on screen.
 - **Layer (depth)** and **pixels per cell**: cells of that layer become that many pixels wide (32 is the tiles' own size, 64 is sharper). The window shows the final size and explains when it is too large (at most 16384 px a side and 64 million pixels).
+- **One region**: exports the bounding box of a chosen region, and *Transparent outside the region* clears every pixel whose cell is not part of it (so an L-shaped region exports as an L).
+- **Presets**: *Save preset* keeps all of these choices under a name (the region is remembered by name, so it works in any map with a region called that); click one to apply it. Stored in `export_presets.txt` in the config folder.
 - **Draw on top**, each toggleable: regions (tint, outline, names), routes, nodes (icons and names), grid lines and the faded layer above.
 
 ## Header bar, measuring and 3D
 
-The narrow bar on the left holds the tools: Brush (B), Bucket (F), Select (S), Shape (H), Pick (C), Measure (M), then Region (R), Route (T) and Nodes (N). Shape opens its shapes and fill styles in the right sidebar; Nodes opens the node editor there (name, a tall description, then the icon list); Brush shows its size and styles above the tiles. The bar under the menu holds the view switch. Zoom, depth and "Whole map" are at the left of the bottom bar. The strip at the bottom shows the cell under the mouse, the last message and the file name.
+The narrow bar on the left holds the tools: Brush (B), Bucket (F), Select (S), Shape (H), Pick (C), Measure (M), then Region (R), Route (T) and Nodes (N). Shape opens its shapes and fill styles in the right sidebar; Nodes opens the node editor there (name, a tall description, then the icon list); Brush shows its size and styles above the tiles. The **Mode** menu (next to View) switches between 2D, Isometric and Top-down; the bar under the menu only appears in the 3D modes, with the turn buttons and the height slider. Zoom, depth and "Whole map" are at the left of the bottom bar. The strip at the bottom shows the cell under the mouse, the last message and the file name.
 
 - **Measure (M):** click points to lay out a path; the label shows its length in cells of the layer you started on (and in depth-0 cells), the last leg's dx/dy, and the number of board-game moves with and without diagonals. Right click removes the last point, Esc clears.
 - **2D / Isometric / Top-down:** the 3D views draw the map as a heightfield. A cell's height is its tile's height plus its colour's (-255 to 255 each; the sum is kept within that, and below zero is a pit). **Right click a tile** in the Tools window, or a colour in *Map colors*, to set its height; water starts flat and brick walls tall. The *height* slider sets how many cells tall 255 is. Isometric can be turned with `<` `>` buttons or the `,` `.` keys; `V` cycles the views. The 3D views are for looking (pan and zoom as usual); empty cells show the parent layer through.
+
+## Keyboard shortcuts
+
+*Help > Keyboard shortcuts* (F1) lists every shortcut and mouse action by section, with a *Find* box.
 
 ## Undo and recovery
 

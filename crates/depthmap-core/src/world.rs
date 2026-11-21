@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 use crate::chunk::{Cell, Chunk, ChunkPos, EMPTY, local_index, normalize};
 use crate::colors::ColorTable;
 use crate::icons;
-use crate::node::{Icon, Node, NodeId};
+use crate::node::{DEFAULT_FOLDER, Icon, MAX_NODE_FOLDERS, Node, NodeFolder, NodeId};
 use crate::spec::MapSpec;
 use crate::texture::{MAX_TEXTURES, TEXTURE_COUNT};
 use crate::tile::CustomTile;
@@ -53,6 +53,8 @@ pub struct World {
     spec: MapSpec,
     nodes: Vec<Node>,
     node_seq: NodeId,
+    node_folders: Vec<NodeFolder>,
+    node_folder_seq: u32,
     custom_icons: BTreeMap<String, CustomIcon>,
     /// User-drawn tiles, indexed by texture id (`TEXTURE_COUNT + 1..=MAX_TEXTURES`).
     tiles: Vec<Option<CustomTile>>,
@@ -79,6 +81,7 @@ pub struct Meta {
     zones: Vec<Zone>,
     routes: Vec<Route>,
     route_folders: Vec<RouteFolder>,
+    node_folders: Vec<NodeFolder>,
     tiles: Vec<Option<CustomTile>>,
     tile_heights: [i16; MAX_TEXTURES as usize + 1],
     color_heights: Vec<i16>,
@@ -105,6 +108,8 @@ impl World {
             spec,
             nodes: Vec::new(),
             node_seq: 1,
+            node_folders: vec![NodeFolder::new(DEFAULT_FOLDER, "Nodes")],
+            node_folder_seq: 1,
             custom_icons: BTreeMap::new(),
             tiles: vec![None; MAX_TEXTURES as usize + 1],
             tiles_version: crate::colors::next_version(),
@@ -174,6 +179,7 @@ impl World {
             zones: self.zones.clone(),
             routes: self.routes.clone(),
             route_folders: self.route_folders.clone(),
+            node_folders: self.node_folders.clone(),
             tiles: self.tiles.clone(),
             tile_heights: self.tile_heights,
             color_heights: self.color_heights.clone(),
@@ -184,6 +190,13 @@ impl World {
     pub fn restore_meta(&mut self, m: &Meta) {
         self.zones = m.zones.clone();
         self.routes = m.routes.clone();
+        let open_nodes: Vec<(u32, bool)> = self.node_folders.iter().map(|f| (f.id, f.expanded)).collect();
+        self.node_folders = m.node_folders.clone();
+        for f in &mut self.node_folders {
+            if let Some((_, o)) = open_nodes.iter().find(|(id, _)| *id == f.id) {
+                f.expanded = *o;
+            }
+        }
         // Open or closed is not undone: keep what is showing.
         let open: Vec<bool> = self.route_folders.iter().map(|f| f.expanded).collect();
         self.route_folders = m.route_folders.clone();
@@ -493,6 +506,74 @@ impl World {
 
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
+    }
+
+    pub fn node_folders(&self) -> &[NodeFolder] {
+        &self.node_folders
+    }
+
+    /// Index in `node_folders` of the folder a node is listed in. A node whose
+    /// folder was deleted is listed in the first one (so undoing the delete
+    /// puts it back without touching the node).
+    pub fn node_folder_index(&self, node: &Node) -> usize {
+        self.node_folders.iter().position(|f| f.id == node.folder).unwrap_or(0)
+    }
+
+    /// Replaces the folders (when loading). An empty list becomes the default.
+    pub fn set_node_folders(&mut self, mut folders: Vec<NodeFolder>, seq: u32) {
+        folders.truncate(MAX_NODE_FOLDERS);
+        if folders.is_empty() {
+            folders.push(NodeFolder::new(DEFAULT_FOLDER, "Nodes"));
+        }
+        self.node_folder_seq = seq.max(folders.iter().map(|f| f.id + 1).max().unwrap_or(1));
+        self.node_folders = folders;
+        self.touch_meta();
+    }
+
+    pub fn node_folder_seq(&self) -> u32 {
+        self.node_folder_seq
+    }
+
+    /// Adds a folder, returning its id; `None` when there are too many.
+    pub fn add_node_folder(&mut self, name: &str) -> Option<u32> {
+        if self.node_folders.len() >= MAX_NODE_FOLDERS {
+            return None;
+        }
+        let id = self.node_folder_seq;
+        self.node_folder_seq += 1;
+        self.node_folders.push(NodeFolder::new(id, name));
+        self.touch_meta();
+        Some(id)
+    }
+
+    pub fn rename_node_folder(&mut self, id: u32, name: &str) {
+        if let Some(f) = self.node_folders.iter_mut().find(|f| f.id == id) {
+            let n = NodeFolder::new(id, name).name;
+            if f.name != n {
+                f.name = n;
+                self.touch_meta();
+            }
+        }
+    }
+
+    /// Opens or closes a folder in the sidebar (not an edit).
+    pub fn set_node_folder_open(&mut self, id: u32, open: bool) {
+        if let Some(f) = self.node_folders.iter_mut().find(|f| f.id == id) {
+            f.expanded = open;
+        }
+    }
+
+    /// Deletes a folder; its nodes are listed in the first folder from then on.
+    /// The first folder cannot be deleted.
+    pub fn remove_node_folder(&mut self, id: u32) -> bool {
+        match self.node_folders.iter().position(|f| f.id == id) {
+            Some(i) if i > 0 => {
+                self.node_folders.remove(i);
+                self.touch_meta();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
