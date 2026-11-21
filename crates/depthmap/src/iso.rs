@@ -29,11 +29,14 @@ pub struct View3d {
     pub yaw: f32,
     /// How many cells tall the highest possible column (255) is.
     pub height_cells: f32,
+    /// Pixels the picture is moved by, to centre it on the part of the window
+    /// the sidebars leave free.
+    pub shift_px: (f32, f32),
 }
 
 impl Default for View3d {
     fn default() -> Self {
-        Self { mode: Mode3d::Isometric, yaw: std::f32::consts::FRAC_PI_4, height_cells: 8.0 }
+        Self { mode: Mode3d::Isometric, yaw: std::f32::consts::FRAC_PI_4, height_cells: 8.0, shift_px: (0.0, 0.0) }
     }
 }
 
@@ -79,6 +82,7 @@ struct Globals {
     elev: [f32; 2],
     lod_ppc: f32,
     _pad: f32,
+    shift: [f32; 4],
     background: [f32; 4],
     colors: [[f32; 4]; 256],
 }
@@ -107,8 +111,10 @@ pub struct Scene {
     /// The camera's cell and position inside it, at that layer.
     pub centre: (i64, i64),
     pub frac: (f32, f32),
-    /// Pixels per cell at that layer.
+    /// Pixels per drawn column (a column is `step` cells of the layer).
     pub ppc: f64,
+    /// Pixels per cell of the layer, for choosing how blurred the patterns are.
+    pub lod_ppc: f64,
 }
 
 /// Picks the layer to draw for this camera and builds the column faces.
@@ -122,17 +128,26 @@ pub fn faces(world: &World, camera: &Camera, size: (u32, u32), view: &View3d) ->
         k -= 1;
         lv = camera.at_depth(k);
     }
-    let half = ((reach / lv.ppc).ceil() as i64 + 2).clamp(3, MAX_HALF);
-    let (cx, cy) = lv.cell;
+    // On the finest layer a very large map still has more cells in view than
+    // MAX_HALF allows: draw every `step`-th cell instead.
+    let step = if reach / lv.ppc > MAX_HALF as f64 { (reach / (lv.ppc * MAX_HALF as f64)).ceil() as i64 } else { 1 };
+    let col_ppc = lv.ppc * step as f64;
+    let half = ((reach / col_ppc).ceil() as i64 + 2).clamp(3, MAX_HALF);
+    // The camera's column, and where it is inside that column (0..1).
+    let (cx, cy) = (lv.cell.0.div_euclid(step), lv.cell.1.div_euclid(step));
+    let sub = |cell: i64, c: i64, frac: f64| (((cell - c * step) as f64 + frac) / step as f64) as f32;
+    let frac = (sub(lv.cell.0, cx, lv.frac.0), sub(lv.cell.1, cy, lv.frac.1));
     let (x0, y0) = (cx - half, cy - half);
     let n = (2 * half + 1) as usize;
 
-    // Cells one wider on every side, so every column knows its neighbours.
+    // Columns one wider on every side, so every column knows its neighbours.
+    // With a step, each stands for the cell in the middle of its block.
     let w = n + 2;
     let mut cells: Vec<Option<Cell>> = Vec::with_capacity(w * w);
     for j in 0..w as i64 {
         for i in 0..w as i64 {
-            cells.push(effective(world, k, x0 - 1 + i, y0 - 1 + j));
+            let (gx, gy) = ((x0 - 1 + i) * step + step / 2, (y0 - 1 + j) * step + step / 2);
+            cells.push(effective(world, k, gx, gy));
         }
     }
     let scale = view.height_cells / 255.0;
@@ -177,7 +192,7 @@ pub fn faces(world: &World, camera: &Camera, size: (u32, u32), view: &View3d) ->
             }
         }
     }
-    Scene { faces, depth: k, centre: (cx, cy), frac: (lv.frac.0 as f32, lv.frac.1 as f32), ppc: lv.ppc }
+    Scene { faces, depth: k, centre: (cx, cy), frac, ppc: col_ppc, lod_ppc: lv.ppc }
 }
 
 pub struct Iso {
@@ -369,8 +384,9 @@ impl Iso {
             frac: [scene.frac.0, scene.frac.1],
             yaw: [view.yaw.cos(), view.yaw.sin()],
             elev: [es, ec],
-            lod_ppc: scene.ppc as f32,
+            lod_ppc: scene.lod_ppc as f32,
             _pad: 0.0,
+            shift: [view.shift_px.0, view.shift_px.1, 0.0, 0.0],
             background: [230.0 / 255.0, 222.0 / 255.0, 204.0 / 255.0, 1.0],
             colors,
         };
@@ -470,6 +486,28 @@ mod tests {
         assert!((before - w.tile_height(4) as f32 * 10.0 / 255.0).abs() < 1e-4);
         w.set_color_height(1, 100);
         assert!(tall(&w) > before);
+    }
+
+    #[test]
+    fn a_huge_map_zoomed_out_is_sampled_so_the_whole_map_is_drawn() {
+        let mut w = World::with_spec(MapSpec::new(3000, 2000, 1));
+        let (mw, mh) = w.spec().extent(0).unwrap();
+        for y in 0..mh {
+            for x in 0..mw {
+                w.set(0, x, y, make_cell(4, 1));
+            }
+        }
+        let mut cam = Camera::new();
+        cam.max_depth = w.spec().max_depth;
+        cam.cell = (mw / 2, mh / 2);
+        cam.ppc = 0.25;
+        let s = faces(&w, &cam, (800, 600), &View3d::default());
+        let step = s.ppc / s.lod_ppc;
+        assert!(step > 1.0, "more cells in view than can be drawn: sampled with a step, got {step}");
+        let (min, max) = s.faces.iter().fold((f32::MAX, f32::MIN), |(lo, hi), f| (lo.min(f.pos[0]), hi.max(f.pos[0])));
+        let span = (max - min) as f64 * step;
+        assert!(span > 0.9 * mw as f64, "the drawn columns cover the map width, {span} of {mw}");
+        assert!(s.faces.len() < 200_000);
     }
 
     #[test]

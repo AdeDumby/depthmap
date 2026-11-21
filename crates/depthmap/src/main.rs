@@ -382,6 +382,8 @@ impl App {
             } else {
                 depthmap::iso::Mode3d::Isometric
             };
+            let (l, t, r, b) = self.editor.insets;
+            v.shift_px = (((l - r) * 0.5) as f32, ((t - b) * 0.5) as f32);
             gfx.iso.render(&mut gfx.renderer, &view, size, &self.editor.world, &self.editor.camera, &v);
         } else {
         self.stats = gfx.renderer.render(

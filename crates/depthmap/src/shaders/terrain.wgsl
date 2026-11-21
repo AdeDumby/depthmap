@@ -11,6 +11,7 @@ struct Globals {
     elev: vec2<f32>,  // sin, cos of the camera elevation
     lod_ppc: f32,
     _pad: f32,
+    shift: vec4<f32>, // pixels to move the picture by (x, y)
     background: vec4<f32>,
     colors: array<vec4<f32>, 256>,
 };
@@ -54,8 +55,8 @@ fn vs_main(@builtin(vertex_index) vi: u32, f: Face) -> VOut {
     let rel = p.xy - g.frac;
     let u = rel.x * g.yaw.x - rel.y * g.yaw.y;
     let v = rel.x * g.yaw.y + rel.y * g.yaw.x;
-    let sx = u * g.ppc;
-    let sy = (v * g.elev.x - p.z * g.elev.y) * g.ppc;
+    let sx = u * g.ppc + g.shift.x;
+    let sy = (v * g.elev.x - p.z * g.elev.y) * g.ppc + g.shift.y;
     let d = v * g.elev.y + p.z * g.elev.x; // larger = nearer the viewer
     var o: VOut;
     o.pos = vec4<f32>(sx / (g.viewport.x * 0.5), -sy / (g.viewport.y * 0.5), clamp(0.5 - d / (2.0 * g.depth_range), 0.0, 1.0), 1.0);
