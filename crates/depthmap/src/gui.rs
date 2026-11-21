@@ -144,6 +144,8 @@ pub struct UiLayout {
     pub node_tag_chips: Vec<egui::Rect>,
     pub node_tag_input: Option<egui::Rect>,
     pub node_tag_add: Option<egui::Rect>,
+    pub tag_suggestions: Vec<egui::Rect>,
+    pub tag_list: Vec<egui::Rect>,
     /// Brush, Fill, Select.
     pub tool_buttons: Vec<egui::Rect>,
     pub zone_kinds: Vec<egui::Rect>,
@@ -2880,6 +2882,22 @@ fn node_list_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
         }
     });
     ui.separator();
+    st.layout.tag_list.clear();
+    let counts = ed.world.tag_counts();
+    if !counts.is_empty() {
+        ui.label(RichText::new("Tags").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (t, n) in &counts {
+                let on = st.node_filter.trim().trim_start_matches('#').eq_ignore_ascii_case(t);
+                let b = ui.selectable_label(on, format!("#{t} ({n})")).on_hover_text("Click to list only nodes with this tag");
+                st.layout.tag_list.push(b.rect);
+                if b.clicked() {
+                    st.node_filter = if on { String::new() } else { t.clone() };
+                }
+            }
+        });
+        ui.separator();
+    }
     let filter = st.node_filter.trim().trim_start_matches('#').to_lowercase();
     let matches = |n: &depthmap_core::Node| {
         filter.is_empty()
@@ -3072,6 +3090,7 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     node.tags.remove(i);
                 }
             });
+            st.layout.tag_suggestions.clear();
             ui.horizontal(|ui| {
                 let input = ui.add(
                     egui::TextEdit::singleline(&mut st.tag_input)
@@ -3090,6 +3109,32 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     }
                 }
             });
+            // Tags already used in this map that fit what is typed.
+            let typed = st.tag_input.trim().trim_start_matches('#').to_lowercase();
+            let fits: Vec<String> = ed
+                .world
+                .tag_counts()
+                .into_iter()
+                .map(|(t, _)| t)
+                .filter(|t| {
+                    let l = t.to_lowercase();
+                    l.contains(&typed) && !node.tags.iter().any(|x| x.to_lowercase() == l)
+                })
+                .take(8)
+                .collect();
+            if !fits.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Used:").weak().small());
+                    for t in fits {
+                        let b = ui.small_button(format!("#{t}")).on_hover_text("Add this tag");
+                        st.layout.tag_suggestions.push(b.rect);
+                        if b.clicked() {
+                            node.tags.push(t);
+                            st.tag_input.clear();
+                        }
+                    }
+                });
+            }
 
             ui.separator();
             ui.horizontal(|ui| {

@@ -508,6 +508,20 @@ impl World {
         &self.nodes
     }
 
+    /// Every tag used by any node with how many nodes carry it, most used
+    /// first (ties alphabetical, case-insensitive).
+    pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        let mut map: std::collections::HashMap<String, (String, usize)> = Default::default();
+        for n in self.nodes() {
+            for t in &n.tags {
+                map.entry(t.to_lowercase()).or_insert_with(|| (t.clone(), 0)).1 += 1;
+            }
+        }
+        let mut v: Vec<(String, usize)> = map.into_values().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        v
+    }
+
     pub fn node_folders(&self) -> &[NodeFolder] {
         &self.node_folders
     }

@@ -1711,3 +1711,29 @@ fn help_lists_every_shortcut_section_once() {
         assert_eq!(keys.len(), rows.len(), "duplicate key in {s}");
     }
 }
+
+#[test]
+fn tags_are_suggested_and_listed_for_filtering() {
+    let mut h = Harness::new();
+    use_tool(&mut h, ToolMode::Node);
+    h.ed.mouse_moved(500.0, 400.0);
+    let a = h.ed.place_node_at_cursor().unwrap();
+    let mut n = h.ed.world.node(a).unwrap().clone();
+    n.tags = vec!["Inn".into(), "Safe".into()];
+    h.ed.update_open_node(n);
+    h.ed.close_node(true);
+    h.ed.mouse_moved(560.0, 400.0);
+    let b = h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.tag_suggestions.len(), 2, "both used tags offered");
+    h.click(h.st.layout.tag_suggestions[0].center());
+    assert_eq!(h.ed.world.node(b).unwrap().tags.len(), 1);
+    assert_eq!(h.ed.world.tag_counts()[0].1, 2, "the shared tag is counted twice");
+    h.ed.close_node(true);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.tag_list.len(), 2);
+    h.click(h.st.layout.tag_list[0].center());
+    assert_eq!(h.st.node_filter.to_lowercase(), h.ed.world.tag_counts()[0].0.to_lowercase());
+}
