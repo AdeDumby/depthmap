@@ -511,8 +511,18 @@ impl World {
     /// Every tag used by any node with how many nodes carry it, most used
     /// first (ties alphabetical, case-insensitive).
     pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        self.count_tags(|_| true)
+    }
+
+    /// Tags used by the other nodes of one folder (not `except`), most used first.
+    pub fn tags_in_folder(&self, folder: u32, except: NodeId) -> Vec<(String, usize)> {
+        let at = self.node_folders().iter().position(|f| f.id == folder);
+        self.count_tags(|n| n.id != except && at == Some(self.node_folder_index(n)))
+    }
+
+    fn count_tags(&self, keep: impl Fn(&Node) -> bool) -> Vec<(String, usize)> {
         let mut map: std::collections::HashMap<String, (String, usize)> = Default::default();
-        for n in self.nodes() {
+        for n in self.nodes().iter().filter(|n| keep(n)) {
             for t in &n.tags {
                 map.entry(t.to_lowercase()).or_insert_with(|| (t.clone(), 0)).1 += 1;
             }

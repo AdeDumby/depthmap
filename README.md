@@ -129,7 +129,8 @@ jump to it. A node has a **Folder** dropdown and a list of **tags** (up to 16 of
 characters, no `#`, case-insensitive) in its panel; the *Filter* box above the list matches
 names and tags. Typing a tag offers the tags already used in the map (click to add), and the
 **Tags** list at the top of the Nodes sidebar shows every tag with its count; click one to
-filter by it. Stored in the `.dmap` file (format v12; older files open with all nodes in
+filter by it; click the **Tags** heading to fold the list. The suggestions in a node's panel only
+include tags used by the other nodes in the same folder as that node. Stored in the `.dmap` file (format v12; older files open with all nodes in
 the first folder).
 
 **Custom icons:** *Import PNG icons...* (File menu, tools panel or the popup) copies

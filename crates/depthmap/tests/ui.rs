@@ -988,6 +988,8 @@ fn palettes_save_colour_and_texture_and_can_be_renamed_and_deleted() {
     assert_eq!(h.st.layout.palette_entries.len(), 2);
 
     // Clicking an entry restores both colour and texture.
+    scroll_sidebar_down(&mut h);
+    h.frame(vec![]);
     h.click(h.st.layout.palette_entries[0].center());
     assert_eq!((h.ed.brush_rgb, h.ed.texture), ([10, 200, 90], 6));
     h.click(h.st.layout.palette_entries[1].center());
@@ -1736,4 +1738,38 @@ fn tags_are_suggested_and_listed_for_filtering() {
     assert_eq!(h.st.layout.tag_list.len(), 2);
     h.click(h.st.layout.tag_list[0].center());
     assert_eq!(h.st.node_filter.to_lowercase(), h.ed.world.tag_counts()[0].0.to_lowercase());
+}
+
+#[test]
+fn tag_list_collapses_and_suggestions_follow_the_nodes_folder() {
+    let mut h = Harness::new();
+    use_tool(&mut h, ToolMode::Node);
+    h.ed.mouse_moved(500.0, 400.0);
+    let a = h.ed.place_node_at_cursor().unwrap();
+    let other = h.ed.world.add_node_folder("Dungeon").unwrap();
+    let mut n = h.ed.world.node(a).unwrap().clone();
+    n.tags = vec!["Inn".into()];
+    h.ed.update_open_node(n);
+    h.ed.close_node(true);
+    h.ed.mouse_moved(560.0, 400.0);
+    let b = h.ed.place_node_at_cursor().unwrap();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.tag_suggestions.len(), 1, "same folder: offered");
+    let mut n = h.ed.world.node(b).unwrap().clone();
+    n.folder = other;
+    h.ed.update_open_node(n);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.st.layout.tag_suggestions.is_empty(), "other folder: not offered");
+    h.ed.close_node(true);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.tag_list.len(), 1);
+    h.click(h.st.layout.tag_head.unwrap().center());
+    h.frame(vec![]);
+    assert!(h.st.layout.tag_list.is_empty(), "collapsed");
+    h.click(h.st.layout.tag_head.unwrap().center());
+    h.frame(vec![]);
+    assert_eq!(h.st.layout.tag_list.len(), 1);
 }

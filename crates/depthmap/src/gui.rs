@@ -146,6 +146,7 @@ pub struct UiLayout {
     pub node_tag_add: Option<egui::Rect>,
     pub tag_suggestions: Vec<egui::Rect>,
     pub tag_list: Vec<egui::Rect>,
+    pub tag_head: Option<egui::Rect>,
     /// Brush, Fill, Select.
     pub tool_buttons: Vec<egui::Rect>,
     pub zone_kinds: Vec<egui::Rect>,
@@ -319,6 +320,7 @@ pub struct UiState {
     pub node_filter: String,
     pub tag_input: String,
     pub stamp_name: String,
+    pub tags_collapsed: bool,
     pub export_presets: Vec<crate::export::Preset>,
     pub preset_name: String,
     /// Where export presets are saved (`None`: kept in memory only).
@@ -394,6 +396,7 @@ impl UiState {
             node_filter: String::new(),
             tag_input: String::new(),
             stamp_name: String::new(),
+            tags_collapsed: false,
             export_presets: Vec::new(),
             preset_name: String::new(),
             presets_file: None,
@@ -945,7 +948,6 @@ fn menu_bar(root: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
 fn height_menu(ui: &mut egui::Ui, st: &mut UiState, title: &str, h: &mut i16) -> bool {
     use depthmap_core::world::{MAX_HEIGHT, MIN_HEIGHT};
     ui.label(RichText::new(title).strong());
-    ui.label(RichText::new("Used by the 3D views. A cell is its tile's height plus its colour's. Below zero is a pit.").weak().small());
     let before = *h;
     // The arrow keys belong to this menu while it is open (not the camera).
     st.arrows_captured = true;
@@ -1447,9 +1449,6 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("Recent maps").strong().size(18.0));
                                 ui.add_space(4.0);
-                                if recent.is_empty() {
-                                    ui.label(RichText::new("Maps you open or save show up here.").weak());
-                                }
                                 for entry in recent.iter().take(8) {
                                     let text = if entry.exists {
                                         format!("{}    {}", entry.name(), entry.folder())
@@ -1467,17 +1466,6 @@ fn startup_window(ctx: &egui::Context, st: &mut UiState, modal: bool) {
                                 }
                             });
                         });
-                        ui.add_space(26.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("Good to know").strong());
-                        for tip in [
-                            "A map is one .dmap file. Save writes to the open map; a new map asks where to save the first time.",
-                            "Scroll to zoom in: past a cell's size you draw on the next, finer layer. Nodes, routes and regions show on every layer.",
-                            "Select an area, Ctrl+C, then Ctrl+V to stamp it again; Save stamp keeps it for other maps.",
-                        ] {
-                            ui.label(RichText::new(tip).weak().small());
-                        }
                     });
                 });
             });
@@ -1682,9 +1670,6 @@ fn clipboard_section(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             }
         });
     });
-    if let Some(c) = &ed.clipboard {
-        ui.label(RichText::new(format!("Clipboard: {} x {} cells", c.width(), c.height())).weak().small());
-    }
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut st.stamp_name).hint_text("Stamp name").desired_width(120.0));
         let b = ui.add_enabled(has_clip, egui::Button::new("Save stamp").small()).on_hover_text("Keep the copy as a stamp you can use in any map");
@@ -2238,11 +2223,9 @@ fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     }
                 }
             });
-            ui.label(RichText::new(ed.zone_kind.hint()).weak().small());
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut ed.zone_subtract, false, "Add");
                 ui.selectable_value(&mut ed.zone_subtract, true, "Remove");
-                ui.label(RichText::new("(Shift flips)").weak().small());
             });
             ui.horizontal(|ui| {
                 let new = ui.button("+ New region").on_hover_text("An empty region; then mark cells");
@@ -2260,9 +2243,6 @@ fn regions_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 }
             });
             ui.separator();
-            if ed.world.zones().is_empty() {
-                ui.label(RichText::new("No regions yet. Press + New region, or just drag a lasso.").weak());
-            }
             if let Some(i) = ed.active_zone() {
                 let mut name = ed.world.zones()[i].name.clone();
                 ui.horizontal(|ui| {
@@ -2353,9 +2333,6 @@ fn colors_window(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                         st.used_colors = ed.world.used_colors();
                     }
                     let colors: Vec<[u8; 3]> = st.used_colors.iter().map(|&i| ed.world.colors.get(i)).collect();
-                    if colors.is_empty() {
-                        ui.label(RichText::new("The colors you paint with appear here").weak().small());
-                    }
                     egui::Grid::new("swatches").spacing([4.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
                         for (i, rgb) in colors.iter().enumerate() {
                             let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
@@ -2736,7 +2713,6 @@ fn palette_section(
 
     let entries = st.palettes.current().entries.clone();
     if entries.is_empty() {
-        ui.label(RichText::new("Empty. Pick a colour and a texture, then Save current.").weak().small());
         return;
     }
     egui::ScrollArea::vertical().id_salt("palette_entries").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -2883,10 +2859,20 @@ fn node_list_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
     });
     ui.separator();
     st.layout.tag_list.clear();
+    st.layout.tag_head = None;
     let counts = ed.world.tag_counts();
     if !counts.is_empty() {
-        ui.label(RichText::new("Tags").strong());
+        let head = ui
+            .selectable_label(false, RichText::new(format!("{} Tags ({})", if st.tags_collapsed { ">" } else { "v" }, counts.len())).strong())
+            .on_hover_text("Show or hide the tag list");
+        st.layout.tag_head = Some(head.rect);
+        if head.clicked() {
+            st.tags_collapsed = !st.tags_collapsed;
+        }
         ui.horizontal_wrapped(|ui| {
+            if st.tags_collapsed {
+                return;
+            }
             for (t, n) in &counts {
                 let on = st.node_filter.trim().trim_start_matches('#').eq_ignore_ascii_case(t);
                 let b = ui.selectable_label(on, format!("#{t} ({n})")).on_hover_text("Click to list only nodes with this tag");
@@ -3113,7 +3099,7 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
             let typed = st.tag_input.trim().trim_start_matches('#').to_lowercase();
             let fits: Vec<String> = ed
                 .world
-                .tag_counts()
+                .tags_in_folder(node.folder, node.id)
                 .into_iter()
                 .map(|(t, _)| t)
                 .filter(|t| {
@@ -3124,7 +3110,6 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                 .collect();
             if !fits.is_empty() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Used:").weak().small());
                     for t in fits {
                         let b = ui.small_button(format!("#{t}")).on_hover_text("Add this tag");
                         st.layout.tag_suggestions.push(b.rect);
@@ -3203,10 +3188,6 @@ fn node_panel(ui: &mut egui::Ui, ed: &mut Editor, st: &mut UiState) {
                     }
                 }
             });
-            let place = if node.edge { "grid corner after" } else { "centre of" };
-            ui.label(
-                RichText::new(format!("depth {}  ·  {place} cell {}, {}", node.depth, node.x, node.y)).weak(),
-            );
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -3336,7 +3317,6 @@ fn export_window(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
                     }
                 }
             });
-            ui.label(RichText::new("32 is the tiles' own size; 64 is sharper.").weak());
             ui.add_space(4.0);
             ui.label("Draw on top");
             ui.checkbox(&mut o.regions, "Regions (tint, outline, names)");
